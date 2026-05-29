@@ -1,0 +1,12 @@
+<UserControl
+    x:Class="BTAP.Controls.VideoCompositorControl"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:canvas="using:Microsoft.Graphics.Canvas.UI.Xaml">
+    <!-- ClearColor transparent so the placeholder gradient / PreviewArea background
+         shows through when no video layers are active. -->
+    <canvas:CanvasAnimatedControl x:Name="Canvas"
+                                  ClearColor="Transparent"
+                                  CreateResources="OnCreateResources"
+                                  Draw="OnDraw" />
+</UserControl>

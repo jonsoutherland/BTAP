@@ -1,0 +1,769 @@
+<Page
+    x:Class="BTAP.Pages.EditorPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:controls="using:BTAP.Controls"
+    xmlns:local="using:BTAP.Pages"
+    Background="{StaticResource BgPageBrush}"
+    IsTabStop="True">
+
+    <Page.KeyboardAccelerators>
+        <KeyboardAccelerator Key="Z" Modifiers="Control" Invoked="OnUndoAccelerator" />
+        <KeyboardAccelerator Key="Y" Modifiers="Control" Invoked="OnRedoAccelerator" />
+        <KeyboardAccelerator Key="S" Modifiers="Control" Invoked="OnSaveAccelerator" />
+    </Page.KeyboardAccelerators>
+
+    <Grid RowDefinitions="36,36,*,22">
+
+        <!-- ══ Title bar ══════════════════════════════════════════════ -->
+        <Border Grid.Row="0"
+                Background="{StaticResource BgPageBrush}"
+                BorderBrush="{StaticResource HairlineBrush}"
+                BorderThickness="0,0,0,1">
+            <Grid ColumnDefinitions="Auto,Auto,*,Auto">
+                <!-- App mark -->
+                <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="8"
+                            Margin="12,0,0,0" VerticalAlignment="Center">
+                    <Border Width="18" Height="18" CornerRadius="3"
+                            Background="Transparent">
+                        <TextBlock Text="▶" FontSize="10"
+                                   Foreground="{StaticResource AccentBrush}"
+                                   HorizontalAlignment="Center" VerticalAlignment="Center" />
+                    </Border>
+                    <TextBlock Text="BTAP" FontWeight="Medium" FontSize="12"
+                               Foreground="{StaticResource TextPrimaryBrush}"
+                               VerticalAlignment="Center" />
+                    <TextBlock Text="—" FontSize="12"
+                               Foreground="{StaticResource TextFaintBrush}"
+                               Margin="4,0" VerticalAlignment="Center" />
+                    <TextBlock x:Name="TbFilename" FontSize="12"
+                               Foreground="{StaticResource TextMutedBrush}"
+                               VerticalAlignment="Center" />
+                    <TextBlock x:Name="TbSavedHint" Text=" · unsaved" FontSize="12" FontStyle="Italic"
+                               FontFamily="{StaticResource SerifFont}"
+                               Foreground="{StaticResource TextFaintBrush}"
+                               VerticalAlignment="Center" />
+                </StackPanel>
+
+                <!-- Undo / Redo -->
+                <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="2"
+                            Margin="18,0" VerticalAlignment="Center">
+                    <Button Content="↩" Style="{StaticResource IconButtonStyle}"
+                            ToolTipService.ToolTip="Undo (Ctrl+Z)" Click="OnUndo" />
+                    <Button Content="↪" Style="{StaticResource IconButtonStyle}"
+                            ToolTipService.ToolTip="Redo (Ctrl+Y)" Click="OnRedo" />
+                </StackPanel>
+
+                <!-- Window controls (right) -->
+                <StackPanel Grid.Column="3" Orientation="Horizontal" VerticalAlignment="Stretch">
+                    <Button Content="—" Click="OnMinimize"
+                            Style="{StaticResource GhostButtonStyle}"
+                            Width="46" Padding="0"
+                            Foreground="{StaticResource TextDimBrush}"
+                            HorizontalContentAlignment="Center" />
+                    <Button Content="□" Click="OnMaximize"
+                            Style="{StaticResource GhostButtonStyle}"
+                            Width="46" Padding="0"
+                            Foreground="{StaticResource TextDimBrush}"
+                            HorizontalContentAlignment="Center" />
+                    <Button x:Name="BtnClose" Click="OnClose"
+                            Style="{StaticResource GhostButtonStyle}"
+                            Width="46" Padding="0"
+                            Foreground="{StaticResource TextDimBrush}"
+                            HorizontalContentAlignment="Center">
+                        <FontIcon FontFamily="Segoe MDL2 Assets" Glyph="&#xE8BB;" FontSize="12"/>
+                    </Button>
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <!-- ══ Menu bar ════════════════════════════════════════════════ -->
+        <Border x:Name="MenuBar" Grid.Row="1"
+                Background="{StaticResource BgPageBrush}"
+                BorderBrush="{StaticResource HairlineBrush}"
+                BorderThickness="0,0,0,1">
+            <Grid ColumnDefinitions="Auto,*,Auto,*,Auto">
+                <!-- File menu items -->
+                <StackPanel Grid.Column="0" Orientation="Horizontal" Padding="8,0"
+                            VerticalAlignment="Center">
+
+                    <Button Content="File" Style="{StaticResource GhostButtonStyle}" Padding="10,4" FontSize="12">
+                        <Button.Flyout>
+                            <MenuFlyout Placement="Bottom">
+                                <MenuFlyoutItem Text="New project"   Click="OnFileNew"      KeyboardAcceleratorTextOverride="Ctrl+N" />
+                                <MenuFlyoutItem Text="Open…"         Click="OnFileOpen"     KeyboardAcceleratorTextOverride="Ctrl+O" />
+                                <MenuFlyoutSeparator />
+                                <MenuFlyoutItem Text="Save"          Click="OnFileSave"     KeyboardAcceleratorTextOverride="Ctrl+S" />
+                                <MenuFlyoutItem Text="Save As…"      Click="OnFileSaveAs"   KeyboardAcceleratorTextOverride="Ctrl+Shift+S" />
+                                <MenuFlyoutSeparator />
+                                <MenuFlyoutItem Text="Import media…" Click="OnImportMedia" />
+                                <MenuFlyoutItem Text="Export…"       Click="OnExport"       KeyboardAcceleratorTextOverride="Ctrl+E" />
+                                <MenuFlyoutSeparator />
+                                <MenuFlyoutItem Text="Close project" Click="OnFileClose" />
+                            </MenuFlyout>
+                        </Button.Flyout>
+                    </Button>
+
+                    <Button Content="Edit" Style="{StaticResource GhostButtonStyle}" Padding="10,4" FontSize="12">
+                        <Button.Flyout>
+                            <MenuFlyout Placement="Bottom">
+                                <MenuFlyoutItem Text="Undo" Click="OnUndo"                 KeyboardAcceleratorTextOverride="Ctrl+Z" />
+                                <MenuFlyoutItem Text="Redo" Click="OnRedo"                 KeyboardAcceleratorTextOverride="Ctrl+Y" />
+                                <MenuFlyoutSeparator />
+                                <MenuFlyoutItem Text="Delete clip"     Click="OnEditDelete"      KeyboardAcceleratorTextOverride="Del" />
+                                <MenuFlyoutItem Text="Duplicate clip"  Click="OnEditDuplicate"   KeyboardAcceleratorTextOverride="Ctrl+D" />
+                                <MenuFlyoutSeparator />
+                                <MenuFlyoutItem Text="Split at playhead" Click="OnEditSplit"     KeyboardAcceleratorTextOverride="Ctrl+B" />
+                            </MenuFlyout>
+                        </Button.Flyout>
+                    </Button>
+
+                    <Button Content="View" Style="{StaticResource GhostButtonStyle}" Padding="10,4" FontSize="12">
+                        <Button.Flyout>
+                            <MenuFlyout Placement="Bottom">
+                                <MenuFlyoutItem Text="Zoom in"    Click="OnZoomIn"  KeyboardAcceleratorTextOverride="Ctrl++" />
+                                <MenuFlyoutItem Text="Zoom out"   Click="OnZoomOut" KeyboardAcceleratorTextOverride="Ctrl+-" />
+                                <MenuFlyoutItem Text="Fit timeline"  Click="OnViewFit" />
+                                <MenuFlyoutSeparator />
+                                <MenuFlyoutItem Text="Toggle snap"    Click="OnToggleSnap"      KeyboardAcceleratorTextOverride="S" />
+                                <MenuFlyoutItem Text="Toggle loop"    Click="OnViewToggleLoop" />
+                                <MenuFlyoutItem Text="Fullscreen preview" Click="OnViewFullscreen" KeyboardAcceleratorTextOverride="F" />
+                            </MenuFlyout>
+                        </Button.Flyout>
+                    </Button>
+
+                    <Button Content="Clip" Style="{StaticResource GhostButtonStyle}" Padding="10,4" FontSize="12">
+                        <Button.Flyout>
+                            <MenuFlyout Placement="Bottom">
+                                <MenuFlyoutItem Text="Split at playhead" Click="OnEditSplit"     KeyboardAcceleratorTextOverride="Ctrl+B" />
+                                <MenuFlyoutItem Text="Duplicate"         Click="OnEditDuplicate" KeyboardAcceleratorTextOverride="Ctrl+D" />
+                                <MenuFlyoutItem Text="Delete"            Click="OnEditDelete"    KeyboardAcceleratorTextOverride="Del" />
+                                <MenuFlyoutSeparator />
+                                <MenuFlyoutItem Text="Ripple delete"     Click="OnClipRippleDelete" KeyboardAcceleratorTextOverride="Shift+Del" />
+                            </MenuFlyout>
+                        </Button.Flyout>
+                    </Button>
+
+                    <Button Content="Timeline" Style="{StaticResource GhostButtonStyle}" Padding="10,4" FontSize="12">
+                        <Button.Flyout>
+                            <MenuFlyout Placement="Bottom">
+                                <MenuFlyoutItem Text="Add video track"  Click="OnTimelineAddVideoTrack" />
+                                <MenuFlyoutItem Text="Add audio track"  Click="OnTimelineAddAudioTrack" />
+                                <MenuFlyoutSeparator />
+                                <MenuFlyoutItem Text="Add marker"       Click="OnMarker"  KeyboardAcceleratorTextOverride="M" />
+                                <MenuFlyoutItem Text="Clear all markers" Click="OnTimelineClearMarkers" />
+                            </MenuFlyout>
+                        </Button.Flyout>
+                    </Button>
+
+                    <Button Content="Help" Style="{StaticResource GhostButtonStyle}" Padding="10,4" FontSize="12">
+                        <Button.Flyout>
+                            <MenuFlyout Placement="Bottom">
+                                <MenuFlyoutItem Text="Keyboard shortcuts" Click="OnHelpShortcuts" />
+                                <MenuFlyoutItem Text="About BTAP"         Click="OnHelpAbout" />
+                            </MenuFlyout>
+                        </Button.Flyout>
+                    </Button>
+                </StackPanel>
+
+                <!-- Mode tabs (centered) -->
+                <Border Grid.Column="2" Margin="0,5"
+                        Background="{StaticResource BgSurfaceBrush}"
+                        CornerRadius="{StaticResource RadiusMd}"
+                        VerticalAlignment="Center"
+                        HorizontalAlignment="Center"
+                        Padding="3">
+                    <StackPanel Orientation="Horizontal" Spacing="2">
+                        <Button x:Name="BtnModeCut"   Content="CUT"    Style="{StaticResource GhostButtonStyle}" Padding="12,3" FontSize="11" FontWeight="Medium" Click="OnModeChange" Tag="cut" />
+                        <Button x:Name="BtnModeEdit"  Content="EDIT"   Style="{StaticResource GhostButtonStyle}" Padding="12,3" FontSize="11" FontWeight="Medium" Click="OnModeChange" Tag="edit"
+                                Background="{StaticResource BgElevatedBrush}" Foreground="{StaticResource TextPrimaryBrush}" />
+                        <Button x:Name="BtnModeColor" Content="COLOR"  Style="{StaticResource GhostButtonStyle}" Padding="12,3" FontSize="11" FontWeight="Medium" Click="OnModeChange" Tag="color" />
+                        <Button x:Name="BtnModeAudio" Content="AUDIO"  Style="{StaticResource GhostButtonStyle}" Padding="12,3" FontSize="11" FontWeight="Medium" Click="OnModeChange" Tag="audio" />
+                        <Button x:Name="BtnModeExp"   Content="EXPORT" Style="{StaticResource GhostButtonStyle}" Padding="12,3" FontSize="11" FontWeight="Medium" Click="OnModeChange" Tag="export" />
+                    </StackPanel>
+                </Border>
+
+                <!-- Action buttons -->
+                <StackPanel Grid.Column="4" Orientation="Horizontal" Spacing="6"
+                            Margin="8,0,12,0" VerticalAlignment="Center">
+                    <Button Style="{StaticResource GhostButtonStyle}"
+                            Height="24" Padding="10,0"
+                            Click="OnShare">
+                        <StackPanel Orientation="Horizontal" Spacing="5" VerticalAlignment="Center">
+                            <FontIcon FontFamily="Segoe MDL2 Assets" Glyph="&#xE72D;" FontSize="10"/>
+                            <TextBlock Text="Share" FontSize="11"/>
+                        </StackPanel>
+                    </Button>
+                    <Button Style="{StaticResource PrimaryButtonStyle}"
+                            Height="24" Padding="12,0" Click="OnExport">
+                        <StackPanel Orientation="Horizontal" Spacing="5" VerticalAlignment="Center">
+                            <FontIcon FontFamily="Segoe MDL2 Assets" Glyph="&#xE898;" FontSize="10"/>
+                            <TextBlock Text="Export" FontSize="11"/>
+                        </StackPanel>
+                    </Button>
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <!-- ══ Body ════════════════════════════════════════════════════ -->
+        <Grid x:Name="BodyGrid" Grid.Row="2" ColumnDefinitions="256,*,296">
+
+            <!-- ── Library panel ──────────────────────────────────── -->
+            <Grid x:Name="LibraryPanel" Grid.Column="0" RowDefinitions="Auto,Auto,Auto,*"
+                  Background="{StaticResource BgPageBrush}"
+                  BorderBrush="{StaticResource HairlineBrush}"
+                  BorderThickness="0,0,1,0">
+
+                <!-- Tab strip -->
+                <Border Grid.Row="0" BorderBrush="{StaticResource HairlineBrush}"
+                        BorderThickness="0,0,0,1" Padding="10,6,10,0">
+                    <StackPanel Orientation="Horizontal" Spacing="0">
+                        <Button x:Name="BtnLibMedia"  Content="Media"   Tag="media"   Click="OnLibTabClick" Style="{StaticResource GhostButtonStyle}" Padding="10,6" FontSize="11.5" FontWeight="Medium" BorderBrush="{StaticResource AccentBrush}" BorderThickness="0,0,0,2" Margin="0,0,0,-1" />
+                        <Button x:Name="BtnLibTitles" Content="Titles"  Tag="titles"  Click="OnLibTabClick" Style="{StaticResource GhostButtonStyle}" Padding="10,6" FontSize="11.5" FontWeight="Medium" />
+                        <Button x:Name="BtnLibFX"     Content="Effects" Tag="fx"      Click="OnLibTabClick" Style="{StaticResource GhostButtonStyle}" Padding="10,6" FontSize="11.5" FontWeight="Medium" />
+                        <Button x:Name="BtnLibAudio"  Content="Audio"   Tag="audio"   Click="OnLibTabClick" Style="{StaticResource GhostButtonStyle}" Padding="10,6" FontSize="11.5" FontWeight="Medium" />
+                        <Button Content="＋" Style="{StaticResource GhostButtonStyle}" Padding="6"
+                                HorizontalAlignment="Right" Margin="4,0,0,0" Click="OnImportMedia" />
+                    </StackPanel>
+                </Border>
+
+                <!-- Search -->
+                <Border Grid.Row="1" Margin="12,10,12,8"
+                        Background="{StaticResource BgInputBrush}"
+                        BorderBrush="{StaticResource HairlineBrush}"
+                        BorderThickness="1" CornerRadius="5" Padding="8,5">
+                    <StackPanel Orientation="Horizontal" Spacing="6">
+                        <TextBlock Text="&#xE721;" FontFamily="Segoe MDL2 Assets" FontSize="11" VerticalAlignment="Center"
+                                   Foreground="{StaticResource TextMutedBrush}" />
+                        <TextBox x:Name="LibSearchBox"
+                                 PlaceholderText="Search media…"
+                                 Background="Transparent" BorderThickness="0"
+                                 FontSize="11.5" Foreground="{StaticResource TextPrimaryBrush}"
+                                 TextChanged="OnLibSearchChanged" />
+                        <TextBlock Text="⌘F" FontFamily="{StaticResource MonoFont}"
+                                   FontSize="10" VerticalAlignment="Center"
+                                   Foreground="{StaticResource TextFaintBrush}"
+                                   HorizontalAlignment="Right" Margin="4,0,0,0" />
+                    </StackPanel>
+                </Border>
+
+                <!-- Bin header -->
+                <StackPanel Grid.Row="2" Orientation="Horizontal" Padding="12,4,12,6" Spacing="6">
+                    <TextBlock Text="▾" FontSize="9" Foreground="{StaticResource TextMutedBrush}"
+                               VerticalAlignment="Center" />
+                    <TextBlock x:Name="TbBinLabel" Text="Bin" FontSize="10.5"
+                               Foreground="{StaticResource TextMutedBrush}"
+                               CharacterSpacing="80" />
+                    <TextBlock x:Name="TbBinCount"
+                               FontFamily="{StaticResource MonoFont}" FontSize="10.5"
+                               Foreground="{StaticResource TextFaintBrush}"
+                               HorizontalAlignment="Right" Margin="4,0,0,0" />
+                </StackPanel>
+
+                <!-- Library content (one panel per tab) -->
+                <Grid Grid.Row="3">
+                    <Grid x:Name="MediaScroll">
+                        <ScrollViewer VerticalScrollBarVisibility="Auto">
+                            <ItemsRepeater x:Name="MediaGrid" Margin="12,4,12,12">
+                                <ItemsRepeater.Layout>
+                                    <UniformGridLayout MinItemWidth="100" MaximumRowsOrColumns="2"
+                                                      MinColumnSpacing="8" MinRowSpacing="8" />
+                                </ItemsRepeater.Layout>
+                                <ItemsRepeater.ItemTemplate>
+                                    <DataTemplate x:DataType="local:MediaTileData">
+                                        <controls:MediaTileControl Data="{x:Bind}"
+                                                                   Tapped="OnMediaTileTapped"
+                                                                   DoubleTapped="OnMediaTileDoubleTapped" />
+                                    </DataTemplate>
+                                </ItemsRepeater.ItemTemplate>
+                            </ItemsRepeater>
+                        </ScrollViewer>
+                        <StackPanel x:Name="EmptyMediaHint"
+                                    VerticalAlignment="Center"
+                                    HorizontalAlignment="Center"
+                                    Spacing="10" Padding="24"
+                                    Visibility="Collapsed">
+                            <FontIcon Glyph="&#xE8B9;" FontFamily="Segoe MDL2 Assets"
+                                      FontSize="28"
+                                      Foreground="{StaticResource TextFaintBrush}" />
+                            <TextBlock Text="No media yet"
+                                       FontSize="12.5" FontWeight="Medium"
+                                       HorizontalAlignment="Center"
+                                       Foreground="{StaticResource TextMutedBrush}" />
+                            <TextBlock Text="Click ＋ to import video, audio, or images."
+                                       FontSize="11" TextAlignment="Center"
+                                       TextWrapping="Wrap" MaxWidth="180"
+                                       HorizontalAlignment="Center"
+                                       Foreground="{StaticResource TextFaintBrush}" />
+                        </StackPanel>
+                    </Grid>
+                    <ScrollViewer x:Name="TitlesScroll" Visibility="Collapsed"
+                                  VerticalScrollBarVisibility="Auto">
+                        <StackPanel x:Name="TitlesList" Padding="12,4,12,12" Spacing="6" />
+                    </ScrollViewer>
+                    <ScrollViewer x:Name="EffectsScroll" Visibility="Collapsed"
+                                  VerticalScrollBarVisibility="Auto">
+                        <StackPanel x:Name="EffectsList" Padding="12,4,12,12" Spacing="6" />
+                    </ScrollViewer>
+                    <ScrollViewer x:Name="AudioScroll" Visibility="Collapsed"
+                                  VerticalScrollBarVisibility="Auto">
+                        <StackPanel x:Name="AudioFxList" Padding="12,4,12,12" Spacing="6" />
+                    </ScrollViewer>
+                </Grid>
+            </Grid>
+
+            <!-- ── Center: preview + timeline ─────────────────────── -->
+            <Grid Grid.Column="1" RowDefinitions="*,Auto,Auto,240"
+                  BorderBrush="{StaticResource HairlineBrush}"
+                  BorderThickness="0,0,1,0">
+
+                <!-- Preview -->
+                <Border Grid.Row="0" Background="{StaticResource BgPageBrush}"
+                        Padding="14">
+                    <Grid RowDefinitions="*,Auto">
+                        <!-- Video canvas -->
+                        <Border Grid.Row="0" CornerRadius="6"
+                                BorderBrush="{StaticResource HairlineBrush}"
+                                BorderThickness="1">
+                            <Grid x:Name="PreviewArea"
+                                  Background="#0A1218"
+                                  PointerWheelChanged="OnPreviewAreaWheel"
+                                  SizeChanged="OnPreviewAreaSizeChanged">
+                                <Grid.ContextFlyout>
+                                    <MenuFlyout x:Name="PreviewContextMenu" Opening="OnPreviewContextOpening">
+                                        <MenuFlyoutItem Text="Center align"      Click="OnPreviewCenterAlign" />
+                                        <MenuFlyoutItem Text="Fit to frame"      Click="OnPreviewFitToFrame" />
+                                        <MenuFlyoutItem Text="Reset transform"   Click="OnPreviewResetTransform" />
+                                        <MenuFlyoutItem Text="Reset crop"        Click="OnPreviewResetCrop" />
+                                        <MenuFlyoutSeparator />
+                                        <MenuFlyoutItem Text="Flip horizontal"   Click="OnPreviewFlipH" />
+                                        <MenuFlyoutItem Text="Flip vertical"     Click="OnPreviewFlipV" />
+                                        <MenuFlyoutSubItem Text="Rotate">
+                                            <MenuFlyoutItem Text="90° clockwise"         Click="OnPreviewRotateCw" />
+                                            <MenuFlyoutItem Text="90° counter-clockwise" Click="OnPreviewRotateCcw" />
+                                            <MenuFlyoutItem Text="180°"                  Click="OnPreviewRotate180" />
+                                        </MenuFlyoutSubItem>
+                                        <MenuFlyoutSubItem Text="Speed">
+                                            <MenuFlyoutItem Text="0.25×" Tag="0.25" Click="OnPreviewSpeedClick" />
+                                            <MenuFlyoutItem Text="0.5×"  Tag="0.5"  Click="OnPreviewSpeedClick" />
+                                            <MenuFlyoutItem Text="1× (normal)" Tag="1" Click="OnPreviewSpeedClick" />
+                                            <MenuFlyoutItem Text="2×"   Tag="2"   Click="OnPreviewSpeedClick" />
+                                            <MenuFlyoutItem Text="4×"   Tag="4"   Click="OnPreviewSpeedClick" />
+                                        </MenuFlyoutSubItem>
+                                        <MenuFlyoutSeparator />
+                                        <MenuFlyoutItem Text="Duplicate" Click="OnPreviewDuplicate" />
+                                        <MenuFlyoutItem Text="Delete"    Click="OnPreviewDeleteClip" />
+                                    </MenuFlyout>
+                                </Grid.ContextFlyout>
+                                <!-- Win2D-based custom video compositor: single GPU swap chain,
+                                     multi-track simultaneous playback, per-clip transforms. -->
+                                <controls:VideoCompositorControl x:Name="VideoCompositor"
+                                                                 AllowDrop="True"
+                                                                 RenderTransformOrigin="0.5,0.5"
+                                                                 DragOver="OnPreviewDragOver"
+                                                                 Drop="OnPreviewDrop"
+                                                                 SizeChanged="OnVideoCompositorSizeChanged">
+                                    <controls:VideoCompositorControl.RenderTransform>
+                                        <CompositeTransform x:Name="VideoCompositorTransform" />
+                                    </controls:VideoCompositorControl.RenderTransform>
+                                </controls:VideoCompositorControl>
+                                <Grid x:Name="PreviewViewport"
+                                      RenderTransformOrigin="0.5,0.5"
+                                      HorizontalAlignment="Center" VerticalAlignment="Center">
+                                    <Grid.RenderTransform>
+                                        <CompositeTransform x:Name="PreviewViewportTransform" />
+                                    </Grid.RenderTransform>
+                                <!-- PreviewPlayer kept only as a named reference for legacy code paths
+                                     (transform overlay sizing, speed plumbing). Visibility=Collapsed so its
+                                     internal SwapChainPanel doesn't render — XAML Opacity does NOT hide
+                                     DXGI swap-chain content, which is why a "ghost video" appears with
+                                     Opacity=0. -->
+                                <MediaPlayerElement x:Name="PreviewPlayer"
+                                                    AreTransportControlsEnabled="False"
+                                                    AutoPlay="False"
+                                                    Stretch="Uniform"
+                                                    Background="Transparent"
+                                                    Visibility="Collapsed"
+                                                    IsHitTestVisible="False"
+                                                    RenderTransformOrigin="0.5,0.5"
+                                                    SizeChanged="OnPreviewPlayerSizeChanged">
+                                    <MediaPlayerElement.RenderTransform>
+                                        <CompositeTransform x:Name="PreviewTransform" />
+                                    </MediaPlayerElement.RenderTransform>
+                                </MediaPlayerElement>
+
+                                <!-- Frame boundary indicator (shown when preview viewport is zoomed out) -->
+                                <Rectangle x:Name="FrameBoundary"
+                                           Stroke="{StaticResource AccentBrush}"
+                                           StrokeThickness="1"
+                                           StrokeDashArray="4,3"
+                                           Fill="Transparent"
+                                           IsHitTestVisible="False"
+                                           Visibility="Collapsed" />
+
+                                <!-- Color-grading layer was here. Disabled in v1 — its
+                                     CompositionEffectBrush + BackdropBrush can't sample
+                                     the MediaPlayerElement swap-chain (paints black on
+                                     top of the video). Will be replaced with a Win2D
+                                     FrameServer pipeline in Tier 1 v2. -->
+                                <Border x:Name="ColorGradingLayer"
+                                        IsHitTestVisible="False"
+                                        Visibility="Collapsed" />
+
+                                <!-- Figma-style transform handles: drag body=move, corners=scale, top knob=rotate -->
+                                <Canvas x:Name="TransformOverlay"
+                                        IsHitTestVisible="True"
+                                        Visibility="Collapsed">
+                                    <Rectangle x:Name="TransformBox"
+                                               Stroke="{StaticResource AccentBrush}"
+                                               StrokeThickness="1.5"
+                                               StrokeDashArray="3,2"
+                                               Fill="Transparent"
+                                               PointerPressed="OnTransformBodyPressed"
+                                               PointerMoved="OnTransformBodyMoved"
+                                               PointerReleased="OnTransformBodyReleased"
+                                               PointerCaptureLost="OnTransformBodyCaptureLost" />
+                                    <!-- Snap guide lines: shown while a drag is snapped against the viewport -->
+                                    <Line x:Name="SnapGuideVLeft"   Stroke="#FFFF3D7F" StrokeThickness="1" IsHitTestVisible="False" Visibility="Collapsed" />
+                                    <Line x:Name="SnapGuideVCenter" Stroke="#FFFF3D7F" StrokeThickness="1" IsHitTestVisible="False" Visibility="Collapsed" />
+                                    <Line x:Name="SnapGuideVRight"  Stroke="#FFFF3D7F" StrokeThickness="1" IsHitTestVisible="False" Visibility="Collapsed" />
+                                    <Line x:Name="SnapGuideHTop"    Stroke="#FFFF3D7F" StrokeThickness="1" IsHitTestVisible="False" Visibility="Collapsed" />
+                                    <Line x:Name="SnapGuideHCenter" Stroke="#FFFF3D7F" StrokeThickness="1" IsHitTestVisible="False" Visibility="Collapsed" />
+                                    <Line x:Name="SnapGuideHBottom" Stroke="#FFFF3D7F" StrokeThickness="1" IsHitTestVisible="False" Visibility="Collapsed" />
+                                    <Line x:Name="RotateLine"
+                                          Stroke="{StaticResource AccentBrush}"
+                                          StrokeThickness="1" />
+                                    <Ellipse x:Name="HandleRotate" Width="14" Height="14"
+                                             Fill="White"
+                                             Stroke="{StaticResource AccentBrush}" StrokeThickness="1.5"
+                                             Tag="ROT"
+                                             PointerPressed="OnTransformHandlePressed"
+                                             PointerMoved="OnTransformHandleMoved"
+                                             PointerReleased="OnTransformHandleReleased"
+                                             PointerCaptureLost="OnTransformHandleCaptureLost" />
+                                    <Ellipse x:Name="HandleTL" Width="12" Height="12"
+                                             Fill="White"
+                                             Stroke="{StaticResource AccentBrush}" StrokeThickness="1.5"
+                                             Tag="TL"
+                                             PointerPressed="OnTransformHandlePressed"
+                                             PointerMoved="OnTransformHandleMoved"
+                                             PointerReleased="OnTransformHandleReleased"
+                                             PointerCaptureLost="OnTransformHandleCaptureLost" />
+                                    <Ellipse x:Name="HandleTR" Width="12" Height="12"
+                                             Fill="White"
+                                             Stroke="{StaticResource AccentBrush}" StrokeThickness="1.5"
+                                             Tag="TR"
+                                             PointerPressed="OnTransformHandlePressed"
+                                             PointerMoved="OnTransformHandleMoved"
+                                             PointerReleased="OnTransformHandleReleased"
+                                             PointerCaptureLost="OnTransformHandleCaptureLost" />
+                                    <Ellipse x:Name="HandleBL" Width="12" Height="12"
+                                             Fill="White"
+                                             Stroke="{StaticResource AccentBrush}" StrokeThickness="1.5"
+                                             Tag="BL"
+                                             PointerPressed="OnTransformHandlePressed"
+                                             PointerMoved="OnTransformHandleMoved"
+                                             PointerReleased="OnTransformHandleReleased"
+                                             PointerCaptureLost="OnTransformHandleCaptureLost" />
+                                    <Ellipse x:Name="HandleBR" Width="12" Height="12"
+                                             Fill="White"
+                                             Stroke="{StaticResource AccentBrush}" StrokeThickness="1.5"
+                                             Tag="BR"
+                                             PointerPressed="OnTransformHandlePressed"
+                                             PointerMoved="OnTransformHandleMoved"
+                                             PointerReleased="OnTransformHandleReleased"
+                                             PointerCaptureLost="OnTransformHandleCaptureLost" />
+                                </Canvas>
+
+                                <!-- Title-clip rendering: shown when current clip Kind == Title -->
+                                <Grid x:Name="TitleClipOverlay"
+                                      Background="Black"
+                                      Visibility="Collapsed">
+                                    <TextBlock x:Name="TitleClipText"
+                                               FontFamily="{StaticResource SerifFont}"
+                                               FontStyle="Italic"
+                                               FontSize="48"
+                                               FontWeight="Light"
+                                               Foreground="White"
+                                               HorizontalAlignment="Center"
+                                               VerticalAlignment="Center"
+                                               TextWrapping="Wrap"
+                                               TextAlignment="Center"
+                                               Padding="40" />
+                                </Grid>
+                                </Grid>  <!-- /PreviewViewport -->
+                                <!-- Placeholder gradient (shown when no media loaded) -->
+                                <Border x:Name="PreviewPlaceholder">
+                                    <Border.Background>
+                                        <LinearGradientBrush StartPoint="0.3,0.4" EndPoint="0.7,0.65">
+                                            <GradientStop Color="#661A3040" Offset="0"/>
+                                            <GradientStop Color="#330A1218" Offset="1"/>
+                                        </LinearGradientBrush>
+                                    </Border.Background>
+                                    <!-- Title overlay -->
+                                    <StackPanel VerticalAlignment="Bottom" HorizontalAlignment="Left"
+                                                Margin="28,0,0,24">
+                                        <TextBlock x:Name="TbPreviewTitle"
+                                                   Text="No clip selected"
+                                                   FontFamily="{StaticResource SerifFont}"
+                                                   FontStyle="Italic" FontSize="28" FontWeight="Normal"
+                                                   Foreground="White" />
+                                        <TextBlock x:Name="TbPreviewSubtitle"
+                                                   Text="— Drop media here or pick a clip from the timeline"
+                                                   FontFamily="{StaticResource MonoFont}"
+                                                   FontSize="10" CharacterSpacing="120"
+                                                   Foreground="{StaticResource AccentInkBrush}"
+                                                   Margin="0,6,0,0" />
+                                    </StackPanel>
+                                </Border>
+                                <!-- Program info overlay (click to change resolution / framerate) -->
+                                <Grid Margin="12,10">
+                                    <Border x:Name="BorderProgramInfo"
+                                            Background="Transparent"
+                                            Padding="4,2"
+                                            CornerRadius="3"
+                                            HorizontalAlignment="Left" VerticalAlignment="Top"
+                                            Tapped="OnProgramInfoTapped"
+                                            PointerEntered="OnProgramInfoHover"
+                                            PointerExited="OnProgramInfoUnhover">
+                                        <FlyoutBase.AttachedFlyout>
+                                            <Flyout x:Name="ProgramInfoFlyout" Opening="OnProgramInfoFlyoutOpening">
+                                                <StackPanel Spacing="10" Width="260">
+
+                                                    <TextBlock Text="RESOLUTION"
+                                                               FontSize="10" CharacterSpacing="120"
+                                                               Foreground="{StaticResource TextMutedBrush}" />
+                                                    <ComboBox x:Name="CmbResPreset"
+                                                              HorizontalAlignment="Stretch"
+                                                              SelectionChanged="OnResPresetChanged">
+                                                        <ComboBoxItem Tag="1920,1080">1920 × 1080  (Full HD)</ComboBoxItem>
+                                                        <ComboBoxItem Tag="3840,2160">3840 × 2160  (4K UHD)</ComboBoxItem>
+                                                        <ComboBoxItem Tag="1280,720">1280 × 720    (HD)</ComboBoxItem>
+                                                        <ComboBoxItem Tag="1080,1920">1080 × 1920  (9:16 vertical)</ComboBoxItem>
+                                                        <ComboBoxItem Tag="1080,1080">1080 × 1080  (1:1 square)</ComboBoxItem>
+                                                        <ComboBoxItem Tag="3840,1606">3840 × 1606  (2.39:1 cinema)</ComboBoxItem>
+                                                        <ComboBoxItem Tag="2560,1440">2560 × 1440  (QHD)</ComboBoxItem>
+                                                        <ComboBoxItem Tag="custom">Custom…</ComboBoxItem>
+                                                    </ComboBox>
+                                                    <Grid ColumnDefinitions="*,Auto,*">
+                                                        <NumberBox x:Name="NbWidth" Header="Width"
+                                                                   Minimum="64" Maximum="7680"
+                                                                   SpinButtonPlacementMode="Compact" />
+                                                        <TextBlock Text="×" Grid.Column="1"
+                                                                   VerticalAlignment="Center"
+                                                                   Margin="6,20,6,0"
+                                                                   FontSize="14"
+                                                                   Foreground="{StaticResource TextMutedBrush}" />
+                                                        <NumberBox x:Name="NbHeight" Header="Height" Grid.Column="2"
+                                                                   Minimum="64" Maximum="4320"
+                                                                   SpinButtonPlacementMode="Compact" />
+                                                    </Grid>
+
+                                                    <TextBlock Text="FRAME RATE"
+                                                               FontSize="10" CharacterSpacing="120"
+                                                               Foreground="{StaticResource TextMutedBrush}"
+                                                               Margin="0,4,0,0" />
+                                                    <ComboBox x:Name="CmbFpsPreset"
+                                                              HorizontalAlignment="Stretch"
+                                                              SelectionChanged="OnFpsPresetChanged">
+                                                        <ComboBoxItem Tag="23.976">23.976 fps  (NTSC film)</ComboBoxItem>
+                                                        <ComboBoxItem Tag="24">24 fps      (cinema)</ComboBoxItem>
+                                                        <ComboBoxItem Tag="25">25 fps      (PAL)</ComboBoxItem>
+                                                        <ComboBoxItem Tag="29.97">29.97 fps   (NTSC)</ComboBoxItem>
+                                                        <ComboBoxItem Tag="30">30 fps</ComboBoxItem>
+                                                        <ComboBoxItem Tag="50">50 fps</ComboBoxItem>
+                                                        <ComboBoxItem Tag="60">60 fps</ComboBoxItem>
+                                                        <ComboBoxItem Tag="120">120 fps</ComboBoxItem>
+                                                        <ComboBoxItem Tag="custom">Custom…</ComboBoxItem>
+                                                    </ComboBox>
+                                                    <NumberBox x:Name="NbFps" Header="fps"
+                                                               Minimum="1" Maximum="240"
+                                                               SmallChange="0.001"
+                                                               SpinButtonPlacementMode="Compact" />
+
+                                                    <StackPanel Orientation="Horizontal" Spacing="8"
+                                                                HorizontalAlignment="Right" Margin="0,4,0,0">
+                                                        <Button Content="Cancel" Click="OnProgramInfoCancel" />
+                                                        <Button Content="Apply"  Click="OnProgramInfoApply"
+                                                                Style="{StaticResource PrimaryButtonStyle}" />
+                                                    </StackPanel>
+
+                                                </StackPanel>
+                                            </Flyout>
+                                        </FlyoutBase.AttachedFlyout>
+                                        <TextBlock x:Name="TbProgramInfo"
+                                                   Text="PROGRAM · 1920 × 1080 · 24p"
+                                                   FontFamily="{StaticResource MonoFont}"
+                                                   FontSize="10" Foreground="#C8FFFFFF" />
+                                    </Border>
+                                    <TextBlock Text="REC.709 · sRGB"
+                                               FontFamily="{StaticResource MonoFont}"
+                                               FontSize="10" Foreground="#C8FFFFFF"
+                                               HorizontalAlignment="Right" VerticalAlignment="Top" />
+                                </Grid>
+                            </Grid>
+                        </Border>
+
+                        <!-- Playback bar -->
+                        <controls:PlaybackBarControl Grid.Row="1"
+                                                     x:Name="PlaybackBar"
+                                                     Margin="0,10,0,0"
+                                                     PlayClicked="OnPlay"
+                                                     StepBackClicked="OnStepBack"
+                                                     StepFwdClicked="OnStepFwd" />
+                    </Grid>
+                </Border>
+
+                <!-- Timeline toolbar -->
+                <Border Grid.Row="2"
+                        Background="{StaticResource BgPageBrush}"
+                        BorderBrush="{StaticResource HairlineBrush}"
+                        BorderThickness="0,1,0,1" Padding="12,6">
+                    <Grid ColumnDefinitions="Auto,Auto,Auto,*,Auto">
+                        <!-- Tool group -->
+                        <Border Grid.Column="0"
+                                Background="{StaticResource BgSurfaceBrush}"
+                                CornerRadius="{StaticResource RadiusMd}"
+                                Padding="2">
+                            <StackPanel Orientation="Horizontal" Spacing="2">
+                                <Button x:Name="BtnToolCursor" Content="↖" Tag="cursor" Click="OnToolChange"
+                                        Style="{StaticResource GhostButtonStyle}"
+                                        Background="{StaticResource BgElevatedBrush}"
+                                        Padding="7,4" FontSize="12"
+                                        ToolTipService.ToolTip="Selection (V)" />
+                                <Button x:Name="BtnToolRazor" Tag="razor" Click="OnToolChange"
+                                        Style="{StaticResource GhostButtonStyle}" Padding="7,4"
+                                        ToolTipService.ToolTip="Razor / Blade (C)">
+                                    <FontIcon FontFamily="Segoe MDL2 Assets" Glyph="&#xE8C6;" FontSize="12"/>
+                                </Button>
+                                <Button x:Name="BtnToolText"   Content="T"  Tag="text"   Click="OnToolChange"
+                                        Style="{StaticResource GhostButtonStyle}" Padding="7,4" FontSize="12"
+                                        ToolTipService.ToolTip="Text (T)" />
+                                <Button x:Name="BtnToolHand" Tag="hand" Click="OnToolChange"
+                                        Style="{StaticResource GhostButtonStyle}" Padding="7,4"
+                                        ToolTipService.ToolTip="Hand (H)">
+                                    <FontIcon FontFamily="Segoe MDL2 Assets" Glyph="&#xE7C4;" FontSize="12"/>
+                                </Button>
+                            </StackPanel>
+                        </Border>
+
+                        <!-- Separator -->
+                        <Border Grid.Column="1" Style="{StaticResource VSeparatorStyle}" />
+
+                        <!-- Snap / ripple -->
+                        <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="2">
+                            <Button x:Name="BtnSnap" Content="⌁" Click="OnToggleSnap"
+                                    Style="{StaticResource GhostButtonStyle}" Padding="7,4"
+                                    Foreground="{StaticResource AccentInkBrush}"
+                                    ToolTipService.ToolTip="Snapping (S)" />
+                            <Button Content="⋯" Style="{StaticResource GhostButtonStyle}" Padding="7,4"
+                                    Click="OnClipRippleDelete"
+                                    ToolTipService.ToolTip="Ripple delete (Shift+Del)" />
+                        </StackPanel>
+
+                        <!-- Track / clip count -->
+                        <TextBlock x:Name="TbTrackCount" Grid.Column="3" Text="0 tracks"
+                                   FontSize="10.5" FontFamily="{StaticResource MonoFont}"
+                                   Foreground="{StaticResource TextMutedBrush}"
+                                   VerticalAlignment="Center" Margin="8,0" />
+
+                        <!-- Zoom -->
+                        <StackPanel Grid.Column="4" Orientation="Horizontal" Spacing="6"
+                                    VerticalAlignment="Center">
+                            <Button Content="—" Style="{StaticResource GhostButtonStyle}"
+                                    Padding="4" Click="OnZoomOut" FontSize="14" />
+                            <Slider x:Name="ZoomSlider" Width="90" Minimum="10" Maximum="400"
+                                    Value="100" Style="{StaticResource BtapSliderStyle}"
+                                    ValueChanged="OnZoomChanged" />
+                            <Button Content="+" Style="{StaticResource GhostButtonStyle}"
+                                    Padding="4" Click="OnZoomIn" FontSize="14" />
+                        </StackPanel>
+                    </Grid>
+                </Border>
+
+                <!-- Timeline -->
+                <controls:TimelineControl Grid.Row="3"
+                                          x:Name="Timeline"
+                                          Background="{StaticResource BgPageBrush}"
+                                          ClipTapped="OnTimelineClipTapped"
+                                          SelectionCleared="OnTimelineSelectionCleared"
+                                          ClipDeleted="OnTimelineClipDeleted"
+                                          PlayheadChanged="OnPlayheadChanged"
+                                          ZoomChanged="OnTimelineZoomChanged" />
+            </Grid>
+
+            <!-- ── Inspector panel ────────────────────────────────── -->
+            <Grid x:Name="InspectorPanel" Grid.Column="2" RowDefinitions="Auto,Auto,*"
+                  Background="{StaticResource BgPageBrush}">
+
+                <!-- Selected clip header -->
+                <Border Grid.Row="0" Padding="14,12,14,10"
+                        BorderBrush="{StaticResource HairlineBrush}"
+                        BorderThickness="0,0,0,1">
+                    <StackPanel Spacing="8">
+                        <StackPanel Orientation="Horizontal" Spacing="8">
+                            <Border Width="32" Height="20" CornerRadius="3">
+                                <Border.Background>
+                                    <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
+                                        <GradientStop Color="#6A1A3040" Offset="0"/>
+                                        <GradientStop Color="#6A0A1830" Offset="1"/>
+                                    </LinearGradientBrush>
+                                </Border.Background>
+                            </Border>
+                            <StackPanel>
+                                <TextBlock x:Name="TbSelectedClipName"
+                                           Text="interview_01 · A"
+                                           FontSize="12" FontWeight="Medium"
+                                           Foreground="{StaticResource TextPrimaryBrush}" />
+                                <TextBlock x:Name="TbSelectedClipMeta"
+                                           Text="V1 · 00:01:08:14 — 00:01:30:14"
+                                           FontFamily="{StaticResource MonoFont}"
+                                           FontSize="10" Foreground="{StaticResource TextFaintBrush}" />
+                            </StackPanel>
+                        </StackPanel>
+
+                        <!-- Inspector tabs -->
+                        <StackPanel Orientation="Horizontal" Spacing="2">
+                            <Button x:Name="BtnInspVideo"  Content="Video"   Tag="video"   Click="OnInspTabClick" Style="{StaticResource GhostButtonStyle}" FontSize="10.5" Padding="7,3" Background="{StaticResource BgElevatedBrush}" Foreground="{StaticResource TextPrimaryBrush}" />
+                            <Button x:Name="BtnInspAudio"  Content="Audio"   Tag="audio"   Click="OnInspTabClick" Style="{StaticResource GhostButtonStyle}" FontSize="10.5" Padding="7,3" />
+                            <Button x:Name="BtnInspFX"     Content="Effects" Tag="effects" Click="OnInspTabClick" Style="{StaticResource GhostButtonStyle}" FontSize="10.5" Padding="7,3" />
+                            <Button x:Name="BtnInspColor"  Content="Color"   Tag="color"   Click="OnInspTabClick" Style="{StaticResource GhostButtonStyle}" FontSize="10.5" Padding="7,3" />
+                        </StackPanel>
+                    </StackPanel>
+                </Border>
+
+                <!-- Inspector scroll content -->
+                <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto">
+                    <StackPanel x:Name="InspectorContent" Spacing="0" />
+                </ScrollViewer>
+            </Grid>
+        </Grid>
+
+        <!-- ══ Status bar ══════════════════════════════════════════════ -->
+        <Border Grid.Row="3"
+                Background="{StaticResource BgPageBrush}"
+                BorderBrush="{StaticResource HairlineBrush}"
+                BorderThickness="0,1,0,0" Padding="14,0">
+            <Grid ColumnDefinitions="Auto,Auto,Auto,Auto,*,Auto">
+                <TextBlock x:Name="TbStatusResolution" Grid.Column="0" Text="1920×1080"
+                           FontFamily="{StaticResource MonoFont}" FontSize="10.5"
+                           Foreground="{StaticResource TextFaintBrush}"
+                           VerticalAlignment="Center" />
+                <TextBlock Grid.Column="1" Text=" · " FontSize="10.5"
+                           Foreground="{StaticResource TextFaintBrush}" VerticalAlignment="Center" />
+                <TextBlock x:Name="TbStatusDuration" Grid.Column="2" Text="00:00:30:00 sequence"
+                           FontSize="10.5" Foreground="{StaticResource TextFaintBrush}"
+                           VerticalAlignment="Center" />
+                <TextBlock x:Name="TbStatusMedia" Grid.Column="3" Text=" · 0 media"
+                           FontSize="10.5" Foreground="{StaticResource TextFaintBrush}"
+                           VerticalAlignment="Center" />
+                <StackPanel Grid.Column="5" Orientation="Horizontal" Spacing="4"
+                            VerticalAlignment="Center">
+                    <Ellipse Width="6" Height="6" Fill="{StaticResource AccentBrush}" />
+                    <TextBlock x:Name="TbStatusSaved" Text="Saved · 11s ago" FontSize="10.5"
+                               Foreground="{StaticResource AccentBrush}" />
+                </StackPanel>
+            </Grid>
+        </Border>
+    </Grid>
+</Page>

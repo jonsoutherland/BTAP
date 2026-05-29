@@ -1,0 +1,90 @@
+<UserControl
+    x:Class="BTAP.Controls.PlaybackBarControl"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+    <Border Background="{StaticResource BgSurfaceBrush}"
+            BorderBrush="{StaticResource HairlineBrush}"
+            BorderThickness="1"
+            CornerRadius="{StaticResource RadiusMd}"
+            Padding="16,8">
+        <Grid ColumnDefinitions="*,Auto,*">
+
+            <!-- Left: timecodes -->
+            <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="6"
+                        VerticalAlignment="Center">
+                <TextBlock x:Name="TbPlayhead" Text="00:00:00:00"
+                           FontFamily="{StaticResource MonoFont}" FontSize="13" FontWeight="Medium"
+                           Foreground="{StaticResource TextPrimaryBrush}"
+                           VerticalAlignment="Center" />
+                <TextBlock Text="/" FontSize="11"
+                           Foreground="{StaticResource TextFaintBrush}"
+                           VerticalAlignment="Center" />
+                <TextBlock x:Name="TbDuration" Text="00:00:00:00"
+                           FontFamily="{StaticResource MonoFont}" FontSize="11"
+                           Foreground="{StaticResource TextMutedBrush}"
+                           VerticalAlignment="Center" />
+            </StackPanel>
+
+            <!-- Center: transport controls -->
+            <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="6"
+                        VerticalAlignment="Center">
+                <Button x:Name="BtnLoop" Content="⟳"
+                        Style="{StaticResource GhostButtonStyle}"
+                        Width="30" Height="30" Padding="0" FontSize="14"
+                        HorizontalContentAlignment="Center"
+                        Click="OnLoopClick"
+                        ToolTipService.ToolTip="Loop (L)" />
+                <Button x:Name="BtnStepBack" Content="⏮"
+                        Style="{StaticResource GhostButtonStyle}"
+                        Width="30" Height="30" Padding="0" FontSize="14"
+                        HorizontalContentAlignment="Center"
+                        Click="OnStepBackClick"
+                        ToolTipService.ToolTip="Step Back (J)" />
+                <Button x:Name="BtnPlay"
+                        Style="{StaticResource PrimaryButtonStyle}"
+                        Width="44" Height="34" Padding="0"
+                        HorizontalContentAlignment="Center"
+                        Click="OnPlayClick"
+                        ToolTipService.ToolTip="Play / Pause (Space)">
+                    <FontIcon x:Name="PlayIcon" FontFamily="Segoe MDL2 Assets"
+                              Glyph="&#xE768;" FontSize="14"/>
+                </Button>
+                <Button x:Name="BtnStepFwd" Content="⏭"
+                        Style="{StaticResource GhostButtonStyle}"
+                        Width="30" Height="30" Padding="0" FontSize="14"
+                        HorizontalContentAlignment="Center"
+                        Click="OnStepFwdClick"
+                        ToolTipService.ToolTip="Step Forward (K)" />
+                <Button x:Name="BtnMarker"
+                        Style="{StaticResource GhostButtonStyle}"
+                        Width="30" Height="30" Padding="0"
+                        HorizontalContentAlignment="Center"
+                        Click="OnMarkerClick"
+                        ToolTipService.ToolTip="Add Marker (M)">
+                    <FontIcon FontFamily="Segoe MDL2 Assets" Glyph="&#xE7C1;" FontSize="11"/>
+                </Button>
+            </StackPanel>
+
+            <!-- Right: speed / extras -->
+            <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="10"
+                        HorizontalAlignment="Right" VerticalAlignment="Center">
+                <TextBlock x:Name="TbSpeed" Text="1×"
+                           FontFamily="{StaticResource MonoFont}" FontSize="11"
+                           Foreground="{StaticResource TextMutedBrush}"
+                           VerticalAlignment="Center" />
+                <TextBlock Text="JKL"
+                           FontFamily="{StaticResource MonoFont}" FontSize="10"
+                           Foreground="{StaticResource TextFaintBrush}"
+                           VerticalAlignment="Center" />
+                <Button Style="{StaticResource GhostButtonStyle}"
+                        Width="28" Height="28" Padding="0"
+                        HorizontalContentAlignment="Center"
+                        Click="OnFullscreenClick"
+                        ToolTipService.ToolTip="Fullscreen Preview (F)">
+                    <FontIcon FontFamily="Segoe MDL2 Assets" Glyph="&#xE1D9;" FontSize="12"/>
+                </Button>
+            </StackPanel>
+        </Grid>
+    </Border>
+</UserControl>

@@ -1,0 +1,68 @@
+<UserControl
+    x:Class="BTAP.Controls.TimelineControl"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+    <Grid>
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="96" />
+            <ColumnDefinition Width="*" />
+        </Grid.ColumnDefinitions>
+
+        <!-- Fixed left column: corner + track headers (slid vertically in sync with the main scroller) -->
+        <Grid Grid.Column="0" RowDefinitions="24,*">
+            <Border Grid.Row="0"
+                    Background="{StaticResource BgSurfaceBrush}"
+                    BorderBrush="{StaticResource HairlineBrush}"
+                    BorderThickness="0,0,1,1" />
+            <Border Grid.Row="1"
+                    Background="{StaticResource BgPageBrush}"
+                    BorderBrush="{StaticResource HairlineBrush}"
+                    BorderThickness="0,0,1,0"
+                    PointerWheelChanged="OnTimelineWheel">
+                <StackPanel x:Name="TrackHeaders">
+                    <StackPanel.RenderTransform>
+                        <TranslateTransform x:Name="TrackHeadersTransform" />
+                    </StackPanel.RenderTransform>
+                </StackPanel>
+            </Border>
+        </Grid>
+
+        <!-- Scrollable right column: ruler + clips -->
+        <ScrollViewer Grid.Column="1" x:Name="MainScroller"
+                      HorizontalScrollBarVisibility="Auto"
+                      VerticalScrollBarVisibility="Auto"
+                      VerticalScrollMode="Enabled"
+                      ViewChanged="OnScrollChanged">
+            <Grid x:Name="ContentGrid" RowDefinitions="24,Auto">
+                <Border Grid.Row="0" Height="24"
+                        Background="{StaticResource BgSurfaceBrush}"
+                        BorderBrush="{StaticResource HairlineBrush}"
+                        BorderThickness="0,0,0,1"
+                        SizeChanged="OnRulerSizeChanged">
+                    <Canvas x:Name="RulerCanvas"
+                            Background="Transparent"
+                            PointerPressed="OnRulerPointerPressed"
+                            PointerMoved="OnRulerPointerMoved"
+                            PointerReleased="OnRulerPointerReleased"
+                            PointerCaptureLost="OnRulerPointerCaptureLost"
+                            PointerCanceled="OnRulerPointerCaptureLost"
+                            PointerWheelChanged="OnTimelineWheel" />
+                </Border>
+                <Canvas x:Name="ClipCanvas" Grid.Row="1"
+                        Background="Transparent"
+                        AllowDrop="True"
+                        DragEnter="OnClipCanvasDragOver"
+                        DragOver="OnClipCanvasDragOver"
+                        DragLeave="OnClipCanvasDragLeave"
+                        Drop="OnClipCanvasDrop"
+                        PointerPressed="OnClipCanvasPointerPressed"
+                        PointerMoved="OnClipCanvasPointerMoved"
+                        PointerReleased="OnClipCanvasPointerReleased"
+                        PointerCaptureLost="OnClipCanvasPointerCaptureLost"
+                        PointerCanceled="OnClipCanvasPointerCaptureLost"
+                        PointerWheelChanged="OnTimelineWheel" />
+            </Grid>
+        </ScrollViewer>
+    </Grid>
+</UserControl>
