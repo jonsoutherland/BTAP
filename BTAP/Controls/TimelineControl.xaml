@@ -33,8 +33,9 @@
                       HorizontalScrollBarVisibility="Auto"
                       VerticalScrollBarVisibility="Auto"
                       VerticalScrollMode="Enabled"
-                      ViewChanged="OnScrollChanged">
-            <Grid x:Name="ContentGrid" RowDefinitions="24,Auto">
+                      ViewChanged="OnScrollChanged"
+                      SizeChanged="OnMainScrollerSizeChanged">
+            <Grid x:Name="ContentGrid" RowDefinitions="24,Auto" HorizontalAlignment="Left">
                 <Border Grid.Row="0" Height="24"
                         Background="{StaticResource BgSurfaceBrush}"
                         BorderBrush="{StaticResource HairlineBrush}"

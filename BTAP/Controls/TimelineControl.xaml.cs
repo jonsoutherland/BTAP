@@ -1,5 +1,7 @@
 using System.IO;
+using System.Reflection;
 using System.Runtime.InteropServices.WindowsRuntime;
+using Microsoft.UI.Input;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Input;
@@ -19,6 +21,7 @@ public sealed partial class TimelineControl : UserControl
     private const double RulerHeight = 24.0;
     private const double VideoTrackHeight = 54.0;
     private const double AudioTrackHeight = 40.0;
+    private const double TitleTrackHeight = 36.0;
     private const double BasePixelsPerSec = 40.0;
     private const double EdgeHitZone = 8.0;
     private const double TrackInsertZone = 14.0;  // drop-here-for-new-track region above & below the stack
@@ -44,6 +47,11 @@ public sealed partial class TimelineControl : UserControl
     private readonly List<(double Y, double Height)> _trackRects = [];
 
     private bool _isLoaded;
+    // Re-entrancy guard. ClipCanvas.Children.Clear() inside BuildTracks() can
+    // synchronously fire PointerCaptureLost on a captured Border, whose handler
+    // also calls Rebuild(). Without this flag the outer Rebuild's foreach would
+    // resume after the inner finished and double-populate ClipCanvas + _trackRects.
+    private bool _isRebuilding;
 
     // Drag state
     private TimelineClip? _dragClip;
@@ -54,11 +62,24 @@ public sealed partial class TimelineControl : UserControl
     private TimeSpan       _dragFromStart;
     private bool           _isDragging;
 
+    // Vertical-drag (cross-track) state
+    private Track?         _dragOriginalTrack;     // where the clip lived when the drag started
+    private int            _dragOriginalIndex;     // its index in OriginalTrack.Clips, for undo
+    private Track?         _dragHoverTrack;        // last track the cursor was over (for visual snap)
+    private double         _dragOriginalBorderY;   // Canvas.Top of the border at press
+    private double         _dragOriginY;           // cursor Y in ClipCanvas coords at press
+    private Microsoft.UI.Xaml.Shapes.Rectangle? _dropTargetHighlight; // tinted rect over the hovered track row
+
+    // When the user drags above the topmost track or below the bottommost track, we
+    // commit the drop as "create a new track and reparent." -1 / +1 indicate top/bottom.
+    private int            _dragInsertNewTrackDir; // 0 = no insert, -1 = above all, +1 = below all
+
     // Trim state
     private bool           _isTrimMode;
     private bool           _trimFromLeft;
     private TimeSpan       _trimOriginalStart;
     private TimeSpan       _trimOriginalDuration;
+    private TimeSpan       _trimOriginalSourceStart;
 
     // Drop indicator
     private Line?          _dropIndicator;
@@ -102,7 +123,14 @@ public sealed partial class TimelineControl : UserControl
         if (DispatcherQueue is null) return;
         DispatcherQueue.TryEnqueue(() =>
         {
-            if (_isLoaded) Rebuild();
+            if (!_isLoaded) return;
+            // A drag in progress has the pointer captured by one of ClipCanvas's
+            // Border children. Tearing down ClipCanvas.Children mid-drag would
+            // synchronously fire PointerCaptureLost into a partially-rebuilt visual
+            // tree, re-enter Rebuild, and corrupt _trackRects / the child list.
+            // The waveform will be picked up by the natural rebuild on release.
+            if (_dragClip is not null || _isRazoring) return;
+            Rebuild();
         });
     }
 
@@ -135,8 +163,14 @@ public sealed partial class TimelineControl : UserControl
     private void Rebuild()
     {
         if (!_isLoaded || ViewModel is null) return;
-        BuildTracks();
-        BuildRuler();
+        if (_isRebuilding) return;
+        _isRebuilding = true;
+        try
+        {
+            BuildTracks();
+            BuildRuler();
+        }
+        finally { _isRebuilding = false; }
     }
 
     private void BuildTracks()
@@ -155,7 +189,12 @@ public sealed partial class TimelineControl : UserControl
         double y = TrackInsertZone;
         foreach (var track in vm.Tracks)
         {
-            double h = track.Kind == TrackKind.Video ? VideoTrackHeight : AudioTrackHeight;
+            double h = track.Kind switch
+            {
+                TrackKind.Video => VideoTrackHeight,
+                TrackKind.Title => TitleTrackHeight,
+                _               => AudioTrackHeight,
+            };
             _trackRects.Add((y, h));
 
             AddTrackHeader(track, h);
@@ -171,7 +210,13 @@ public sealed partial class TimelineControl : UserControl
         TrackHeaders.Children.Add(new Border { Height = TrackInsertZone });
 
         ClipCanvas.Width = totalWidth;
-        ClipCanvas.Height = Math.Max(y + TrackInsertZone, 1);
+        // Fill the visible timeline area below the ruler so the empty space under the
+        // last track still accepts drops. Without this the canvas would be as short as
+        // the track stack and an empty project would have a ~28px drop zone — too small
+        // to discover, and any drop below it falls outside the canvas entirely.
+        double tracksBottom = y + TrackInsertZone;
+        double viewportFill = Math.Max(0, MainScroller.ViewportHeight - RulerHeight);
+        ClipCanvas.Height = Math.Max(tracksBottom, Math.Max(viewportFill, 1));
 
         DrawPlayhead(vm.Project.Playhead.TotalSeconds * _pixelsPerSec);
     }
@@ -191,9 +236,12 @@ public sealed partial class TimelineControl : UserControl
         {
             Width = 5,
             Height = 5,
-            Fill = track.Kind == TrackKind.Video
-                ? new SolidColorBrush(Color.FromArgb(255, 45, 110, 180))
-                : new SolidColorBrush(Color.FromArgb(255, 45, 140, 80)),
+            Fill = track.Kind switch
+            {
+                TrackKind.Video => new SolidColorBrush(Color.FromArgb(255, 45, 110, 180)),
+                TrackKind.Title => new SolidColorBrush(Color.FromArgb(255, 200, 120, 60)),
+                _               => new SolidColorBrush(Color.FromArgb(255, 45, 140, 80)),
+            },
             VerticalAlignment = VerticalAlignment.Center,
             Margin = new Thickness(0, 0, 5, 0),
         };
@@ -292,11 +340,29 @@ public sealed partial class TimelineControl : UserControl
         // Waveform overlay (above background, below label) for clips that point at a
         // media file with audio. The bitmap is rendered at the clip's actual on-screen
         // pixel width so it stays crisp at any zoom level, and only the played-in slice
-        // (SourceStart..SourceStart+Duration) is drawn.
+        // (SourceStart..SourceStart+Duration) is drawn. The image lives inside a Canvas
+        // host so it can be sized larger than the clip's current Border width during a
+        // trim drag without the layout system shrinking it; the Border's CornerRadius
+        // takes care of clipping the visible overflow.
         var waveformImage = TryCreateWaveformImage(clip, w);
 
         var contentRoot = new Grid();
-        if (waveformImage is not null) contentRoot.Children.Add(waveformImage);
+        if (waveformImage is not null)
+        {
+            double waveW = Math.Max(1, w - 4);
+            double waveH = Math.Max(1, trackHeight - 11);
+            waveformImage.Width  = waveW;
+            waveformImage.Height = waveH;
+            waveformImage.Margin = new Thickness(0);
+            waveformImage.HorizontalAlignment = HorizontalAlignment.Left;
+            waveformImage.VerticalAlignment   = VerticalAlignment.Top;
+            Canvas.SetLeft(waveformImage, 2);
+            Canvas.SetTop(waveformImage, 4);
+
+            var waveformHost = new Canvas { IsHitTestVisible = false };
+            waveformHost.Children.Add(waveformImage);
+            contentRoot.Children.Add(waveformHost);
+        }
         contentRoot.Children.Add(label);
 
         var border = new Border
@@ -322,6 +388,7 @@ public sealed partial class TimelineControl : UserControl
         border.PointerReleased    += OnClipPointerReleased;
         border.PointerCaptureLost += OnClipPointerCaptureLost;
         border.PointerCanceled    += OnClipPointerCaptureLost;
+        border.PointerExited      += OnClipPointerExited;
 
         // Right-click context menu
         var flyout = new MenuFlyout();
@@ -338,6 +405,224 @@ public sealed partial class TimelineControl : UserControl
         border.ContextFlyout = flyout;
 
         ClipCanvas.Children.Add(border);
+    }
+
+    // Shared hover cursors — InputSystemCursor.Create allocates a real OS handle on
+    // every call so we keep static singletons rather than reallocating on each move.
+    private static readonly InputCursor s_resizeEWCursor = InputSystemCursor.Create(InputSystemCursorShape.SizeWestEast);
+    private static readonly InputCursor s_sizeAllCursor  = InputSystemCursor.Create(InputSystemCursorShape.SizeAll);
+    private static readonly InputCursor s_arrowCursor    = InputSystemCursor.Create(InputSystemCursorShape.Arrow);
+
+    // Border is sealed in WinUI 3 so we can't subclass it to expose ProtectedCursor.
+    // The setter is protected on UIElement; reach it via reflection (cached) instead.
+    private static readonly MethodInfo? s_setProtectedCursor =
+        typeof(UIElement).GetProperty("ProtectedCursor",
+            BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public)?.GetSetMethod(nonPublic: true);
+
+    private static void SetCursor(UIElement element, InputCursor cursor)
+    {
+        try { s_setProtectedCursor?.Invoke(element, new object[] { cursor }); }
+        catch { /* shouldn't happen but never crash the UI over a cursor */ }
+    }
+
+    /// <summary>Pick the right cursor for the pointer's position over <paramref name="border"/>:
+    /// resize-east-west on the left/right trim zones, size-all on the body, default cursor
+    /// when the track is locked or the razor tool is active (which has its own slice affordance).</summary>
+    private void UpdateHoverCursor(Border border, TimelineClip clip, Track track, double localX)
+    {
+        if (track.IsLocked || ViewModel?.ActiveTool == ActiveTool.Razor)
+        {
+            SetCursor(border, s_arrowCursor);
+            return;
+        }
+        double w = border.Width;
+        if (localX <= EdgeHitZone || localX >= w - EdgeHitZone)
+            SetCursor(border, s_resizeEWCursor);
+        else
+            SetCursor(border, s_sizeAllCursor);
+    }
+
+    private void OnClipPointerExited(object sender, PointerRoutedEventArgs e)
+    {
+        // Only reset the cursor when the user wasn't mid-drag; if they were, the drag
+        // session owns the cursor and will reset it on release.
+        if (_dragClip is null && sender is Border b)
+            SetCursor(b, s_arrowCursor);
+    }
+
+    // ── Trim visual cue ─────────────────────────────────────────────────
+    // While trimming, paint a bright stripe on the trimming edge and recolor the
+    // clip's outline so the user can tell at a glance that they're resizing the clip
+    // rather than dragging it sideways.
+
+    private static readonly Color   TrimAccentColor       = Color.FromArgb(255, 255, 200, 100);
+    private static readonly Color   TrimAccentDarkColor   = Color.FromArgb(255, 200, 140, 50);
+    private const           double  TrimHandleWidth       = 4.0;
+    private Rectangle?              _trimHandleOverlay;
+    private Brush?                  _trimOriginalBorderBrush;
+    private Thickness?              _trimOriginalBorderThickness;
+
+    // Frozen-waveform state — while a trim is in progress the image's Width stays
+    // pinned (because its host Canvas doesn't impose a layout constraint), and a
+    // TranslateTransform slides it for left-trims so the trim edges visibly cross an
+    // unchanging waveform instead of watching the peaks rubber-band.
+    private Image?                  _trimWaveformImage;
+    private TranslateTransform?     _trimImageTransform;
+    private double                  _trimOriginalBorderLeft;
+
+    private void BeginTrimVisual(Border b, bool fromLeft)
+    {
+        // Stash the clip's original outline so EndTrimVisual can restore it.
+        _trimOriginalBorderBrush     = b.BorderBrush;
+        _trimOriginalBorderThickness = b.BorderThickness;
+        b.BorderBrush = new SolidColorBrush(TrimAccentColor);
+        b.BorderThickness = new Thickness(1.5);
+        SetCursor(b, s_resizeEWCursor);
+
+        if (_trimHandleOverlay is null)
+        {
+            _trimHandleOverlay = new Rectangle
+            {
+                Fill = new SolidColorBrush(TrimAccentColor),
+                Stroke = new SolidColorBrush(TrimAccentDarkColor),
+                StrokeThickness = 1,
+                IsHitTestVisible = false,
+                RadiusX = 1.5,
+                RadiusY = 1.5,
+            };
+            ClipCanvas.Children.Add(_trimHandleOverlay);
+        }
+        UpdateTrimHandlePosition(b, fromLeft);
+        Canvas.SetZIndex(_trimHandleOverlay, 150);
+
+        FreezeWaveform(b);
+    }
+
+    private void UpdateTrimHandlePosition(Border b, bool fromLeft)
+    {
+        if (_trimHandleOverlay is not null)
+        {
+            double left = Canvas.GetLeft(b);
+            double top  = Canvas.GetTop(b);
+            double handleX = fromLeft ? left : left + b.Width - TrimHandleWidth;
+            _trimHandleOverlay.Width  = TrimHandleWidth;
+            _trimHandleOverlay.Height = Math.Max(2, b.Height);
+            Canvas.SetLeft(_trimHandleOverlay, handleX);
+            Canvas.SetTop(_trimHandleOverlay, top);
+        }
+
+        // For left-trim, slide the frozen waveform left inside the border by the
+        // exact amount the border moved right, so the peaks stay anchored in
+        // canvas-space and the new left edge passes over the unchanged waveform.
+        if (_trimImageTransform is not null && fromLeft)
+            _trimImageTransform.X = -(Canvas.GetLeft(b) - _trimOriginalBorderLeft);
+    }
+
+    private void FreezeWaveform(Border b)
+    {
+        // The waveform image lives in a Canvas inside the content Grid — Canvas is
+        // chosen specifically because it does NOT layout-constrain its children, so
+        // the image keeps its explicit Width during a trim even when the parent
+        // Border shrinks. The Border's CornerRadius clips overflow visually.
+        if (b.Child is not Grid grid) return;
+        Image? img = null;
+        foreach (var child in grid.Children)
+        {
+            if (child is Canvas host)
+                foreach (var c in host.Children)
+                    if (c is Image i) { img = i; break; }
+            if (img is not null) break;
+        }
+        if (img is null) return;
+
+        _trimWaveformImage      = img;
+        _trimOriginalBorderLeft = Canvas.GetLeft(b);
+
+        // Re-render the waveform across the FULL range the trim could expose, not just
+        // the clip's current source extent. Otherwise the user can trim inward, release,
+        // and then trim outward again — and the newly-uncovered portion of the clip has
+        // no waveform pixels because the image was rendered at the smaller range.
+        RenderExtendedWaveformForTrim(img);
+
+        // Image.Width is already explicit (set in AddClipRect or RenderExtendedWaveformForTrim)
+        // so its rendered size is locked. All we need is a TranslateTransform to slide it
+        // for left-trim.
+        _trimImageTransform = new TranslateTransform();
+        img.RenderTransform = _trimImageTransform;
+    }
+
+    /// <summary>Replace the in-place waveform image with one rendered over the maximum
+    /// span the current trim could reach: source [0, originalEnd] for a left-trim,
+    /// or [originalStart, sourceTotalDuration] for a right-trim. Positioned so the
+    /// pre-trim source-pixel mapping still aligns at the original edge, so the
+    /// canvas-anchored sliding behavior is preserved.</summary>
+    private void RenderExtendedWaveformForTrim(Image img)
+    {
+        if (_dragClip is null || ViewModel is null) return;
+        if (string.IsNullOrEmpty(_dragClip.SourceId)) return;
+        var media = ViewModel.MediaBin.FirstOrDefault(m => m.Id == _dragClip.SourceId);
+        if (media is null || string.IsNullOrEmpty(media.FilePath)) return;
+        var peaks = BTAP.Services.WaveformService.GetCachedPeaks(media.FilePath);
+        if (peaks is null) return;
+
+        double sourceTotalSec = peaks.Duration.TotalSeconds;
+        double extStart, extEnd;
+        if (_trimFromLeft)
+        {
+            extStart = 0;
+            extEnd   = _trimOriginalSourceStart.TotalSeconds + _trimOriginalDuration.TotalSeconds;
+        }
+        else
+        {
+            extStart = _trimOriginalSourceStart.TotalSeconds;
+            extEnd   = sourceTotalSec;
+        }
+        if (extEnd <= extStart) return;
+
+        double extWidthPx = (extEnd - extStart) * _pixelsPerSec;
+        if (extWidthPx < 1) return;
+
+        var color = _dragClip.Kind == ClipKind.Audio || _dragClip.Kind == ClipKind.Music
+            ? Color.FromArgb(230, 130, 220, 160)
+            : Color.FromArgb(200, 230, 240, 250);
+
+        // Bitmap is keyed off SourceStart/Duration in the rendering routine, so feed
+        // it a synthetic clip describing the extended range.
+        var synthClip = new TimelineClip
+        {
+            SourceStart = TimeSpan.FromSeconds(extStart),
+            Duration    = TimeSpan.FromSeconds(extEnd - extStart),
+        };
+        img.Source = RenderWaveformBitmap(peaks, color, synthClip, extWidthPx);
+        img.Width  = extWidthPx;
+
+        // Re-anchor: the pixel for the original SourceStart should still sit at the
+        // border-relative x=2 gutter (where AddClipRect originally placed the image).
+        double pixelForOriginalStart = (_trimOriginalSourceStart.TotalSeconds - extStart) * _pixelsPerSec;
+        Canvas.SetLeft(img, 2 - pixelForOriginalStart);
+    }
+
+    private void EndTrimVisual()
+    {
+        if (_dragBorder is Border b && _trimOriginalBorderBrush is not null)
+        {
+            b.BorderBrush = _trimOriginalBorderBrush;
+            if (_trimOriginalBorderThickness.HasValue)
+                b.BorderThickness = _trimOriginalBorderThickness.Value;
+            SetCursor(b, s_arrowCursor);
+        }
+        _trimOriginalBorderBrush     = null;
+        _trimOriginalBorderThickness = null;
+        if (_trimHandleOverlay is not null)
+        {
+            ClipCanvas.Children.Remove(_trimHandleOverlay);
+            _trimHandleOverlay = null;
+        }
+
+        if (_trimWaveformImage is not null)
+            _trimWaveformImage.RenderTransform = null;
+        _trimWaveformImage  = null;
+        _trimImageTransform = null;
     }
 
     private void OnClipPointerPressed(object sender, PointerRoutedEventArgs e)
@@ -386,10 +671,16 @@ public sealed partial class TimelineControl : UserControl
         _dragClip = clip;
         _dragTrack = track;
         _dragBorder = b;
-        _dragOriginX = e.GetCurrentPoint(ClipCanvas).Position.X;
+        var pressCanvas = e.GetCurrentPoint(ClipCanvas).Position;
+        _dragOriginX = pressCanvas.X;
+        _dragOriginY = pressCanvas.Y;
         _dragOriginClipSec = clip.TimelineStart.TotalSeconds;
         _dragFromStart = clip.TimelineStart;
         _isDragging = false;
+        _dragOriginalTrack   = track;
+        _dragOriginalIndex   = track.Clips.IndexOf(clip);
+        _dragHoverTrack      = track;
+        _dragOriginalBorderY = Canvas.GetTop(b);
 
         if (localX <= EdgeHitZone)
         {
@@ -397,7 +688,9 @@ public sealed partial class TimelineControl : UserControl
             _trimFromLeft = true;
             _trimOriginalStart = clip.TimelineStart;
             _trimOriginalDuration = clip.Duration;
+            _trimOriginalSourceStart = clip.SourceStart;
             _multiDragItems = null;  // trim is always single-clip
+            BeginTrimVisual(b, fromLeft: true);
         }
         else if (localX >= w - EdgeHitZone)
         {
@@ -405,7 +698,9 @@ public sealed partial class TimelineControl : UserControl
             _trimFromLeft = false;
             _trimOriginalStart = clip.TimelineStart;
             _trimOriginalDuration = clip.Duration;
+            _trimOriginalSourceStart = clip.SourceStart;
             _multiDragItems = null;
+            BeginTrimVisual(b, fromLeft: false);
         }
         else
         {
@@ -445,38 +740,100 @@ public sealed partial class TimelineControl : UserControl
             return;
         }
 
-        if (_dragClip is null || _dragBorder is null) return;
+        // Hover-only: no active drag → set the cursor based on which zone of the clip
+        // the pointer is over (resize on the edges, move on the body) so the user knows
+        // a press will trim vs. drag before they commit to it.
+        if (_dragClip is null)
+        {
+            if (sender is Border hoverBorder && hoverBorder.Tag is (TimelineClip hoverClip, Track hoverTrack))
+                UpdateHoverCursor(hoverBorder, hoverClip, hoverTrack, e.GetCurrentPoint(hoverBorder).Position.X);
+            return;
+        }
+        if (_dragBorder is null) return;
         var pt = e.GetCurrentPoint(ClipCanvas);
         if (!pt.Properties.IsLeftButtonPressed) return;
 
         double deltaX = pt.Position.X - _dragOriginX;
-        if (!_isDragging && Math.Abs(deltaX) < 5) return;
+        double deltaY = pt.Position.Y - (_dragOriginalBorderY + (_dragBorder.Height / 2));
+        if (!_isDragging && Math.Abs(deltaX) < 5 && Math.Abs(deltaY) < 5) return;
         _isDragging = true;
 
         if (_isTrimMode)
         {
             double deltaSec = deltaX / _pixelsPerSec;
+            // Ctrl held mid-drag forces snapping for this drag regardless of the
+            // persistent SnapEnabled toggle, matching the move-drag behavior below.
+            bool snapActive = IsCtrlDown() || ViewModel?.SnapEnabled == true;
             if (_trimFromLeft)
             {
-                double newStartSec = Math.Max(0, _trimOriginalStart.TotalSeconds + deltaSec);
-                double newDurSec   = _trimOriginalDuration.TotalSeconds - (newStartSec - _trimOriginalStart.TotalSeconds);
-                if (newDurSec < 0.1) return;
+                // Trim-left changes the clip's in-point: advance both TimelineStart and
+                // SourceStart by the same delta so the visible portion of the underlying
+                // media shifts forward (rather than just shrinking the display window
+                // while replaying the same opening frames).
+                double minDelta = Math.Max(
+                    -_trimOriginalStart.TotalSeconds,        // TimelineStart ≥ 0
+                    -_trimOriginalSourceStart.TotalSeconds); // SourceStart ≥ 0
+                double maxDelta = _trimOriginalDuration.TotalSeconds - 0.1; // Duration ≥ 0.1
+                double delta = Math.Clamp(deltaSec, minDelta, maxDelta);
+
+                if (snapActive)
+                {
+                    double candidateEdge = _trimOriginalStart.TotalSeconds + delta;
+                    double snappedEdge = FindSnapPosition(candidateEdge, _dragClip);
+                    double snappedDelta = snappedEdge - _trimOriginalStart.TotalSeconds;
+                    if (snappedDelta >= minDelta && snappedDelta <= maxDelta)
+                        delta = snappedDelta;
+                }
+
+                double newStartSec = _trimOriginalStart.TotalSeconds       + delta;
+                double newDurSec   = _trimOriginalDuration.TotalSeconds    - delta;
+                double newSrcSec   = _trimOriginalSourceStart.TotalSeconds + delta;
+
                 _dragClip.TimelineStart = TimeSpan.FromSeconds(newStartSec);
                 _dragClip.Duration      = TimeSpan.FromSeconds(newDurSec);
+                _dragClip.SourceStart   = TimeSpan.FromSeconds(newSrcSec);
                 Canvas.SetLeft(_dragBorder, newStartSec * _pixelsPerSec);
                 _dragBorder.Width = Math.Max(newDurSec * _pixelsPerSec, 4);
             }
             else
             {
-                double newDurSec = Math.Max(0.1, _trimOriginalDuration.TotalSeconds + deltaSec);
+                double minDelta = 0.1 - _trimOriginalDuration.TotalSeconds; // Duration ≥ 0.1
+                double delta = Math.Max(deltaSec, minDelta);
+
+                if (snapActive)
+                {
+                    double originalEndSec = _trimOriginalStart.TotalSeconds + _trimOriginalDuration.TotalSeconds;
+                    double candidateEdge = originalEndSec + delta;
+                    double snappedEdge = FindSnapPosition(candidateEdge, _dragClip);
+                    double snappedDelta = snappedEdge - originalEndSec;
+                    if (snappedDelta >= minDelta)
+                        delta = snappedDelta;
+                }
+
+                double newDurSec = _trimOriginalDuration.TotalSeconds + delta;
                 _dragClip.Duration = TimeSpan.FromSeconds(newDurSec);
                 _dragBorder.Width = Math.Max(newDurSec * _pixelsPerSec, 4);
             }
+            UpdateTrimHandlePosition(_dragBorder, _trimFromLeft);
+
+            // Seek the preview to the trim edge so the user sees the actual frame they're
+            // landing on. Left-trim → first frame of the (new) clip; right-trim → last
+            // frame of the clip (one frame back so the playhead is still inside it; the
+            // compositor only renders a layer while playhead < TimelineEnd).
+            double fps = Math.Max(1, ViewModel?.Project.FrameRate ?? 24.0);
+            var oneFrame = TimeSpan.FromSeconds(1.0 / fps);
+            TimeSpan previewPos = _trimFromLeft
+                ? _dragClip.TimelineStart
+                : _dragClip.TimelineEnd - oneFrame;
+            if (previewPos < TimeSpan.Zero) previewPos = TimeSpan.Zero;
+            PlayheadChanged?.Invoke(this, previewPos);
         }
         else
         {
             double newStartSec = Math.Max(0, _dragOriginClipSec + deltaX / _pixelsPerSec);
-            if (ViewModel?.SnapEnabled == true)
+            // Ctrl held mid-drag forces snapping for this drag regardless of the
+            // persistent SnapEnabled toggle.
+            if (ViewModel?.SnapEnabled == true || IsCtrlDown())
                 newStartSec = FindSnapPosition(newStartSec, _dragClip);
 
             // Multi-drag: clamp delta so no other selected clip would go negative,
@@ -501,9 +858,126 @@ public sealed partial class TimelineControl : UserControl
 
             _dragClip.TimelineStart = TimeSpan.FromSeconds(newStartSec);
             Canvas.SetLeft(_dragBorder, newStartSec * _pixelsPerSec);
+
+            // Vertical free-drag — only when this is a single-clip drag. With a
+            // multi-selection we'd need a "preserve relative track offsets" pass that's
+            // not worth the complexity for v1; the user can still use Ctrl+Up/Down on a
+            // multi-selection. The dragged border follows the cursor freely and the
+            // candidate target track is shown as a highlighted row; the actual reparent
+            // commits on pointer release.
+            if (_multiDragItems is null && _dragOriginalTrack is not null)
+            {
+                // Float the dragged border above its peers so it visibly "picks up".
+                Canvas.SetZIndex(_dragBorder, 100);
+
+                int insertDir = DetectInsertZone(pt.Position.Y);
+                if (insertDir != 0)
+                {
+                    _dragInsertNewTrackDir = insertDir;
+                    _dragHoverTrack = null;
+                    HideDropTargetHighlight();
+                    double indicatorY = insertDir < 0
+                        ? TrackInsertZone / 2
+                        : ClipCanvas.Height - TrackInsertZone / 2;
+                    ShowTrackInsertIndicator(indicatorY);
+                }
+                else
+                {
+                    _dragInsertNewTrackDir = 0;
+                    HideTrackInsertIndicator();
+
+                    var targetTrack = FindTrackForVerticalDrag(pt.Position.Y, _dragClip.Kind);
+                    if (targetTrack is not null)
+                    {
+                        _dragHoverTrack = targetTrack;
+                        int idx = ViewModel!.Tracks.IndexOf(targetTrack);
+                        if (idx >= 0 && idx < _trackRects.Count)
+                            ShowDropTargetHighlight(_trackRects[idx].Y, _trackRects[idx].Height);
+                    }
+                    else
+                    {
+                        // Hovering an incompatible/locked track — no valid drop here.
+                        _dragHoverTrack = null;
+                        HideDropTargetHighlight();
+                    }
+                }
+
+                // The border follows the cursor's vertical movement so the user feels
+                // they're carrying the clip rather than snapping between rows.
+                double freeY = _dragOriginalBorderY + (pt.Position.Y - _dragOriginY);
+                // Don't let it wander completely off-canvas; clamp to a generous range.
+                double maxY = Math.Max(0, ClipCanvas.Height - _dragBorder.Height);
+                freeY = Math.Clamp(freeY, -_dragBorder.Height / 2, maxY + _dragBorder.Height / 2);
+                Canvas.SetTop(_dragBorder, freeY);
+            }
         }
         e.Handled = true;
     }
+
+    private void ShowDropTargetHighlight(double y, double height)
+    {
+        if (_dropTargetHighlight is null)
+        {
+            _dropTargetHighlight = new Microsoft.UI.Xaml.Shapes.Rectangle
+            {
+                Fill = new SolidColorBrush(Color.FromArgb(48, 127, 176, 105)),
+                Stroke = new SolidColorBrush(Color.FromArgb(200, 127, 176, 105)),
+                StrokeThickness = 1.5,
+                IsHitTestVisible = false,
+            };
+            ClipCanvas.Children.Add(_dropTargetHighlight);
+        }
+        _dropTargetHighlight.Width  = Math.Max(1, ClipCanvas.Width);
+        _dropTargetHighlight.Height = height;
+        Canvas.SetLeft(_dropTargetHighlight, 0);
+        Canvas.SetTop(_dropTargetHighlight, y);
+        Canvas.SetZIndex(_dropTargetHighlight, 50);
+    }
+
+    private void HideDropTargetHighlight()
+    {
+        if (_dropTargetHighlight is null) return;
+        ClipCanvas.Children.Remove(_dropTargetHighlight);
+        _dropTargetHighlight = null;
+    }
+
+    private const double KeyVerticalParkOffsetTop = 0; // park flush with top edge
+
+    /// <summary>Returns -1 if Y is above all tracks (drop here = new track on top),
+    /// +1 if Y is below all tracks (new track on bottom), or 0 if it's over a track row.</summary>
+    private int DetectInsertZone(double canvasY)
+    {
+        if (_trackRects.Count == 0) return 0;
+        if (canvasY < _trackRects[0].Y - 2) return -1;
+        var (lastY, lastH) = _trackRects[^1];
+        if (canvasY > lastY + lastH + 2) return 1;
+        return 0;
+    }
+
+    /// <summary>Pick the track row under <paramref name="canvasY"/>, but only if it's
+    /// unlocked and matches the dragging clip's kind (video clips → video tracks; audio
+    /// clips → audio tracks). Returns null when there's no compatible row under the cursor.</summary>
+    private Track? FindTrackForVerticalDrag(double canvasY, ClipKind kind)
+    {
+        if (ViewModel is null) return null;
+        var needKind = TrackKindForClip(kind);
+        for (int i = 0; i < _trackRects.Count && i < ViewModel.Tracks.Count; i++)
+        {
+            var (y, h) = _trackRects[i];
+            if (canvasY < y || canvasY > y + h) continue;
+            var t = ViewModel.Tracks[i];
+            if (t.IsLocked) return null;
+            return t.Kind == needKind ? t : null;
+        }
+        return null;
+    }
+
+    private static TrackKind TrackKindForClip(ClipKind k) => k switch
+    {
+        ClipKind.Audio or ClipKind.Music => TrackKind.Audio,
+        ClipKind.Title                   => TrackKind.Title,
+        _                                => TrackKind.Video,
+    };
 
     private void OnClipPointerReleased(object sender, PointerRoutedEventArgs e)
     {
@@ -536,12 +1010,21 @@ public sealed partial class TimelineControl : UserControl
         var border               = _dragBorder;
         bool wasDragging         = _isDragging;
         bool wasTrimming         = _isTrimMode;
-        var trimOriginalStart    = _trimOriginalStart;
-        var trimOriginalDuration = _trimOriginalDuration;
+        var trimOriginalStart       = _trimOriginalStart;
+        var trimOriginalDuration    = _trimOriginalDuration;
+        var trimOriginalSourceStart = _trimOriginalSourceStart;
         var dragFromStart        = _dragFromStart;
         var multiDragItems       = _multiDragItems;
+        var originalTrack        = _dragOriginalTrack;
+        var originalIndex        = _dragOriginalIndex;
+        var hoverTrack           = _dragHoverTrack;
+        var insertNewTrackDir    = _dragInsertNewTrackDir;
 
+        EndTrimVisual();
         ResetDragState();
+        HideTrackInsertIndicator();
+        HideDropTargetHighlight();
+        if (border is not null) Canvas.SetZIndex(border, 0);
         border?.ReleasePointerCapture(e.Pointer);
 
         if (!wasDragging)
@@ -557,12 +1040,18 @@ public sealed partial class TimelineControl : UserControl
         {
             ViewModel?.History.RecordWithoutDo(new ClipTrimAction(
                 clip,
-                trimOriginalStart, trimOriginalDuration,
-                clip.TimelineStart, clip.Duration));
+                trimOriginalStart, trimOriginalDuration, trimOriginalSourceStart,
+                clip.TimelineStart, clip.Duration, clip.SourceStart));
+            // Regenerate the clip's Border + waveform Image at the new dimensions.
+            // Without this, the Image keeps its press-time Width and intrinsic pixel
+            // content, so a subsequent trim that extends the clip back uncovers an
+            // un-rendered region on whichever edge was extended.
+            Rebuild();
         }
         else
         {
-            ViewModel?.History.RecordWithoutDo(new ClipMoveAction(clip, dragFromStart, clip.TimelineStart));
+            if (clip.TimelineStart != dragFromStart)
+                ViewModel?.History.RecordWithoutDo(new ClipMoveAction(clip, dragFromStart, clip.TimelineStart));
             if (multiDragItems is not null)
             {
                 foreach (var (other, _, origStart) in multiDragItems)
@@ -571,16 +1060,63 @@ public sealed partial class TimelineControl : UserControl
                         ViewModel?.History.RecordWithoutDo(new ClipMoveAction(other, origStart, other.TimelineStart));
                 }
             }
+
+            // Vertical drag → reparent. We've been mutating the visual border's
+            // Canvas.Top during move; commit the data side now.
+            if (originalTrack is not null && insertNewTrackDir != 0 && ViewModel is not null)
+            {
+                // User dragged into the strip above/below all tracks — create a new
+                // track in that slot and move the clip onto it.
+                var newTrack = BuildTrackForClipKind(clip.Kind);
+                int newPos = insertNewTrackDir < 0 ? 0 : ViewModel.Tracks.Count;
+                ViewModel.History.Record(new ClipMoveToNewTrackAction(
+                    ViewModel.Tracks, originalTrack, originalIndex, clip, newTrack, newPos));
+                Rebuild();
+            }
+            else if (originalTrack is not null && hoverTrack is not null
+                  && !ReferenceEquals(originalTrack, hoverTrack))
+            {
+                ViewModel?.History.Record(new ClipReparentAction(originalTrack, hoverTrack, clip, originalIndex));
+                Rebuild();
+            }
+            else
+            {
+                // No reparent happened — the user free-dragged the border but dropped
+                // it back on the same track (or over an incompatible row). Snap the
+                // border back to its original row so it doesn't stay floating mid-air.
+                Rebuild();
+            }
         }
 
         e.Handled = true;
     }
 
+    /// <summary>Mint a fresh track of the right kind for <paramref name="clipKind"/>,
+    /// labeled with the next free number for that kind ("V3", "A2", …).</summary>
+    private Track BuildTrackForClipKind(ClipKind clipKind)
+    {
+        var kind = TrackKindForClip(clipKind);
+        var prefix = kind switch
+        {
+            TrackKind.Video => "V",
+            TrackKind.Title => "T",
+            _               => "A",
+        };
+        int n = (ViewModel?.Tracks.Count(t => t.Kind == kind) ?? 0) + 1;
+        return new Track { Label = $"{prefix}{n}", Kind = kind };
+    }
+
     /// <summary>Reset drag/trim state when capture is yanked away (lock screen, Win+L, alt-tab, Esc).</summary>
     private void OnClipPointerCaptureLost(object sender, PointerRoutedEventArgs e)
     {
+        if (sender is Border b) Canvas.SetZIndex(b, 0);
+        EndTrimVisual();
+        HideDropTargetHighlight();
+        HideTrackInsertIndicator();
         ResetDragState();
         ResetRazorState();
+        // Snap any free-dragged border back to its row.
+        if (_isLoaded) Rebuild();
     }
 
     private void ResetDragState()
@@ -591,6 +1127,9 @@ public sealed partial class TimelineControl : UserControl
         _isDragging = false;
         _isTrimMode = false;
         _multiDragItems = null;
+        _dragOriginalTrack = null;
+        _dragHoverTrack    = null;
+        _dragInsertNewTrackDir = 0;
     }
 
     private void ResetRazorState()
@@ -859,6 +1398,14 @@ public sealed partial class TimelineControl : UserControl
 
     private void OnRulerSizeChanged(object sender, SizeChangedEventArgs e) =>
         BuildRuler();
+
+    private void OnMainScrollerSizeChanged(object sender, SizeChangedEventArgs e)
+    {
+        // The clip canvas is sized to fill the viewport (so the empty area below the
+        // tracks can accept media drops as a "new track" gesture). When the viewport
+        // grows or shrinks we have to rebuild to update Height.
+        if (_isLoaded) BuildTracks();
+    }
 
     private void OnScrollChanged(object sender, ScrollViewerViewChangedEventArgs e)
     {
@@ -1136,6 +1683,24 @@ public sealed partial class TimelineControl : UserControl
         e.DragUIOverride.IsGlyphVisible   = false;
 
         var pos = e.GetPosition(ClipCanvas);
+
+        // No compatible track yet for this media kind → the entire canvas is a
+        // "create a new track" zone. This lets the user drop the first video/audio
+        // clip anywhere instead of hunting for the 14px insertion strip.
+        var media = TryResolveDragMedia(e);
+        if (media is not null && !HasCompatibleTrack(media.Type))
+        {
+            e.DragUIOverride.Caption = media.Type == MediaType.Audio
+                ? "Drop to create a new audio track"
+                : "Drop to create a new video track";
+            HideDropIndicator();
+            double indicatorY = _trackRects.Count > 0
+                ? _trackRects[^1].Y + _trackRects[^1].Height + (TrackInsertZone / 2)
+                : TrackInsertZone / 2;
+            ShowTrackInsertIndicator(indicatorY);
+            return;
+        }
+
         if (IsInTopInsertZone(pos.Y))
         {
             e.DragUIOverride.Caption = "Drop to add a new track above";
@@ -1146,7 +1711,10 @@ public sealed partial class TimelineControl : UserControl
         {
             e.DragUIOverride.Caption = "Drop to add a new track below";
             HideDropIndicator();
-            ShowTrackInsertIndicator(ClipCanvas.Height - TrackInsertZone / 2);
+            double indicatorY = _trackRects.Count > 0
+                ? _trackRects[^1].Y + _trackRects[^1].Height + (TrackInsertZone / 2)
+                : TrackInsertZone / 2;
+            ShowTrackInsertIndicator(indicatorY);
         }
         else
         {
@@ -1167,8 +1735,38 @@ public sealed partial class TimelineControl : UserControl
     }
 
     private bool IsInTopInsertZone(double y) => y < TrackInsertZone;
-    private bool IsInBottomInsertZone(double y) =>
-        ViewModel is not null && y > ClipCanvas.Height - TrackInsertZone;
+    private bool IsInBottomInsertZone(double y)
+    {
+        if (ViewModel is null) return false;
+        // Below the last track row (or below the top strip if there are no tracks).
+        if (_trackRects.Count == 0) return y >= TrackInsertZone;
+        var (lastY, lastH) = _trackRects[^1];
+        return y > lastY + lastH;
+    }
+
+    /// <summary>True if the project already has an unlocked track that matches
+    /// <paramref name="mediaType"/>. Used to decide whether a drop has anywhere to land
+    /// without minting a new track first.</summary>
+    private bool HasCompatibleTrack(MediaType mediaType)
+    {
+        if (ViewModel is null) return false;
+        var needKind = mediaType == MediaType.Audio ? TrackKind.Audio : TrackKind.Video;
+        foreach (var t in ViewModel.Tracks)
+            if (!t.IsLocked && t.Kind == needKind) return true;
+        return false;
+    }
+
+    /// <summary>Resolve the MediaItem behind an in-flight drag synchronously (DragOver
+    /// fires before we'd want to do anything async). Returns null if this isn't a media
+    /// bin drag or the id no longer matches.</summary>
+    private MediaItem? TryResolveDragMedia(DragEventArgs e)
+    {
+        if (ViewModel is null) return null;
+        if (!e.DataView.Properties.TryGetValue(BTAP.Controls.MediaTileControl.DragDataFormat, out var v))
+            return null;
+        if (v is not string id || string.IsNullOrEmpty(id)) return null;
+        return ViewModel.MediaBin.FirstOrDefault(m => m.Id == id);
+    }
 
     private async void OnClipCanvasDrop(object sender, DragEventArgs e)
     {
@@ -1194,7 +1792,14 @@ public sealed partial class TimelineControl : UserControl
             startSec = Math.Max(0, FindSnapPosition(startSec, null));
 
         Track? track;
-        if (IsInTopInsertZone(pos.Y))
+        // If no compatible track exists for this media kind, mint one no matter where
+        // the user dropped — matches the "drop anywhere → new track" affordance shown
+        // by DragOver in the same situation.
+        if (!HasCompatibleTrack(media.Type))
+        {
+            track = CreateAndInsertTrack(media.Type, insertAtTop: false);
+        }
+        else if (IsInTopInsertZone(pos.Y))
         {
             track = CreateAndInsertTrack(media.Type, insertAtTop: true);
         }
@@ -1336,6 +1941,12 @@ public sealed partial class TimelineControl : UserControl
         var get = Microsoft.UI.Input.InputKeyboardSource.GetKeyStateForCurrentThread;
         return get(Windows.System.VirtualKey.Shift).HasFlag(Windows.UI.Core.CoreVirtualKeyStates.Down)
             || get(Windows.System.VirtualKey.Control).HasFlag(Windows.UI.Core.CoreVirtualKeyStates.Down);
+    }
+
+    private static bool IsCtrlDown()
+    {
+        var get = Microsoft.UI.Input.InputKeyboardSource.GetKeyStateForCurrentThread;
+        return get(Windows.System.VirtualKey.Control).HasFlag(Windows.UI.Core.CoreVirtualKeyStates.Down);
     }
 
     // ── Marquee rectangle ──────────────────────────────────────────────
@@ -1507,6 +2118,51 @@ public sealed partial class TimelineControl : UserControl
         return bmp;
     }
 
+    /// <summary>Move every selected clip to the next compatible (same-kind, unlocked)
+    /// track above (<paramref name="direction"/> = -1) or below (+1). Skips clips that
+    /// have no eligible neighbor. Returns the number of clips moved.</summary>
+    public int MoveSelectedClipsByTrack(int direction)
+    {
+        if (ViewModel is null || direction == 0) return 0;
+
+        // Snapshot selection so re-parenting (which mutates Tracks[*].Clips) doesn't
+        // perturb our iteration.
+        var moves = new List<(Track From, TimelineClip Clip, int Index, Track To)>();
+        for (int i = 0; i < ViewModel.Tracks.Count; i++)
+        {
+            var src = ViewModel.Tracks[i];
+            if (src.IsLocked) continue;
+            for (int ci = 0; ci < src.Clips.Count; ci++)
+            {
+                var c = src.Clips[ci];
+                if (!c.IsSelected) continue;
+                var dst = FindAdjacentCompatibleTrack(i, direction, c.Kind);
+                if (dst is null) continue;
+                moves.Add((src, c, ci, dst));
+            }
+        }
+
+        if (moves.Count == 0) return 0;
+        foreach (var (from, clip, idx, to) in moves)
+            ViewModel.History.Record(new ClipReparentAction(from, to, clip, idx));
+
+        Rebuild();
+        return moves.Count;
+    }
+
+    private Track? FindAdjacentCompatibleTrack(int fromIndex, int direction, ClipKind clipKind)
+    {
+        if (ViewModel is null) return null;
+        var needKind = TrackKindForClip(clipKind);
+        for (int i = fromIndex + direction; i >= 0 && i < ViewModel.Tracks.Count; i += direction)
+        {
+            var t = ViewModel.Tracks[i];
+            if (t.IsLocked) continue;
+            if (t.Kind == needKind) return t;
+        }
+        return null;
+    }
+
     private Track? CreateAndInsertTrack(MediaType mediaType, bool insertAtTop)
     {
         if (ViewModel is null) return null;
@@ -1514,8 +2170,18 @@ public sealed partial class TimelineControl : UserControl
         var prefix = kind == TrackKind.Video ? "V" : "A";
         var n = ViewModel.Tracks.Count(t => t.Kind == kind) + 1;
         var track = new Track { Label = $"{prefix}{n}", Kind = kind };
-        if (insertAtTop) ViewModel.Tracks.Insert(0, track);
-        else             ViewModel.Tracks.Add(track);
+        if (insertAtTop)
+        {
+            // Keep title tracks on top — insert below them.
+            int idx = 0;
+            while (idx < ViewModel.Tracks.Count && ViewModel.Tracks[idx].Kind == TrackKind.Title)
+                idx++;
+            ViewModel.Tracks.Insert(idx, track);
+        }
+        else
+        {
+            ViewModel.Tracks.Add(track);
+        }
         ViewModel.Project.IsModified = true;
         return track;
     }

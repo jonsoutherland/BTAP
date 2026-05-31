@@ -3,7 +3,7 @@ using CommunityToolkit.Mvvm.ComponentModel;
 
 namespace BTAP.Models;
 
-public enum TrackKind { Video, Audio }
+public enum TrackKind { Video, Audio, Title }
 
 public partial class Track : ObservableObject
 {

@@ -86,14 +86,72 @@ public sealed class ClipMoveAction(TimelineClip clip, TimeSpan from, TimeSpan to
     public void Undo() => clip.TimelineStart = from;
 }
 
+/// <summary>Move a clip from one track to another, preserving order on the destination.
+/// Used by vertical clip drag and the Ctrl+Up/Down "nudge to next track" shortcut.</summary>
+public sealed class ClipReparentAction(Track fromTrack, Track toTrack, TimelineClip clip, int fromIndex) : IEditAction
+{
+    public string Description => $"Move \"{clip.Label}\" to {toTrack.Label}";
+
+    public void Do()
+    {
+        if (fromTrack.Clips.Contains(clip)) fromTrack.Clips.Remove(clip);
+        if (!toTrack.Clips.Contains(clip))  toTrack.Clips.Add(clip);
+    }
+
+    public void Undo()
+    {
+        if (toTrack.Clips.Contains(clip)) toTrack.Clips.Remove(clip);
+        if (!fromTrack.Clips.Contains(clip))
+            fromTrack.Clips.Insert(Math.Min(fromIndex, fromTrack.Clips.Count), clip);
+    }
+}
+
+/// <summary>Create a brand-new track at <paramref name="newTrackPosition"/> in the
+/// project's track list and move <paramref name="clip"/> onto it. Undo reverses
+/// both halves: clip goes back to its old track at <paramref name="fromIndex"/>,
+/// new track is removed entirely.</summary>
+public sealed class ClipMoveToNewTrackAction(
+    System.Collections.ObjectModel.ObservableCollection<Track> tracks,
+    Track fromTrack, int fromIndex, TimelineClip clip,
+    Track newTrack, int newTrackPosition) : IEditAction
+{
+    public string Description => $"Move \"{clip.Label}\" to new track {newTrack.Label}";
+
+    public void Do()
+    {
+        if (!tracks.Contains(newTrack))
+            tracks.Insert(Math.Min(newTrackPosition, tracks.Count), newTrack);
+        if (fromTrack.Clips.Contains(clip)) fromTrack.Clips.Remove(clip);
+        if (!newTrack.Clips.Contains(clip)) newTrack.Clips.Add(clip);
+    }
+
+    public void Undo()
+    {
+        if (newTrack.Clips.Contains(clip)) newTrack.Clips.Remove(clip);
+        if (!fromTrack.Clips.Contains(clip))
+            fromTrack.Clips.Insert(Math.Min(fromIndex, fromTrack.Clips.Count), clip);
+        tracks.Remove(newTrack);
+    }
+}
+
 public sealed class ClipTrimAction(
     TimelineClip clip,
-    TimeSpan oldStart, TimeSpan oldDuration,
-    TimeSpan newStart, TimeSpan newDuration) : IEditAction
+    TimeSpan oldStart, TimeSpan oldDuration, TimeSpan oldSourceStart,
+    TimeSpan newStart, TimeSpan newDuration, TimeSpan newSourceStart) : IEditAction
 {
     public string Description => $"Trim \"{clip.Label}\"";
-    public void Do()   { clip.TimelineStart = newStart; clip.Duration = newDuration; }
-    public void Undo() { clip.TimelineStart = oldStart; clip.Duration = oldDuration; }
+    public void Do()
+    {
+        clip.TimelineStart = newStart;
+        clip.Duration      = newDuration;
+        clip.SourceStart   = newSourceStart;
+    }
+    public void Undo()
+    {
+        clip.TimelineStart = oldStart;
+        clip.Duration      = oldDuration;
+        clip.SourceStart   = oldSourceStart;
+    }
 }
 
 public sealed class ClipSplitAction : IEditAction

@@ -5,10 +5,15 @@ using Windows.Storage;
 
 namespace BTAP.Services;
 
-/// <summary>Per-file peak data: amplitude buckets sampled at a fixed time resolution.</summary>
+/// <summary>Per-file peak data: amplitude buckets sampled at a fixed time resolution.
+/// <see cref="Peaks"/> is the max across channels (used by the timeline waveform).
+/// <see cref="PeaksL"/>/<see cref="PeaksR"/> are per-channel for the audio level meter;
+/// for mono sources they are identical to <see cref="Peaks"/>.</summary>
 public sealed class PeakData
 {
     public required float[] Peaks            { get; init; }
+    public required float[] PeaksL           { get; init; }
+    public required float[] PeaksR           { get; init; }
     public required int     BucketsPerSecond { get; init; }
     public required TimeSpan Duration        { get; init; }
 }
@@ -95,9 +100,11 @@ public static class WaveformService
 
         try
         {
-            // 22.05 kHz mono PCM16: small temp file, ample amplitude resolution for a meter.
+            // 22.05 kHz stereo PCM16: small temp file, per-channel peaks for the
+            // audio meter. Mono sources get duplicated to both channels (transcoder
+            // upmixes), so PeaksL == PeaksR in that case — still safe to read.
             var profile = MediaEncodingProfile.CreateWav(AudioEncodingQuality.Low);
-            profile.Audio = AudioEncodingProperties.CreatePcm(22050, 1, 16);
+            profile.Audio = AudioEncodingProperties.CreatePcm(22050, 2, 16);
 
             var transcoder = new MediaTranscoder();
             var prep = await transcoder.PrepareFileTranscodeAsync(sourceFile, tempFile, profile);
@@ -173,7 +180,9 @@ public static class WaveformService
         int    totalBuckets = Math.Max(1, (int)Math.Ceiling(durationSec * BucketsPerSecond));
         double framesPerBucket = (double)totalFrames / totalBuckets;
 
-        var peaks = new float[totalBuckets];
+        var peaks  = new float[totalBuckets];
+        var peaksL = new float[totalBuckets];
+        var peaksR = new float[totalBuckets];
 
         stream.Position = dataStart;
         var  buffer    = new byte[Math.Min(64 * 1024, dataLength)];
@@ -191,16 +200,29 @@ public static class WaveformService
 
             for (int off = 0; off + frameStride <= read; off += frameStride)
             {
+                // Per-channel absolute peaks. For mono sources both channels see the
+                // same value; for ≥3-channel sources we map ch0→L, ch1→R and ignore
+                // the rest (only the meter uses these — the timeline waveform reads
+                // `peaks` which is max across all channels).
                 float maxSample = 0;
+                float lSample = 0, rSample = 0;
                 for (int c = 0; c < numChannels; c++)
                 {
                     short s = BitConverter.ToInt16(buffer, off + c * bytesPerSample);
                     float f = Math.Abs(s) / 32768f;
                     if (f > maxSample) maxSample = f;
+                    if      (c == 0) lSample = f;
+                    else if (c == 1) rSample = f;
                 }
+                if (numChannels == 1) rSample = lSample;
+
                 int bucket = (int)(frameIdx / framesPerBucket);
-                if ((uint)bucket < (uint)peaks.Length && maxSample > peaks[bucket])
-                    peaks[bucket] = maxSample;
+                if ((uint)bucket < (uint)peaks.Length)
+                {
+                    if (maxSample > peaks [bucket]) peaks [bucket] = maxSample;
+                    if (lSample   > peaksL[bucket]) peaksL[bucket] = lSample;
+                    if (rSample   > peaksR[bucket]) peaksR[bucket] = rSample;
+                }
                 frameIdx++;
             }
         }
@@ -208,6 +230,8 @@ public static class WaveformService
         return new PeakData
         {
             Peaks            = peaks,
+            PeaksL           = peaksL,
+            PeaksR           = peaksR,
             BucketsPerSecond = BucketsPerSecond,
             Duration         = TimeSpan.FromSeconds(durationSec),
         };

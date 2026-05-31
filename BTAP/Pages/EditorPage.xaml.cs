@@ -38,6 +38,7 @@ public sealed partial class EditorPage : Page
     private DispatcherTimer? _statusTimer;
     private DateTime _lastSaved = DateTime.Now;
     private readonly PreviewEffectsService _previewEffects = new();
+    private readonly KeyBindingsService _keyBindings = new();
 
     public EditorPage()
     {
@@ -89,8 +90,32 @@ public sealed partial class EditorPage : Page
         // Re-seek the preview after any clip move/trim/delete/etc.
         _vm.History.Changed += OnHistoryChangedForPreview;
 
+        // Canvas is derived from the first imported video's native size. When that
+        // changes (first video added, last video removed) the preview viewport's
+        // aspect must re-fit and the export-window overlay must reposition.
+        _vm.Project.MediaBin.CollectionChanged += OnMediaBinChangedForCanvas;
+
+        // Build the page-level KeyboardAccelerators from the user's saved bindings
+        // and keep them in sync when the customizer changes anything.
+        _keyBindings.Changed -= OnKeyBindingsChanged;
+        _keyBindings.Changed += OnKeyBindingsChanged;
+        RebuildKeyboardAccelerators();
+
         // Take keyboard focus so Space / J / K / etc. work immediately
         Loaded += OnPageLoaded;
+    }
+
+    private void OnMediaBinChangedForCanvas(object? sender, System.Collections.Specialized.NotifyCollectionChangedEventArgs e)
+    {
+        // GetCanvasSize() walks MediaBin and returns the first video's native size,
+        // so any add/remove can flip the canvas aspect. Re-fit the viewport, refresh
+        // overlays and the inspector (PosX/Y slider range is canvas-bound).
+        UpdatePreviewCanvasSize();
+        UpdateTransformHandles();
+        if (_titleClipAtPlayhead is not null)
+            ApplyTitlePosition(_titleClipAtPlayhead);
+        if (_vm?.SelectedClip is not null)
+            UpdateInspector(_vm.SelectedClip);
     }
 
     private void OnHistoryChangedForPreview(object? sender, EventArgs e)
@@ -142,7 +167,11 @@ public sealed partial class EditorPage : Page
         _statusTimer?.Stop();
         _statusTimer = null;
         if (_vm is not null)
+        {
             _vm.History.Changed -= OnHistoryChangedForPreview;
+            _vm.Project.MediaBin.CollectionChanged -= OnMediaBinChangedForCanvas;
+        }
+        _keyBindings.Changed -= OnKeyBindingsChanged;
         if (_mediaPlayer is not null)
         {
             _mediaPlayer.MediaOpened -= OnPreviewMediaOpened;
@@ -156,128 +185,76 @@ public sealed partial class EditorPage : Page
 
     private void OnEditorKeyDown(object sender, KeyRoutedEventArgs e)
     {
-        if (_vm is null) return;
+        // All shortcut handling now flows through KeyboardAccelerators built
+        // from _keyBindings (see RebuildKeyboardAccelerators / InvokeCommand).
+        // Kept hooked up only so future non-binding key behaviors have a home.
+    }
 
-        bool ctrl = InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.Control)
-                        .HasFlag(Windows.UI.Core.CoreVirtualKeyStates.Down);
-        bool shift = InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.Shift)
-                        .HasFlag(Windows.UI.Core.CoreVirtualKeyStates.Down);
+    // ── Dynamic shortcut machinery ───────────────────────────────────────
 
-        switch (e.Key)
+    private void OnKeyBindingsChanged(object? sender, EventArgs e) =>
+        RebuildKeyboardAccelerators();
+
+    private void RebuildKeyboardAccelerators()
+    {
+        KeyboardAccelerators.Clear();
+        foreach (var binding in _keyBindings.Bindings)
         {
-            case VirtualKey.Space:
-                TogglePlayback();
-                e.Handled = true;
-                break;
+            var acc = new Microsoft.UI.Xaml.Input.KeyboardAccelerator
+            {
+                Key       = binding.Key,
+                Modifiers = binding.Modifiers,
+            };
+            var cmd = binding.Command;
+            acc.Invoked += (_, args) =>
+            {
+                if (FocusManager.GetFocusedElement(XamlRoot) is TextBox) return;
+                InvokeCommand(cmd);
+                args.Handled = true;
+            };
+            KeyboardAccelerators.Add(acc);
+        }
+    }
 
-            case VirtualKey.J:
-                StopPlayback();
-                _vm.StepBackCommand.Execute(null);
-                RefreshPlayheadUI();
-                e.Handled = true;
-                break;
+    private void InvokeCommand(EditorCommand cmd)
+    {
+        if (_vm is null) return;
+        switch (cmd)
+        {
+            case EditorCommand.PlayPause:        TogglePlayback(); break;
+            case EditorCommand.StepBack:         OnStepBack(this, new RoutedEventArgs()); break;
+            case EditorCommand.StepForward:      OnStepFwd(this, new RoutedEventArgs()); break;
+            case EditorCommand.Stop:             StopPlayback(); break;
 
-            case VirtualKey.K:
-                StopPlayback();
-                e.Handled = true;
-                break;
+            case EditorCommand.Undo:             OnUndo(this, new RoutedEventArgs()); break;
+            case EditorCommand.Redo:             OnRedo(this, new RoutedEventArgs()); break;
+            case EditorCommand.Save:             _ = SaveProjectAsync(); break;
+            case EditorCommand.NewProject:       OnFileNew(this, new RoutedEventArgs()); break;
+            case EditorCommand.OpenProject:      OnFileOpen(this, new RoutedEventArgs()); break;
+            case EditorCommand.Export:           OnExport(this, new RoutedEventArgs()); break;
 
-            case VirtualKey.L:
-                TogglePlayback();
-                e.Handled = true;
-                break;
+            case EditorCommand.DeleteClip:       OnEditDelete(this, new RoutedEventArgs()); break;
+            case EditorCommand.RippleDelete:     OnClipRippleDelete(this, new RoutedEventArgs()); break;
+            case EditorCommand.DuplicateClip:    OnEditDuplicate(this, new RoutedEventArgs()); break;
+            case EditorCommand.SplitAtPlayhead:  OnEditSplit(this, new RoutedEventArgs()); break;
 
-            case VirtualKey.C:
-                SetActiveToolBtn(BtnToolRazor);
-                _vm.ActiveTool = ActiveTool.Razor;
-                e.Handled = true;
-                break;
+            case EditorCommand.AddMarker:        _vm.AddMarkerCommand.Execute(null); break;
+            case EditorCommand.ToggleSnap:       OnToggleSnap(this, new RoutedEventArgs()); break;
+            case EditorCommand.Fullscreen:       OnViewFullscreen(this, new RoutedEventArgs()); break;
 
-            case VirtualKey.V:
-                SetActiveToolBtn(BtnToolCursor);
-                _vm.ActiveTool = ActiveTool.Cursor;
-                e.Handled = true;
-                break;
+            case EditorCommand.ToolCursor:
+                SetActiveToolBtn(BtnToolCursor); _vm.ActiveTool = ActiveTool.Cursor; break;
+            case EditorCommand.ToolRazor:
+                SetActiveToolBtn(BtnToolRazor);  _vm.ActiveTool = ActiveTool.Razor;  break;
+            case EditorCommand.ToolHand:
+                SetActiveToolBtn(BtnToolHand);   _vm.ActiveTool = ActiveTool.Hand;   break;
 
-            case VirtualKey.H:
-                SetActiveToolBtn(BtnToolHand);
-                _vm.ActiveTool = ActiveTool.Hand;
-                e.Handled = true;
-                break;
+            case EditorCommand.MoveClipUp:
+                if (Timeline.MoveSelectedClipsByTrack(-1) > 0) _vm.Project.IsModified = true; break;
+            case EditorCommand.MoveClipDown:
+                if (Timeline.MoveSelectedClipsByTrack(1) > 0)  _vm.Project.IsModified = true; break;
 
-            case VirtualKey.S when ctrl:
-                _ = SaveProjectAsync();
-                e.Handled = true;
-                break;
-
-            case VirtualKey.S:
-                _vm.SnapEnabled = !_vm.SnapEnabled;
-                BtnSnap.Foreground = _vm.SnapEnabled
-                    ? (Brush)Application.Current.Resources["AccentInkBrush"]
-                    : (Brush)Application.Current.Resources["TextMutedBrush"];
-                e.Handled = true;
-                break;
-
-            case VirtualKey.M:
-                _vm.AddMarkerCommand.Execute(null);
-                e.Handled = true;
-                break;
-
-            case VirtualKey.Delete when shift:
-            case VirtualKey.Back when shift:
-                OnClipRippleDelete(this, new RoutedEventArgs());
-                e.Handled = true;
-                break;
-
-            case VirtualKey.Delete:
-            case VirtualKey.Back:
-                OnEditDelete(this, new RoutedEventArgs());
-                e.Handled = true;
-                break;
-
-            case VirtualKey.Z when ctrl:
-                _vm.Undo();
-                Timeline.ViewModel = _vm;
-                UpdateInspector(_vm.SelectedClip);
-                e.Handled = true;
-                break;
-
-            case VirtualKey.Y when ctrl:
-                _vm.Redo();
-                Timeline.ViewModel = _vm;
-                UpdateInspector(_vm.SelectedClip);
-                e.Handled = true;
-                break;
-
-            case VirtualKey.D when ctrl:
-                OnEditDuplicate(this, new RoutedEventArgs());
-                e.Handled = true;
-                break;
-
-            case VirtualKey.B when ctrl:
-                OnEditSplit(this, new RoutedEventArgs());
-                e.Handled = true;
-                break;
-
-            case VirtualKey.N when ctrl:
-                OnFileNew(this, new RoutedEventArgs());
-                e.Handled = true;
-                break;
-
-            case VirtualKey.O when ctrl:
-                OnFileOpen(this, new RoutedEventArgs());
-                e.Handled = true;
-                break;
-
-            case VirtualKey.E when ctrl:
-                OnExport(this, new RoutedEventArgs());
-                e.Handled = true;
-                break;
-
-            case VirtualKey.F:
-                OnViewFullscreen(this, new RoutedEventArgs());
-                e.Handled = true;
-                break;
+            case EditorCommand.AddTitleAtPlayhead: AddTitleAtPlayheadAndEdit(); break;
         }
     }
 
@@ -395,11 +372,6 @@ public sealed partial class EditorPage : Page
         PreviewPlaceholder.Visibility = Visibility.Visible;
         _currentPreviewPath = null;
         _pendingSeek = null;
-        if (_vm is null || _vm.SelectedClip is null)
-        {
-            TbPreviewTitle.Text    = "No clip selected";
-            TbPreviewSubtitle.Text = "— Drop media here or pick a clip from the timeline";
-        }
     }
 
     private void LoadPreviewForClip(TimelineClip clip)
@@ -417,6 +389,19 @@ public sealed partial class EditorPage : Page
         foreach (var t in _vm.Tracks)
         {
             if (t.Kind != TrackKind.Video) continue;
+            foreach (var c in t.Clips)
+                if (position >= c.TimelineStart && position < c.TimelineEnd)
+                    return c;
+        }
+        return null;
+    }
+
+    private TimelineClip? FindTitleClipAt(TimeSpan position)
+    {
+        if (_vm is null) return null;
+        foreach (var t in _vm.Tracks)
+        {
+            if (t.Kind != TrackKind.Title) continue;
             foreach (var c in t.Clips)
                 if (position >= c.TimelineStart && position < c.TimelineEnd)
                     return c;
@@ -453,6 +438,138 @@ public sealed partial class EditorPage : Page
         ApplyPresentation();
     }
 
+    // ── Title overlay (independent of _presentedClip so it can layer over video) ──
+
+    /// <summary>The title clip currently covering the playhead. Drives TitleClipOverlay
+    /// and is the target of inline-edit mode. Independent of <see cref="_presentedClip"/>
+    /// so a title can render on top of a video that's also playing.</summary>
+    private TimelineClip? _titleClipAtPlayhead;
+
+    private void SetTitleClipAtPlayhead(TimelineClip? clip)
+    {
+        if (ReferenceEquals(_titleClipAtPlayhead, clip)) return;
+        // Switching titles while editing would otherwise commit the in-progress text
+        // into the old clip and then strand the editor on top of the new one.
+        ExitTitleEditMode(commit: true);
+        if (_titleClipAtPlayhead is not null)
+            _titleClipAtPlayhead.PropertyChanged -= OnTitleClipPropertyChanged;
+        _titleClipAtPlayhead = clip;
+        if (_titleClipAtPlayhead is not null)
+            _titleClipAtPlayhead.PropertyChanged += OnTitleClipPropertyChanged;
+        ApplyTitleOverlay();
+    }
+
+    private void OnTitleClipPropertyChanged(object? sender, System.ComponentModel.PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName is nameof(TimelineClip.Label)
+                           or nameof(TimelineClip.PosX)
+                           or nameof(TimelineClip.PosY)
+                           or nameof(TimelineClip.Scale)
+                           or nameof(TimelineClip.Rotation)
+                           or nameof(TimelineClip.FontFamily)
+                           or nameof(TimelineClip.FontSize)
+                           or nameof(TimelineClip.IsBold)
+                           or nameof(TimelineClip.IsItalic)
+                           or nameof(TimelineClip.IsUnderline)
+                           or nameof(TimelineClip.TextColor)
+                           or nameof(TimelineClip.TextAlign))
+        {
+            ApplyTitleOverlay();
+        }
+    }
+
+    private void ApplyTitleOverlay()
+    {
+        var clip = _titleClipAtPlayhead;
+        if (clip is null)
+        {
+            ExitTitleEditMode(commit: true);
+            TitleClipOverlay.Visibility = Visibility.Collapsed;
+            TitleClipBorder.Visibility  = Visibility.Collapsed;
+            return;
+        }
+        ApplyTitleTextStyle(clip);
+        TitleClipText.Text          = clip.Label;
+        ApplyTitlePosition(clip);
+        TitleClipOverlay.Visibility = Visibility.Visible;
+        UpdateTitleSelectionAffordance();
+        if (!_isEditingTitle)
+            TitleClipEditor.Visibility = Visibility.Collapsed;
+    }
+
+    /// <summary>Mirror the TransformBox affordance for title clips: the dashed accent
+    /// border around the text shows only when the title is the selected/presented clip.</summary>
+    private void UpdateTitleSelectionAffordance()
+    {
+        bool selected = _titleClipAtPlayhead is not null
+                     && ReferenceEquals(_presentedClip, _titleClipAtPlayhead);
+        TitleClipBorder.Visibility = selected ? Visibility.Visible : Visibility.Collapsed;
+        UpdateTitleHandles();
+    }
+
+    /// <summary>Position the 4 corner + 1 rotation handle around the rendered title text.
+    /// Mirrors UpdateTransformHandles' role for video clips. Handles sit in viewport-pixel
+    /// coordinates inside TitleHandles (a Canvas filling TitleClipOverlay), so they stay a
+    /// constant visual size regardless of the title's own scale/rotation.</summary>
+    private void UpdateTitleHandles()
+    {
+        bool selected = _titleClipAtPlayhead is not null
+                     && ReferenceEquals(_presentedClip, _titleClipAtPlayhead);
+        if (!selected || _isEditingTitle || _vm is null
+            || TitleClipPositioner.ActualWidth < 4 || TitleClipPositioner.ActualHeight < 4)
+        {
+            TitleHandles.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        var clip = _titleClipAtPlayhead!;
+
+        double scale = Math.Clamp(clip.Scale, 0.1, 10);
+        double w = TitleClipPositioner.ActualWidth  * scale;
+        double h = TitleClipPositioner.ActualHeight * scale;
+
+        // Title's center in viewport coords: middle of the viewport + PosX/Y mapped to viewport pixels.
+        // PosX/PosY are in canvas-pixel units (the preview's working area), NOT the
+        // export resolution — see Project.GetCanvasSize().
+        var (canvasW, canvasH) = _vm.Project.GetCanvasSize();
+        double sx = PreviewViewport.Width  / Math.Max(1, canvasW);
+        double sy = PreviewViewport.Height / Math.Max(1, canvasH);
+        double cx = PreviewViewport.Width  / 2 + clip.PosX * sx;
+        double cy = PreviewViewport.Height / 2 + clip.PosY * sy;
+
+        double x = cx - w / 2;
+        double y = cy - h / 2;
+
+        // Box rotation is not reflected in handle positions (matches video clip behavior:
+        // the dashed box stays axis-aligned even when the underlying clip is rotated).
+        TitleHandles.Visibility = Visibility.Visible;
+
+        PlaceHandle(TitleHandleTL, x,       y);
+        PlaceHandle(TitleHandleTR, x + w,   y);
+        PlaceHandle(TitleHandleBL, x,       y + h);
+        PlaceHandle(TitleHandleBR, x + w,   y + h);
+
+        double rotateHandleY = y - 28;
+        PlaceHandle(TitleHandleRotate, cx, rotateHandleY);
+        TitleRotateLine.X1 = TitleRotateLine.X2 = cx;
+        TitleRotateLine.Y1 = y;
+        TitleRotateLine.Y2 = rotateHandleY;
+
+        _currentBoxCenter = new Windows.Foundation.Point(cx, cy);
+    }
+
+    /// <summary>Center of the currently-active transform bounding box, in viewport-pixel
+    /// coordinates. Set by UpdateTransformHandles (video) and UpdateTitleHandles (title);
+    /// read by OnTransformHandlePressed so the scale/rotate math works for both.</summary>
+    private Windows.Foundation.Point _currentBoxCenter;
+
+    /// <summary>Recompute which title clip is at the playhead and refresh the overlay.</summary>
+    private void RefreshTitleOverlay()
+    {
+        if (_vm is null) { SetTitleClipAtPlayhead(null); return; }
+        SetTitleClipAtPlayhead(FindTitleClipAt(_vm.Project.Playhead));
+    }
+
     private void OnPresentedClipEffectsChanged(object? sender, System.Collections.Specialized.NotifyCollectionChangedEventArgs e)
     {
         if (e.OldItems is not null)
@@ -482,7 +599,14 @@ public sealed partial class EditorPage : Page
                            or nameof(TimelineClip.CropRight)
                            or nameof(TimelineClip.CropBottom)
                            or nameof(TimelineClip.FlipX)
-                           or nameof(TimelineClip.FlipY))
+                           or nameof(TimelineClip.FlipY)
+                           or nameof(TimelineClip.FontFamily)
+                           or nameof(TimelineClip.FontSize)
+                           or nameof(TimelineClip.IsBold)
+                           or nameof(TimelineClip.IsItalic)
+                           or nameof(TimelineClip.IsUnderline)
+                           or nameof(TimelineClip.TextColor)
+                           or nameof(TimelineClip.TextAlign))
         {
             ApplyPresentation();
         }
@@ -495,28 +619,272 @@ public sealed partial class EditorPage : Page
         var clip = _presentedClip;
         if (clip is null)
         {
-            TitleClipOverlay.Visibility = Visibility.Collapsed;
             TransformOverlay.Visibility = Visibility.Collapsed;
             return;
         }
 
+        // Title overlay rendering is independent of _presentedClip; it always reflects
+        // the title clip at the playhead. Transform handles only make sense for video
+        // clips so we hide them when a title is the selected/presented clip.
         if (clip.Kind == ClipKind.Title)
-        {
-            TitleClipText.Text          = clip.Label;
-            TitleClipOverlay.Visibility = Visibility.Visible;
             TransformOverlay.Visibility = Visibility.Collapsed;
-        }
-        else
-        {
-            TitleClipOverlay.Visibility = Visibility.Collapsed;
-            // Video rendering + per-clip transforms are owned by VideoCompositor now;
-            // the legacy PreviewPlayer/PreviewTransform manipulations have been removed
-            // because PreviewPlayer is permanently collapsed (its SwapChainPanel would
-            // otherwise paint a ghost layer that ignores XAML opacity).
-        }
+
+        // The title's own selection-border affordance depends on _presentedClip.
+        UpdateTitleSelectionAffordance();
 
         ApplyClipSpeed(clip);
         UpdateTransformHandles();
+    }
+
+    // ── Title text styling & inline editing ──────────────────────────────
+
+    private bool _isEditingTitle;
+
+    private void ApplyTitleTextStyle(TimelineClip clip)
+    {
+        try { TitleClipText.FontFamily   = new FontFamily(clip.FontFamily); } catch { }
+        try { TitleClipEditor.FontFamily = new FontFamily(clip.FontFamily); } catch { }
+        var size = Math.Max(6, clip.FontSize);
+        TitleClipText.FontSize   = size;
+        TitleClipEditor.FontSize = size;
+
+        TitleClipText.FontWeight   = clip.IsBold ? Microsoft.UI.Text.FontWeights.Bold : Microsoft.UI.Text.FontWeights.Normal;
+        TitleClipEditor.FontWeight = clip.IsBold ? Microsoft.UI.Text.FontWeights.Bold : Microsoft.UI.Text.FontWeights.Normal;
+
+        var style = clip.IsItalic ? Windows.UI.Text.FontStyle.Italic : Windows.UI.Text.FontStyle.Normal;
+        TitleClipText.FontStyle   = style;
+        TitleClipEditor.FontStyle = style;
+
+        TitleClipText.TextDecorations = clip.IsUnderline
+            ? Windows.UI.Text.TextDecorations.Underline
+            : Windows.UI.Text.TextDecorations.None;
+
+        var brush = ParseColorBrush(clip.TextColor) ?? new SolidColorBrush(Microsoft.UI.Colors.White);
+        TitleClipText.Foreground   = brush;
+        TitleClipEditor.Foreground = brush;
+
+        var align = clip.TextAlign switch
+        {
+            "Left"  => TextAlignment.Left,
+            "Right" => TextAlignment.Right,
+            _       => TextAlignment.Center,
+        };
+        TitleClipText.TextAlignment   = align;
+        TitleClipEditor.TextAlignment = align;
+    }
+
+    private static SolidColorBrush? ParseColorBrush(string? hex)
+    {
+        if (string.IsNullOrWhiteSpace(hex)) return null;
+        var s = hex.Trim().TrimStart('#');
+        if (s.Length == 6) s = "FF" + s;
+        if (s.Length != 8) return null;
+        if (!byte.TryParse(s[..2], System.Globalization.NumberStyles.HexNumber, null, out var a)) return null;
+        if (!byte.TryParse(s.Substring(2, 2), System.Globalization.NumberStyles.HexNumber, null, out var r)) return null;
+        if (!byte.TryParse(s.Substring(4, 2), System.Globalization.NumberStyles.HexNumber, null, out var g)) return null;
+        if (!byte.TryParse(s.Substring(6, 2), System.Globalization.NumberStyles.HexNumber, null, out var b)) return null;
+        return new SolidColorBrush(Color.FromArgb(a, r, g, b));
+    }
+
+    private void OnTitleOverlayDoubleTapped(object sender, DoubleTappedRoutedEventArgs e)
+    {
+        if (_titleClipAtPlayhead is null) return;
+        EnterTitleEditMode();
+        e.Handled = true;
+    }
+
+    private void EnterTitleEditMode()
+    {
+        if (_titleClipAtPlayhead is null) return;
+        _isEditingTitle = true;
+        TitleClipEditor.Text       = _titleClipAtPlayhead.Label;
+        TitleClipText.Visibility   = Visibility.Collapsed;
+        TitleClipEditor.Visibility = Visibility.Visible;
+        TitleClipEditor.Focus(FocusState.Programmatic);
+        TitleClipEditor.SelectAll();
+        UpdateTitleHandles();
+    }
+
+    private void ExitTitleEditMode(bool commit)
+    {
+        if (!_isEditingTitle) return;
+        _isEditingTitle = false;
+        if (commit && _titleClipAtPlayhead is not null)
+        {
+            var newText = TitleClipEditor.Text ?? string.Empty;
+            if (newText != _titleClipAtPlayhead.Label)
+            {
+                _titleClipAtPlayhead.Label = newText;
+                if (_vm is not null) _vm.Project.IsModified = true;
+                UpdateClipHeader(_titleClipAtPlayhead);
+                Timeline.Refresh();
+            }
+        }
+        TitleClipEditor.Visibility = Visibility.Collapsed;
+        TitleClipText.Visibility   = Visibility.Visible;
+        UpdateTitleHandles();
+    }
+
+    private void OnTitleEditorKeyDown(object sender, KeyRoutedEventArgs e)
+    {
+        if (e.Key == VirtualKey.Escape)
+        {
+            ExitTitleEditMode(commit: false);
+            e.Handled = true;
+        }
+        else if (e.Key == VirtualKey.Enter && !InputKeyboardSource
+                    .GetKeyStateForCurrentThread(VirtualKey.Shift)
+                    .HasFlag(Windows.UI.Core.CoreVirtualKeyStates.Down))
+        {
+            // Plain Enter commits; Shift+Enter inserts a newline (AcceptsReturn).
+            ExitTitleEditMode(commit: true);
+            e.Handled = true;
+        }
+    }
+
+    private void OnTitleEditorLostFocus(object sender, RoutedEventArgs e) =>
+        ExitTitleEditMode(commit: true);
+
+    // ── Title drag-to-position in preview ───────────────────────────────
+
+    /// <summary>Map clip.PosX/PosY (project pixels) → preview-viewport pixels and apply
+    /// scale + rotation. The CompositeTransform's origin is set to (0.5, 0.5) in XAML so
+    /// scale/rotation pivot around the title's own center.</summary>
+    private void ApplyTitlePosition(TimelineClip clip)
+    {
+        if (_vm is null)
+        {
+            TitleClipTransform.TranslateX = 0;
+            TitleClipTransform.TranslateY = 0;
+            TitleClipTransform.ScaleX = 1;
+            TitleClipTransform.ScaleY = 1;
+            TitleClipTransform.Rotation = 0;
+            return;
+        }
+        // PosX/PosY are in canvas-pixel units; the viewport is sized to canvas aspect.
+        var (canvasW, canvasH) = _vm.Project.GetCanvasSize();
+        double sx = PreviewViewport.Width  / Math.Max(1, canvasW);
+        double sy = PreviewViewport.Height / Math.Max(1, canvasH);
+        TitleClipTransform.TranslateX = clip.PosX * sx;
+        TitleClipTransform.TranslateY = clip.PosY * sy;
+        double s = Math.Clamp(clip.Scale, 0.1, 10);
+        TitleClipTransform.ScaleX   = s;
+        TitleClipTransform.ScaleY   = s;
+        TitleClipTransform.Rotation = clip.Rotation;
+        UpdateTitleHandles();
+    }
+
+    private bool _isDraggingTitle;
+    private Windows.Foundation.Point _titleDragStartPointer;
+    private double _titleDragStartPosX;
+    private double _titleDragStartPosY;
+
+    private void OnTitlePositionerPointerPressed(object sender, PointerRoutedEventArgs e)
+    {
+        if (_isEditingTitle) return;
+        if (_titleClipAtPlayhead is null) return;
+        var fe = (FrameworkElement)sender;
+        _titleDragStartPointer = e.GetCurrentPoint(PreviewViewport).Position;
+        _titleDragStartPosX    = _titleClipAtPlayhead.PosX;
+        _titleDragStartPosY    = _titleClipAtPlayhead.PosY;
+        _isDraggingTitle       = true;
+        fe.CapturePointer(e.Pointer);
+        e.Handled = true;
+    }
+
+    private void OnTitlePositionerPointerMoved(object sender, PointerRoutedEventArgs e)
+    {
+        if (!_isDraggingTitle || _vm is null || _titleClipAtPlayhead is null) return;
+        var pt = e.GetCurrentPoint(PreviewViewport).Position;
+        double dxViewport = pt.X - _titleDragStartPointer.X;
+        double dyViewport = pt.Y - _titleDragStartPointer.Y;
+        // Convert viewport-pixel delta back to canvas-pixel units (PosX/PosY space).
+        var (canvasW, canvasH) = _vm.Project.GetCanvasSize();
+        double sx = PreviewViewport.Width  > 0 ? canvasW / PreviewViewport.Width  : 1.0;
+        double sy = PreviewViewport.Height > 0 ? canvasH / PreviewViewport.Height : 1.0;
+        double newX = _titleDragStartPosX + dxViewport * sx;
+        double newY = _titleDragStartPosY + dyViewport * sy;
+
+        SnapGuide guideX = SnapGuide.None;
+        SnapGuide guideY = SnapGuide.None;
+
+        if (IsCtrlHeld())
+        {
+            // Snap targets in canvas pixels (same scheme as video clips). Title's
+            // half-extents come from its rendered size × Scale, converted to canvas px.
+            double titleScale = Math.Clamp(_titleClipAtPlayhead.Scale, 0.1, 10);
+            double halfW  = TitleClipPositioner.ActualWidth  * titleScale * sx / 2.0;
+            double halfH  = TitleClipPositioner.ActualHeight * titleScale * sy / 2.0;
+            double vHalfW = canvasW / 2.0;
+            double vHalfH = canvasH / 2.0;
+
+            // 8 viewport-pixel snap radius expressed in project px so the feel is
+            // independent of preview-area size or project resolution.
+            double snapPx = 8.0;
+            double thresholdX = snapPx * sx;
+            double thresholdY = snapPx * sy;
+
+            (newX, int ix) = SnapTo(newX, new[]
+            {
+                0.0,             // 0: title center on vertical centerline
+                -halfW,          // 1: title right edge on vertical centerline
+                 halfW,          // 2: title left edge on vertical centerline
+                 vHalfW - halfW, // 3: title right edge on viewport right
+                -vHalfW + halfW, // 4: title left edge on viewport left
+            }, thresholdX);
+            guideX = ix switch
+            {
+                0 or 1 or 2 => SnapGuide.Center,
+                3           => SnapGuide.Far,
+                4           => SnapGuide.Near,
+                _           => SnapGuide.None,
+            };
+
+            (newY, int iy) = SnapTo(newY, new[]
+            {
+                0.0,
+                -halfH,
+                 halfH,
+                 vHalfH - halfH,
+                -vHalfH + halfH,
+            }, thresholdY);
+            guideY = iy switch
+            {
+                0 or 1 or 2 => SnapGuide.Center,
+                3           => SnapGuide.Far,
+                4           => SnapGuide.Near,
+                _           => SnapGuide.None,
+            };
+        }
+
+        UpdateSnapGuides(guideX, guideY);
+
+        _titleClipAtPlayhead.PosX = newX;
+        _titleClipAtPlayhead.PosY = newY;
+        _vm.Project.IsModified = true;
+        e.Handled = true;
+    }
+
+    private void OnTitlePositionerPointerReleased(object sender, PointerRoutedEventArgs e)
+    {
+        if (!_isDraggingTitle) return;
+        _isDraggingTitle = false;
+        ((FrameworkElement)sender).ReleasePointerCapture(e.Pointer);
+        HideSnapGuides();
+        e.Handled = true;
+    }
+
+    private void OnTitlePositionerPointerCaptureLost(object sender, PointerRoutedEventArgs e)
+    {
+        _isDraggingTitle = false;
+        HideSnapGuides();
+    }
+
+    /// <summary>Re-position the title transform handles once the positioner's measured
+    /// size settles (text content or font changes reflow the layout asynchronously).</summary>
+    private void OnTitlePositionerSizeChanged(object sender, SizeChangedEventArgs e)
+    {
+        UpdateTitleHandles();
     }
 
     /// <summary>Apply CropLeft/CropTop/CropRight/CropBottom as a RectangleGeometry on the
@@ -567,7 +935,7 @@ public sealed partial class EditorPage : Page
     /// </summary>
     private void RefreshPresentation()
     {
-        if (_vm is null) { SetPresentedClip(null); return; }
+        if (_vm is null) { SetPresentedClip(null); SetTitleClipAtPlayhead(null); return; }
 
         // Prefer the explicitly-selected clip so the transform overlay edits whatever
         // the user clicked (including lower-track clips beneath a topmost one). Fall
@@ -581,6 +949,9 @@ public sealed partial class EditorPage : Page
             clip = FindVideoClipAt(_vm.Project.Playhead);
 
         SetPresentedClip(clip);
+        // The title overlay is independent — it always reflects the title at the
+        // playhead, even when a video clip is presented.
+        SetTitleClipAtPlayhead(FindTitleClipAt(_vm.Project.Playhead));
     }
 
     private bool IsClipInProject(TimelineClip clip)
@@ -631,8 +1002,11 @@ public sealed partial class EditorPage : Page
             return;
         }
 
-        int outW = Math.Max(1, _vm.Project.Width);
-        int outH = Math.Max(1, _vm.Project.Height);
+        // Preview is laid out at canvas aspect, not at the export's W×H — the
+        // export size only controls the dashed crop overlay inside the canvas.
+        var (canvasW, canvasH) = _vm.Project.GetCanvasSize();
+        int outW = Math.Max(1, canvasW);
+        int outH = Math.Max(1, canvasH);
         double outAspect = (double)outW / outH;
         double cAspect   = cw / ch;
         double frX, frY, frW, frH;
@@ -699,6 +1073,8 @@ public sealed partial class EditorPage : Page
         RotateLine.X1 = RotateLine.X2 = cx;
         RotateLine.Y1 = y;
         RotateLine.Y2 = rotateHandleY;
+
+        _currentBoxCenter = new Windows.Foundation.Point(cx, y + h / 2);
     }
 
     private static void PlaceHandle(Microsoft.UI.Xaml.Shapes.Shape handle, double centerX, double centerY)
@@ -764,7 +1140,10 @@ public sealed partial class EditorPage : Page
         double areaH = PreviewArea.ActualHeight;
         if (areaW <= 0 || areaH <= 0) return;
 
-        double projectAspect = (double)_vm.Project.Width / _vm.Project.Height;
+        // Fit the viewport to the canvas aspect (not the export resolution) so the
+        // preview shows the working canvas. The export crop overlay lives inside it.
+        var (canvasW, canvasH) = _vm.Project.GetCanvasSize();
+        double projectAspect = (double)canvasW / canvasH;
         double areaAspect    = areaW / areaH;
 
         double w, h;
@@ -783,10 +1162,56 @@ public sealed partial class EditorPage : Page
 
         PreviewViewport.Width  = w;
         PreviewViewport.Height = h;
+        UpdateExportWindowOverlay();
     }
 
-    private void OnPreviewAreaSizeChanged(object sender, SizeChangedEventArgs e) =>
+    /// <summary>
+    /// Position the dashed export-window indicator inside the preview viewport.
+    /// Visible only when the canvas and export aspects differ — when they match,
+    /// the export covers the full canvas and the overlay would be redundant.
+    /// </summary>
+    private void UpdateExportWindowOverlay()
+    {
+        if (_vm is null
+            || PreviewViewport.Width  <= 0
+            || PreviewViewport.Height <= 0)
+        {
+            ExportWindowOverlay.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        var (canvasW, canvasH) = _vm.Project.GetCanvasSize();
+        if (canvasW <= 0 || canvasH <= 0)
+        {
+            ExportWindowOverlay.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        double canvasAspect = (double)canvasW / canvasH;
+        double exportAspect = (double)_vm.Project.Width / Math.Max(1, _vm.Project.Height);
+        if (Math.Abs(canvasAspect - exportAspect) < 0.001)
+        {
+            // Canvas already matches the export aspect — no crop region to mark.
+            ExportWindowOverlay.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        var (_, _, winW, winH) = _vm.Project.GetExportWindow();
+        // Convert canvas-pixel dimensions to viewport-pixel dimensions.
+        double scale = PreviewViewport.Width / canvasW;
+        ExportWindowOverlay.Width  = winW * scale;
+        ExportWindowOverlay.Height = winH * scale;
+        ExportWindowOverlay.Visibility = Visibility.Visible;
+    }
+
+    private void OnPreviewAreaSizeChanged(object sender, SizeChangedEventArgs e)
+    {
         UpdatePreviewCanvasSize();
+        // Title position is in project pixels — re-map after the viewport changes size
+        // so the text doesn't drift relative to the underlying video frame.
+        if (_titleClipAtPlayhead is not null)
+            ApplyTitlePosition(_titleClipAtPlayhead);
+    }
 
     // ── Right-click context menu on the preview ──────────────────────────
 
@@ -934,13 +1359,14 @@ public sealed partial class EditorPage : Page
 
         if (IsCtrlHeld())
         {
-            // Snap targets in project pixels (PosX/Y units). Viewport half-extents are
-            // simply the project resolution / 2; scaled clip half-extents are scale * that.
+            // Snap targets in canvas pixels (PosX/Y units). Viewport half-extents are
+            // simply the canvas resolution / 2; scaled clip half-extents are scale * that.
+            var (canvasW, canvasH) = _vm.Project.GetCanvasSize();
             double scale = _presentedClip.Scale;
-            double halfW  = scale * _vm.Project.Width  / 2.0;
-            double halfH  = scale * _vm.Project.Height / 2.0;
-            double vHalfW = _vm.Project.Width  / 2.0;
-            double vHalfH = _vm.Project.Height / 2.0;
+            double halfW  = scale * canvasW  / 2.0;
+            double halfH  = scale * canvasH / 2.0;
+            double vHalfW = canvasW / 2.0;
+            double vHalfH = canvasH / 2.0;
 
             // 8 screen-pixel snap radius expressed in project pixels (so the feel is
             // the same regardless of preview-area size or project resolution).
@@ -1005,8 +1431,10 @@ public sealed partial class EditorPage : Page
 
     private void UpdateSnapGuides(SnapGuide x, SnapGuide y)
     {
-        double w = PreviewPlayer.ActualWidth;
-        double h = PreviewPlayer.ActualHeight;
+        // Guide lines span the viewport. PreviewPlayer is permanently Collapsed (zero size),
+        // so use PreviewViewport which always reflects the visible canvas.
+        double w = PreviewViewport.ActualWidth;
+        double h = PreviewViewport.ActualHeight;
 
         SetVLine(SnapGuideVLeft,   0,     h);
         SetVLine(SnapGuideVCenter, w / 2, h);
@@ -1048,8 +1476,10 @@ public sealed partial class EditorPage : Page
         if (_vm is null) return (1, 1);
         double cw = VideoCompositor.ActualWidth;
         double ch = VideoCompositor.ActualHeight;
-        int outW = Math.Max(1, _vm.Project.Width);
-        int outH = Math.Max(1, _vm.Project.Height);
+        // Pointer-to-clip math runs in canvas-pixel space, same as PosX/PosY.
+        var (canvasW, canvasH) = _vm.Project.GetCanvasSize();
+        int outW = Math.Max(1, canvasW);
+        int outH = Math.Max(1, canvasH);
         if (cw <= 0 || ch <= 0) return (1, 1);
 
         double outAspect = (double)outW / outH;
@@ -1102,10 +1532,10 @@ public sealed partial class EditorPage : Page
         _gestureStartPosX     = _presentedClip.PosX;
         _gestureStartPosY     = _presentedClip.PosY;
 
-        // Center of the bounding box in overlay coordinates
-        _gestureBoxCenter = new Windows.Foundation.Point(
-            Canvas.GetLeft(TransformBox) + TransformBox.Width  / 2,
-            Canvas.GetTop (TransformBox) + TransformBox.Height / 2);
+        // Center of the bounding box in viewport coords (matches TransformOverlay's coord
+        // space — both Canvas elements stretch to fill PreviewViewport, so handles from
+        // either video TransformOverlay or TitleHandles use the same coord system).
+        _gestureBoxCenter = _currentBoxCenter;
 
         var dx = _gestureStart.X - _gestureBoxCenter.X;
         var dy = _gestureStart.Y - _gestureBoxCenter.Y;
@@ -1225,9 +1655,8 @@ public sealed partial class EditorPage : Page
 
     private void UpdatePreviewOverlayForMedia(MediaItem media)
     {
-        TbPreviewTitle.Text = System.IO.Path.GetFileNameWithoutExtension(media.Name);
-        var dur = media.Duration > TimeSpan.Zero ? FormatHms(media.Duration) : "—";
-        TbPreviewSubtitle.Text = $"— {media.Type.ToString().ToUpperInvariant()} · {dur}";
+        // Preview-overlay text was removed; this hook is kept as a no-op so the
+        // existing call sites don't need to change.
     }
 
     private void OnPlaybackTick(object? sender, object e)
@@ -1263,6 +1692,9 @@ public sealed partial class EditorPage : Page
                 return;
             }
         }
+
+        // Title overlay tracks the playhead independently of video.
+        SetTitleClipAtPlayhead(FindTitleClipAt(_vm.Project.Playhead));
 
         // Every tick: let the compositor reconcile its layer pool so newly-active or
         // newly-finished clips on any track appear/disappear in the swap chain.
@@ -1501,11 +1933,34 @@ public sealed partial class EditorPage : Page
         return border;
     }
 
+    /// <summary>Find the title track (creating one if the project doesn't have it yet).
+    /// New title tracks are inserted at the top of the stack so titles render above video.</summary>
+    private Track? GetOrCreateTitleTrack()
+    {
+        if (_vm is null) return null;
+        var track = _vm.Tracks.FirstOrDefault(t => t.Kind == TrackKind.Title);
+        if (track is null)
+        {
+            track = new Track { Label = "T1", Kind = TrackKind.Title };
+            _vm.Tracks.Insert(0, track);
+        }
+        return track;
+    }
+
     private void AddTitleClip(string presetName)
     {
         if (_vm is null) return;
-        var track = _vm.Tracks.FirstOrDefault(t => t.Kind == TrackKind.Video);
+        var track = GetOrCreateTitleTrack();
         if (track is null) return;
+
+        // If a title already covers the playhead, edit it instead of stacking another.
+        var existing = track.Clips.FirstOrDefault(c =>
+            _vm.Project.Playhead >= c.TimelineStart && _vm.Project.Playhead < c.TimelineEnd);
+        if (existing is not null)
+        {
+            SelectAndEditTitleClip(existing);
+            return;
+        }
 
         var start = track.Clips.Count > 0
             ? track.Clips.Max(c => c.TimelineEnd)
@@ -1522,6 +1977,56 @@ public sealed partial class EditorPage : Page
 
         _vm.History.Record(new ClipAddAction(track, clip));
         Timeline.ViewModel = _vm;
+    }
+
+    /// <summary>Drop a fresh title clip at the playhead on the title track, select it,
+    /// and put the preview overlay straight into edit mode so the user can type
+    /// immediately. If a title already covers the playhead, edit that one instead of
+    /// creating a second overlapping clip.</summary>
+    private void AddTitleAtPlayheadAndEdit()
+    {
+        if (_vm is null) return;
+        var track = GetOrCreateTitleTrack();
+        if (track is null) return;
+
+        var existing = track.Clips.FirstOrDefault(c =>
+            _vm.Project.Playhead >= c.TimelineStart && _vm.Project.Playhead < c.TimelineEnd);
+        if (existing is not null)
+        {
+            SelectAndEditTitleClip(existing);
+            return;
+        }
+
+        var clip = new TimelineClip
+        {
+            Label         = "Title",
+            Kind          = ClipKind.Title,
+            TimelineStart = _vm.Project.Playhead,
+            Duration      = TimeSpan.FromSeconds(3),
+            ColorHue      = 30,
+        };
+
+        _vm.History.Record(new ClipAddAction(track, clip));
+        SelectAndEditTitleClip(clip);
+    }
+
+    private void SelectAndEditTitleClip(TimelineClip clip)
+    {
+        if (_vm is null) return;
+        foreach (var tr in _vm.Tracks)
+            foreach (var c in tr.Clips)
+                c.IsSelected = false;
+        clip.IsSelected = true;
+        _vm.SelectedClip = clip;
+
+        Timeline.ViewModel = _vm;
+        UpdateInspector(clip);
+        UpdateClipHeader(clip);
+        SetPresentedClip(clip);
+        // The title overlay drives edit-mode targeting — make sure it's bound to
+        // this clip before we open the editor.
+        SetTitleClipAtPlayhead(clip);
+        EnterTitleEditMode();
     }
 
     private void OnLibSearchChanged(object sender, TextChangedEventArgs e)
@@ -1565,16 +2070,14 @@ public sealed partial class EditorPage : Page
         if (_vm is null) return;
         _vm.SelectedClip = null;
         UpdateInspector(null);
-        TbPreviewTitle.Text = "No clip selected";
-        TbPreviewSubtitle.Text = "— Drop media here or pick a clip from the timeline";
         Timeline.Refresh();
         RefreshPresentation();
     }
 
     private void UpdatePreviewOverlay(TimelineClip clip)
     {
-        TbPreviewTitle.Text = clip.Label;
-        TbPreviewSubtitle.Text = $"— {clip.Kind.ToString().ToUpperInvariant()} · {FormatHms(clip.Duration)}";
+        // Preview-overlay text was removed; this hook is kept as a no-op so the
+        // existing call sites don't need to change.
     }
 
     private void UpdateProgramInfo()
@@ -1669,6 +2172,13 @@ public sealed partial class EditorPage : Page
         UpdateProgramInfo();
         UpdateStatusBar();
         UpdatePreviewCanvasSize();
+        // Project dimensions feed the compositor's letterbox and per-clip transform
+        // math, the transform-handle overlay, and the title clip's project-pixel→
+        // viewport-pixel mapping. None of those refresh on their own when only the
+        // project's W/H change (PreviewArea hasn't resized) — kick them by hand.
+        UpdateTransformHandles();
+        if (_titleClipAtPlayhead is not null)
+            ApplyTitlePosition(_titleClipAtPlayhead);
 
         ProgramInfoFlyout.Hide();
     }
@@ -1722,8 +2232,6 @@ public sealed partial class EditorPage : Page
         {
             _vm.SelectedClip = null;
             UpdateInspector(null);
-            TbPreviewTitle.Text = "No clip selected";
-            TbPreviewSubtitle.Text = "— Drop media here or pick a clip from the timeline";
         }
     }
 
@@ -1948,12 +2456,20 @@ public sealed partial class EditorPage : Page
         AddInspSlider("Volume", clip.Volume * 100,  0,  100, v => clip.Volume = v / 100.0);
         AddInspSlider("Speed",  clip.Speed  * 100, 10,  400, v => clip.Speed  = v / 100.0);
 
+        if (clip.Kind == ClipKind.Title)
+        {
+            BuildInspectorTitleText(clip);
+        }
+
         if (clip.Kind is ClipKind.Video or ClipKind.Title)
         {
             InspectorContent.Children.Add(MakeInspSectionHeader("TRANSFORM"));
+            // PosX/PosY are in canvas-pixel units. Range to ±canvas dimensions so the
+            // slider covers the full movable area regardless of project export size.
+            var (canvasW, canvasH) = _vm.Project.GetCanvasSize();
             AddInspSlider("Scale",    clip.Scale    * 100,   10,  300, v => clip.Scale    = v / 100.0);
-            AddInspSlider("Pos X",    clip.PosX,          -1920, 1920, v => clip.PosX     = v);
-            AddInspSlider("Pos Y",    clip.PosY,          -1080, 1080, v => clip.PosY     = v);
+            AddInspSlider("Pos X",    clip.PosX,        -canvasW, canvasW, v => clip.PosX     = v);
+            AddInspSlider("Pos Y",    clip.PosY,        -canvasH, canvasH, v => clip.PosY     = v);
             AddInspSlider("Rotation", clip.Rotation,        -180,  180, v => clip.Rotation = v);
             AddInspSlider("Opacity",  clip.Opacity  * 100,    0,  100, v => clip.Opacity  = v / 100.0);
 
@@ -1963,6 +2479,206 @@ public sealed partial class EditorPage : Page
             AddInspSlider("Right",  clip.CropRight  * 100, 0, 95, v => clip.CropRight  = v / 100.0);
             AddInspSlider("Bottom", clip.CropBottom * 100, 0, 95, v => clip.CropBottom = v / 100.0);
         }
+    }
+
+    private static readonly string[] FontFamilyChoices =
+    {
+        "Segoe UI", "Arial", "Calibri", "Cambria", "Consolas", "Courier New",
+        "Georgia", "Impact", "Times New Roman", "Trebuchet MS", "Verdana",
+    };
+
+    private static readonly (string Label, string Hex)[] TextColorSwatches =
+    {
+        ("White",  "#FFFFFFFF"),
+        ("Black",  "#FF000000"),
+        ("Yellow", "#FFFFD93D"),
+        ("Red",    "#FFE05858"),
+        ("Green",  "#FF7FB069"),
+        ("Cyan",   "#FF6EC1E4"),
+    };
+
+    private void BuildInspectorTitleText(TimelineClip clip)
+    {
+        InspectorContent.Children.Add(MakeInspSectionHeader("TEXT"));
+
+        // Text content
+        InspectorContent.Children.Add(MakeTextBoxRow(
+            "Text", clip.Label, v => { clip.Label = v; Timeline.Refresh(); UpdateClipHeader(clip); }));
+
+        // Font family
+        InspectorContent.Children.Add(MakeFontFamilyRow(clip));
+
+        // Font size
+        AddInspSlider("Size", clip.FontSize, 8, 240, v => clip.FontSize = v);
+
+        // Bold / Italic / Underline toggles + alignment
+        InspectorContent.Children.Add(MakeFontStyleRow(clip));
+
+        // Alignment
+        InspectorContent.Children.Add(MakeTextAlignRow(clip));
+
+        // Color swatches
+        InspectorContent.Children.Add(MakeColorSwatchRow(clip));
+    }
+
+    private UIElement MakeTextBoxRow(string label, string value, Action<string> onChange)
+    {
+        var panel = new StackPanel { Padding = new Thickness(14, 4, 14, 4), Spacing = 2 };
+        panel.Children.Add(new TextBlock
+        {
+            Text = label,
+            FontSize = 10,
+            Foreground = (Brush)Application.Current.Resources["TextMutedBrush"],
+        });
+        var tb = new TextBox
+        {
+            Text = value,
+            FontSize = 11.5,
+            AcceptsReturn = true,
+            TextWrapping = TextWrapping.Wrap,
+        };
+        tb.TextChanged += (_, _) => onChange(tb.Text);
+        panel.Children.Add(tb);
+        return panel;
+    }
+
+    private UIElement MakeFontFamilyRow(TimelineClip clip)
+    {
+        var panel = new StackPanel { Padding = new Thickness(14, 4, 14, 4), Spacing = 2 };
+        panel.Children.Add(new TextBlock
+        {
+            Text = "Font",
+            FontSize = 10,
+            Foreground = (Brush)Application.Current.Resources["TextMutedBrush"],
+        });
+        var combo = new ComboBox
+        {
+            ItemsSource = FontFamilyChoices,
+            SelectedItem = FontFamilyChoices.Contains(clip.FontFamily) ? clip.FontFamily : FontFamilyChoices[0],
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            FontSize = 11.5,
+        };
+        combo.SelectionChanged += (_, _) =>
+        {
+            if (combo.SelectedItem is string s) clip.FontFamily = s;
+        };
+        panel.Children.Add(combo);
+        return panel;
+    }
+
+    private UIElement MakeFontStyleRow(TimelineClip clip)
+    {
+        var panel = new StackPanel { Padding = new Thickness(14, 4, 14, 4), Spacing = 2 };
+        panel.Children.Add(new TextBlock
+        {
+            Text = "Style",
+            FontSize = 10,
+            Foreground = (Brush)Application.Current.Resources["TextMutedBrush"],
+        });
+        var row = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 4 };
+
+        var boldBtn = MakeToggle("B", clip.IsBold, v => clip.IsBold = v);
+        boldBtn.FontWeight = Microsoft.UI.Text.FontWeights.Bold;
+        var italicBtn = MakeToggle("I", clip.IsItalic, v => clip.IsItalic = v);
+        italicBtn.FontStyle = Windows.UI.Text.FontStyle.Italic;
+        var underlineBtn = MakeToggle("U", clip.IsUnderline, v => clip.IsUnderline = v);
+
+        row.Children.Add(boldBtn);
+        row.Children.Add(italicBtn);
+        row.Children.Add(underlineBtn);
+        panel.Children.Add(row);
+        return panel;
+    }
+
+    private static ToggleButton MakeToggle(string content, bool initial, Action<bool> onChange)
+    {
+        var t = new ToggleButton
+        {
+            Content = content,
+            IsChecked = initial,
+            MinWidth = 32,
+            Padding = new Thickness(6, 2, 6, 2),
+            FontSize = 12,
+        };
+        t.Checked   += (_, _) => onChange(true);
+        t.Unchecked += (_, _) => onChange(false);
+        return t;
+    }
+
+    private UIElement MakeTextAlignRow(TimelineClip clip)
+    {
+        var panel = new StackPanel { Padding = new Thickness(14, 4, 14, 4), Spacing = 2 };
+        panel.Children.Add(new TextBlock
+        {
+            Text = "Align",
+            FontSize = 10,
+            Foreground = (Brush)Application.Current.Resources["TextMutedBrush"],
+        });
+        var row = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 4 };
+
+        ToggleButton? activeBtn = null;
+        ToggleButton MakeAlignBtn(string label, string value)
+        {
+            var t = new ToggleButton
+            {
+                Content = label,
+                MinWidth = 32,
+                Padding = new Thickness(6, 2, 6, 2),
+                FontSize = 12,
+                IsChecked = clip.TextAlign == value,
+            };
+            if (t.IsChecked == true) activeBtn = t;
+            t.Click += (_, _) =>
+            {
+                clip.TextAlign = value;
+                t.IsChecked = true;
+                if (activeBtn is not null && activeBtn != t) activeBtn.IsChecked = false;
+                activeBtn = t;
+            };
+            return t;
+        }
+
+        row.Children.Add(MakeAlignBtn("⯇", "Left"));
+        row.Children.Add(MakeAlignBtn("≡", "Center"));
+        row.Children.Add(MakeAlignBtn("⯈", "Right"));
+        panel.Children.Add(row);
+        return panel;
+    }
+
+    private UIElement MakeColorSwatchRow(TimelineClip clip)
+    {
+        var panel = new StackPanel { Padding = new Thickness(14, 4, 14, 4), Spacing = 2 };
+        panel.Children.Add(new TextBlock
+        {
+            Text = "Color",
+            FontSize = 10,
+            Foreground = (Brush)Application.Current.Resources["TextMutedBrush"],
+        });
+        var row = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
+        foreach (var (lbl, hex) in TextColorSwatches)
+        {
+            var fill = ParseColorBrush(hex) ?? new SolidColorBrush(Microsoft.UI.Colors.White);
+            var swatchBorder = new Border
+            {
+                Width = 22,
+                Height = 22,
+                CornerRadius = new CornerRadius(3),
+                Background = fill,
+                BorderBrush = string.Equals(clip.TextColor, hex, StringComparison.OrdinalIgnoreCase)
+                    ? (Brush)Application.Current.Resources["AccentBrush"]
+                    : (Brush)Application.Current.Resources["HairlineBrush"],
+                BorderThickness = new Thickness(string.Equals(clip.TextColor, hex, StringComparison.OrdinalIgnoreCase) ? 2 : 1),
+            };
+            ToolTipService.SetToolTip(swatchBorder, lbl);
+            swatchBorder.Tapped += (_, _) =>
+            {
+                clip.TextColor = hex;
+                UpdateInspector(clip);
+            };
+            row.Children.Add(swatchBorder);
+        }
+        panel.Children.Add(row);
+        return panel;
     }
 
     private void BuildInspectorAudio(TimelineClip clip)
@@ -1987,9 +2703,30 @@ public sealed partial class EditorPage : Page
 
     private UIElement MakeAudioLevelMeter(TimelineClip clip)
     {
-        const int Segments = 22;
-        const double GreenStop = 0.68;
-        const double AmberStop = 0.88;
+        // Geometry & dB scale
+        const int    Segments    = 40;        // higher resolution than the old 22-segment bar
+        const double FloorDb     = -60.0;     // bottom of the meter, in dBFS
+        const double GreenTopDb  = -18.0;     // green→amber transition
+        const double AmberTopDb  =  -6.0;     // amber→red transition
+        const double ClipDb      =  -0.5;     // sample-level "clipping" trigger
+        const double PeakHoldSec = 1.5;       // peak-hold dwell before falling
+        const double PeakFallDbPerSec = 30;   // peak-hold fall speed once dwell elapses
+        const double RmsWindowSec = 0.3;      // ~300 ms RMS window (close to VU)
+
+        // Map any linear amplitude in [0..1] to a [0..1] meter position based on dBFS.
+        static double AmpToMeterFraction(double amp)
+        {
+            if (amp <= 0) return 0;
+            double db = 20.0 * Math.Log10(amp);
+            if (db <= FloorDb) return 0;
+            if (db >= 0)       return 1;
+            return (db - FloorDb) / (0 - FloorDb);
+        }
+
+        // Color zones use *dB position*, not linear position, so the colors line up
+        // with conventional broadcast meters (green up to -18, amber to -6, red above).
+        double greenFrac = (GreenTopDb - FloorDb) / (0 - FloorDb);
+        double amberFrac = (AmberTopDb - FloorDb) / (0 - FloorDb);
 
         var greenOn  = new SolidColorBrush(Color.FromArgb(255,  72, 196, 124));
         var amberOn  = new SolidColorBrush(Color.FromArgb(255, 220, 184,  72));
@@ -2000,11 +2737,14 @@ public sealed partial class EditorPage : Page
 
         Brush ColorFor(int i, bool on)
         {
-            double frac = (i + 1) / (double)Segments;
-            if (frac <= GreenStop) return on ? greenOn : greenOff;
-            if (frac <= AmberStop) return on ? amberOn : amberOff;
+            double frac = (i + 0.5) / Segments;
+            if (frac <= greenFrac) return on ? greenOn : greenOff;
+            if (frac <= amberFrac) return on ? amberOn : amberOff;
             return on ? redOn : redOff;
         }
+
+        // Mono font for all numeric readouts so columns stay aligned across updates.
+        var monoFont = new FontFamily("JetBrains Mono, Consolas");
 
         var cellsL = new Rectangle[Segments];
         var cellsR = new Rectangle[Segments];
@@ -2015,7 +2755,7 @@ public sealed partial class EditorPage : Page
             {
                 ColumnDefinitions =
                 {
-                    new ColumnDefinition { Width = new GridLength(12) },
+                    new ColumnDefinition { Width = new GridLength(10) },
                     new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) },
                 },
             };
@@ -2023,7 +2763,7 @@ public sealed partial class EditorPage : Page
             {
                 Text = label,
                 FontSize = 9.5,
-                FontFamily = new FontFamily("JetBrains Mono, Consolas"),
+                FontFamily = monoFont,
                 Foreground = (Brush)Application.Current.Resources["TextFaintBrush"],
                 VerticalAlignment = VerticalAlignment.Center,
             };
@@ -2037,10 +2777,10 @@ public sealed partial class EditorPage : Page
             {
                 var cell = new Rectangle
                 {
-                    Width = 7,
-                    Height = 7,
-                    RadiusX = 1,
-                    RadiusY = 1,
+                    Width = 4,
+                    Height = 8,
+                    RadiusX = 0.5,
+                    RadiusY = 0.5,
                     Fill = ColorFor(i, false),
                 };
                 cells[i] = cell;
@@ -2053,13 +2793,113 @@ public sealed partial class EditorPage : Page
             return grid;
         }
 
-        var dbText = new TextBlock
+        // dB tick row underneath the bars: marks 0, -6, -18, -30, -60 dB positions.
+        Grid BuildScaleRow()
         {
-            Text = "-∞ dBFS",
-            FontFamily = new FontFamily("JetBrains Mono, Consolas"),
-            FontSize = 10,
-            Foreground = (Brush)Application.Current.Resources["TextMutedBrush"],
-            HorizontalAlignment = HorizontalAlignment.Right,
+            var grid = new Grid
+            {
+                ColumnDefinitions =
+                {
+                    new ColumnDefinition { Width = new GridLength(10) },
+                    new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) },
+                },
+                Margin = new Thickness(0, 1, 0, 0),
+            };
+            // The bar cells are Width=4 + Spacing=1 = 5px per segment, totaling
+            // Segments*5 - 1 px. Place tick labels at fractional positions of that width.
+            int totalWidth = Segments * 5 - 1;
+            var canvas = new Canvas { Height = 9, Width = totalWidth };
+            void Tick(double db, string text)
+            {
+                double frac = (db - FloorDb) / (0 - FloorDb);
+                if (frac < 0 || frac > 1) return;
+                var tb = new TextBlock
+                {
+                    Text = text,
+                    FontSize = 8,
+                    FontFamily = monoFont,
+                    Foreground = (Brush)Application.Current.Resources["TextFaintBrush"],
+                };
+                tb.Measure(new Windows.Foundation.Size(double.PositiveInfinity, double.PositiveInfinity));
+                double x = frac * totalWidth - tb.DesiredSize.Width / 2;
+                Canvas.SetLeft(tb, Math.Max(0, Math.Min(totalWidth - tb.DesiredSize.Width, x)));
+                Canvas.SetTop(tb, 0);
+                canvas.Children.Add(tb);
+            }
+            Tick(  0, "0");
+            Tick( -6, "-6");
+            Tick(-18, "-18");
+            Tick(-30, "-30");
+            Tick(-60, "-60");
+            Grid.SetColumn(canvas, 1);
+            grid.Children.Add(canvas);
+            return grid;
+        }
+
+        // Numeric readouts row: Peak / Hold / RMS dBFS. Tight tabular layout so the
+        // values can be read at a glance while audio plays.
+        TextBlock MakeStatLabel(string text)
+            => new() {
+                Text = text,
+                FontSize = 9,
+                FontFamily = monoFont,
+                Foreground = (Brush)Application.Current.Resources["TextFaintBrush"],
+            };
+        TextBlock MakeStatValue()
+            => new() {
+                Text = "-∞ dB",
+                FontSize = 10,
+                FontFamily = monoFont,
+                Foreground = (Brush)Application.Current.Resources["TextMutedBrush"],
+            };
+
+        var peakValue = MakeStatValue();
+        var holdValue = MakeStatValue();
+        var rmsValue  = MakeStatValue();
+
+        Grid BuildStatsRow()
+        {
+            var grid = new Grid
+            {
+                ColumnDefinitions =
+                {
+                    new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) },
+                    new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) },
+                    new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) },
+                },
+                Margin = new Thickness(0, 4, 0, 0),
+            };
+            void Col(int idx, string title, TextBlock value)
+            {
+                var sp = new StackPanel { Spacing = 1 };
+                sp.Children.Add(MakeStatLabel(title));
+                sp.Children.Add(value);
+                Grid.SetColumn(sp, idx);
+                grid.Children.Add(sp);
+            }
+            Col(0, "PEAK", peakValue);
+            Col(1, "HOLD", holdValue);
+            Col(2, "RMS",  rmsValue);
+            return grid;
+        }
+
+        // Latching clip indicator. The user resets it by tapping the chip.
+        var clipBorder = new Border
+        {
+            Background = new SolidColorBrush(Color.FromArgb(40, 224, 88, 88)),
+            BorderBrush = new SolidColorBrush(Color.FromArgb(120, 224, 88, 88)),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(3),
+            Padding = new Thickness(6, 1, 6, 1),
+            Margin = new Thickness(0, 4, 0, 0),
+            Child = new TextBlock
+            {
+                Text = "CLIP — click to clear",
+                FontSize = 9,
+                FontFamily = monoFont,
+                Foreground = new SolidColorBrush(Color.FromArgb(255, 224, 88, 88)),
+            },
+            Visibility = Visibility.Collapsed,
         };
 
         var container = new StackPanel
@@ -2067,57 +2907,194 @@ public sealed partial class EditorPage : Page
             Padding = new Thickness(14, 4, 14, 8),
             Spacing = 3,
         };
-        container.Children.Add(dbText);
         container.Children.Add(BuildRow("L", cellsL));
         container.Children.Add(BuildRow("R", cellsR));
+        container.Children.Add(BuildScaleRow());
+        container.Children.Add(BuildStatsRow());
+        container.Children.Add(clipBorder);
 
-        double levelL = 0, levelR = 0, peakL = 0, peakR = 0, phase = 0;
-        var rng = new System.Random();
-        var timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(50) };
+        // Ensure peak data is being extracted so the meter shows the real waveform
+        // (instead of zero) as soon as the background job finishes.
+        if (_vm is not null && !string.IsNullOrEmpty(clip.SourceId))
+        {
+            var media = _vm.MediaBin.FirstOrDefault(m => m.Id == clip.SourceId);
+            if (media is not null && !string.IsNullOrEmpty(media.FilePath))
+                BTAP.Services.WaveformService.EnsurePeaksAsync(media.FilePath);
+        }
+
+        // Meter ballistics state
+        double levelL = 0, levelR = 0;           // displayed bar levels (smoothed)
+        double peakL  = 0, peakR  = 0;           // peak-hold values (linear amplitude)
+        double peakLDwell = 0, peakRDwell = 0;   // seconds-of-hold remaining before fall
+        bool   clipped = false;
+
+        // RMS rolling window. At 60Hz tick the window is RmsWindowSec / TickSec samples.
+        const double TickMs = 16.0;              // 60Hz update rate
+        int rmsWindowSize = Math.Max(1, (int)(RmsWindowSec * 1000.0 / TickMs));
+        var rmsBuf = new double[rmsWindowSize];
+        int rmsIdx = 0;
+        double rmsSumSq = 0;
+
+        DateTime lastTick = DateTime.UtcNow;
+        var timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(TickMs) };
+
+        clipBorder.Tapped += (_, _) =>
+        {
+            clipped = false;
+            clipBorder.Visibility = Visibility.Collapsed;
+        };
+
+        // Sample the cached peak data at the playhead's offset into the clip's source.
+        (double instL, double instR) SamplePeaks()
+        {
+            if (_vm is null) return (0, 0);
+            if (string.IsNullOrEmpty(clip.SourceId)) return (0, 0);
+            var media = _vm.MediaBin.FirstOrDefault(m => m.Id == clip.SourceId);
+            if (media is null || string.IsNullOrEmpty(media.FilePath)) return (0, 0);
+            var data = BTAP.Services.WaveformService.GetCachedPeaks(media.FilePath);
+            if (data is null || data.PeaksL.Length == 0) return (0, 0);
+
+            var playhead = _vm.Project.Playhead;
+            if (playhead < clip.TimelineStart || playhead >= clip.TimelineEnd) return (0, 0);
+
+            var srcTime  = clip.SourceStart + (playhead - clip.TimelineStart);
+            double srcSec = srcTime.TotalSeconds;
+            if (srcSec < 0) return (0, 0);
+            int bucket = (int)(srcSec * data.BucketsPerSecond);
+            if (bucket < 0 || bucket >= data.PeaksL.Length) return (0, 0);
+
+            double l = data.PeaksL[bucket];
+            double r = data.PeaksR[bucket];
+            return (l, r);
+        }
 
         timer.Tick += (_, _) =>
         {
-            double target = 0;
+            var now = DateTime.UtcNow;
+            double dt = (now - lastTick).TotalSeconds;
+            lastTick = now;
+            if (dt <= 0 || dt > 0.25) dt = TickMs / 1000.0;
+
+            double instL = 0, instR = 0;
             if (_vm?.IsPlaying == true)
             {
-                phase += 0.22;
-                double envelope = Math.Clamp(clip.Volume, 0, 2);
-                double pulse = 0.55 + 0.30 * Math.Sin(phase) + 0.15 * Math.Sin(phase * 2.7 + 1.1);
-                double noise = (rng.NextDouble() - 0.5) * 0.12;
-                target = Math.Clamp((pulse + noise) * envelope * 0.55, 0, 1);
+                var (sL, sR) = SamplePeaks();
+                instL = sL;
+                instR = sR;
+
+                // Apply per-clip gain + pan. clip.Volume is the linear gain factor
+                // (slider goes 0..2 for ±6 dB). Pan is -1..+1 (constant-power-ish via
+                // linear taper here — close enough for a meter, simpler than sqrt).
+                double gain = Math.Clamp(clip.Volume, 0, 4);
+                instL *= gain;
+                instR *= gain;
+
+                double pan = Math.Clamp(clip.Pan, -1, 1);
+                instL *= 1.0 - Math.Max(0,  pan);
+                instR *= 1.0 - Math.Max(0, -pan);
             }
 
-            double pan = Math.Clamp(clip.Pan, -1, 1);
-            double tL = target * (1.0 - Math.Max(0,  pan));
-            double tR = target * (1.0 - Math.Max(0, -pan));
+            // Ballistics: instant attack to the actual sample peak (matches PPM-style
+            // behavior; we already integrate over 5 ms via the bucket so no more
+            // smoothing is needed on attack). Release falls roughly 20 dB/sec.
+            double releasePerTick = Math.Pow(10, -20 * dt / 20.0); // 20 dB/s release
+            levelL = Math.Max(instL, levelL * releasePerTick);
+            levelR = Math.Max(instR, levelR * releasePerTick);
 
-            levelL += (tL - levelL) * (tL > levelL ? 0.55 : 0.22);
-            levelR += (tR - levelR) * (tR > levelR ? 0.55 : 0.22);
+            // Peak hold: latch instantaneous peak for PeakHoldSec, then fall at
+            // PeakFallDbPerSec until it meets the live level.
+            void UpdateHold(ref double hold, ref double dwell, double inst)
+            {
+                if (inst >= hold) { hold = inst; dwell = PeakHoldSec; return; }
+                if (dwell > 0)    { dwell -= dt; return; }
+                // Dwell elapsed — drop hold at the configured dB-per-second rate.
+                double db = hold > 0 ? 20 * Math.Log10(hold) : FloorDb - 1;
+                db -= PeakFallDbPerSec * dt;
+                hold = db <= FloorDb ? 0 : Math.Pow(10, db / 20.0);
+            }
+            UpdateHold(ref peakL, ref peakLDwell, instL);
+            UpdateHold(ref peakR, ref peakRDwell, instR);
 
-            peakL = Math.Max(peakL * 0.95, levelL);
-            peakR = Math.Max(peakR * 0.95, levelR);
+            // Clip-latch: any sample above ClipDb (effectively 0 dBFS) lights and
+            // holds the red badge until the user clicks to clear it.
+            double maxInst = Math.Max(instL, instR);
+            if (maxInst > 0 && 20 * Math.Log10(maxInst) >= ClipDb)
+            {
+                if (!clipped)
+                {
+                    clipped = true;
+                    clipBorder.Visibility = Visibility.Visible;
+                }
+            }
 
-            int litL = (int)Math.Round(levelL * Segments);
-            int litR = (int)Math.Round(levelR * Segments);
-            int pkL  = (int)Math.Round(peakL  * Segments);
-            int pkR  = (int)Math.Round(peakR  * Segments);
+            // Update bars from dB position, not linear — so the green/amber/red
+            // bands stay visually proportional to the dB labels.
+            double fracL = AmpToMeterFraction(levelL);
+            double fracR = AmpToMeterFraction(levelR);
+            double holdFracL = AmpToMeterFraction(peakL);
+            double holdFracR = AmpToMeterFraction(peakR);
+
+            int litL = (int)Math.Round(fracL * Segments);
+            int litR = (int)Math.Round(fracR * Segments);
+            int pkL  = (int)Math.Round(holdFracL * Segments);
+            int pkR  = (int)Math.Round(holdFracR * Segments);
 
             for (int i = 0; i < Segments; i++)
             {
-                bool onL = i < litL || (peakL > 0.02 && i == pkL - 1);
-                bool onR = i < litR || (peakR > 0.02 && i == pkR - 1);
+                bool onL = i < litL || (pkL > 0 && i == pkL - 1);
+                bool onR = i < litR || (pkR > 0 && i == pkR - 1);
                 cellsL[i].Fill = ColorFor(i, onL);
                 cellsR[i].Fill = ColorFor(i, onR);
             }
 
-            double peak = Math.Max(peakL, peakR);
-            dbText.Text = peak < 0.001
-                ? "-∞ dBFS"
-                : $"{20 * Math.Log10(peak),6:F1} dBFS";
+            // RMS over the rolling window. We feed it the max(L,R) per tick so the
+            // displayed RMS reflects whichever channel is loudest — matches the way
+            // most NLEs label a single "RMS" readout for a stereo track.
+            double rmsSample = Math.Max(instL, instR);
+            double rmsSampleSq = rmsSample * rmsSample;
+            rmsSumSq += rmsSampleSq - rmsBuf[rmsIdx];
+            rmsBuf[rmsIdx] = rmsSampleSq;
+            rmsIdx = (rmsIdx + 1) % rmsBuf.Length;
+            double rms = Math.Sqrt(Math.Max(0, rmsSumSq) / rmsBuf.Length);
+
+            static string Fmt(double amp) =>
+                amp < 1e-5 ? "-∞ dB" : $"{20 * Math.Log10(amp),6:F1} dB";
+
+            double peakInst = Math.Max(levelL, levelR);
+            double peakHold = Math.Max(peakL, peakR);
+            peakValue.Text = Fmt(peakInst);
+            holdValue.Text = Fmt(peakHold);
+            rmsValue.Text  = Fmt(rms);
+
+            // Recolor PEAK readout when clipping is "right now" (not just latched)
+            peakValue.Foreground = peakInst > 0 && 20 * Math.Log10(peakInst) >= ClipDb
+                ? (Brush)new SolidColorBrush(Color.FromArgb(255, 224, 88, 88))
+                : (Brush)Application.Current.Resources["TextMutedBrush"];
         };
 
-        container.Loaded   += (_, _) => timer.Start();
-        container.Unloaded += (_, _) => timer.Stop();
+        // Refresh when peaks land asynchronously (so the meter shows real data the
+        // moment WaveformService finishes extracting).
+        EventHandler<string>? onPeaks = null;
+        onPeaks = (_, path) =>
+        {
+            if (_vm is null) return;
+            var media = _vm.MediaBin.FirstOrDefault(m => m.Id == clip.SourceId);
+            if (media is null || !string.Equals(media.FilePath, path, StringComparison.OrdinalIgnoreCase))
+                return;
+            // No explicit refresh needed — the next timer tick will read the new cache.
+        };
+
+        container.Loaded += (_, _) =>
+        {
+            lastTick = DateTime.UtcNow;
+            BTAP.Services.WaveformService.PeaksReady += onPeaks;
+            timer.Start();
+        };
+        container.Unloaded += (_, _) =>
+        {
+            timer.Stop();
+            BTAP.Services.WaveformService.PeaksReady -= onPeaks;
+        };
 
         return container;
     }
@@ -2351,27 +3328,6 @@ public sealed partial class EditorPage : Page
         UpdateInspector(_vm.SelectedClip);
     }
 
-    // Scope-wide keyboard accelerators — fire even when focus is in a TextBox / button.
-    private void OnUndoAccelerator(Microsoft.UI.Xaml.Input.KeyboardAccelerator sender,
-                                   Microsoft.UI.Xaml.Input.KeyboardAcceleratorInvokedEventArgs args)
-    {
-        OnUndo(this, new RoutedEventArgs());
-        args.Handled = true;
-    }
-
-    private void OnRedoAccelerator(Microsoft.UI.Xaml.Input.KeyboardAccelerator sender,
-                                   Microsoft.UI.Xaml.Input.KeyboardAcceleratorInvokedEventArgs args)
-    {
-        OnRedo(this, new RoutedEventArgs());
-        args.Handled = true;
-    }
-
-    private void OnSaveAccelerator(Microsoft.UI.Xaml.Input.KeyboardAccelerator sender,
-                                   Microsoft.UI.Xaml.Input.KeyboardAcceleratorInvokedEventArgs args)
-    {
-        _ = SaveProjectAsync();
-        args.Handled = true;
-    }
 
     // ── File menu ─────────────────────────────────────────────────────────
 
@@ -2557,7 +3513,11 @@ public sealed partial class EditorPage : Page
     {
         if (_vm is null) return;
         var n = _vm.Tracks.Count(t => t.Kind == TrackKind.Video) + 1;
-        _vm.Tracks.Insert(0, new Track { Label = $"V{n}", Kind = TrackKind.Video });
+        // Insert above other video tracks but below any title tracks so titles stay on top.
+        int insertIdx = 0;
+        while (insertIdx < _vm.Tracks.Count && _vm.Tracks[insertIdx].Kind == TrackKind.Title)
+            insertIdx++;
+        _vm.Tracks.Insert(insertIdx, new Track { Label = $"V{n}", Kind = TrackKind.Video });
         Timeline.ViewModel = _vm;
         _vm.Project.IsModified = true;
         UpdateStatusBar();
@@ -2584,18 +3544,38 @@ public sealed partial class EditorPage : Page
 
     // ── Help menu ─────────────────────────────────────────────────────────
 
-    private async void OnHelpShortcuts(object sender, RoutedEventArgs e) =>
-        await ShowDialog("Keyboard shortcuts",
-            "Space — Play / Pause\n" +
-            "J / L — Step back / Play\n" +
-            "K — Stop\n" +
-            "C — Razor tool      V — Selection      H — Hand\n" +
-            "S — Toggle snap     M — Add marker\n" +
-            "Delete — Delete clip   Shift+Delete — Ripple delete\n" +
-            "Ctrl+Z / Ctrl+Y — Undo / Redo\n" +
-            "Ctrl+S — Save     Ctrl+Shift+S — Save As\n" +
-            "Ctrl+D — Duplicate clip    Ctrl+B — Split at playhead\n" +
-            "Ctrl+N — New     Ctrl+O — Open     Ctrl+E — Export");
+    private async void OnHelpShortcuts(object sender, RoutedEventArgs e)
+    {
+        var customizer = new BTAP.Controls.KeyboardCustomizerControl();
+        customizer.Attach(_keyBindings);
+        var dialog = new ContentDialog
+        {
+            Title = "Keyboard shortcuts",
+            Content = customizer,
+            CloseButtonText = "Close",
+            XamlRoot = XamlRoot,
+        };
+        // ContentDialog's default Max{Width,Height} (548 × 756) would crop the
+        // visual keyboard. These resource overrides widen the dialog enough to
+        // show the unbound column + keyboard + side panel without scrolling.
+        dialog.Resources["ContentDialogMaxWidth"]  = 1400d;
+        dialog.Resources["ContentDialogMaxHeight"] = 820d;
+        dialog.Resources["ContentDialogMinWidth"]  = 1340d;
+        dialog.Resources["ContentDialogMinHeight"] = 680d;
+
+        // Page-level KeyboardAccelerators fire window-wide; during the
+        // listen-for-key flow they'd hijack the user's keystrokes. Clear them
+        // while the dialog is up and rebuild on close.
+        KeyboardAccelerators.Clear();
+        try
+        {
+            await dialog.ShowAsync();
+        }
+        finally
+        {
+            RebuildKeyboardAccelerators();
+        }
+    }
 
     private async void OnHelpAbout(object sender, RoutedEventArgs e) =>
         await ShowDialog("About BTAP",
@@ -2654,32 +3634,27 @@ public sealed partial class EditorPage : Page
         }
 
         // Tear down the Win2D composition-effects layer for the duration of the export.
-        // The CompositionEffectBrush shares its DirectX device with the MediaComposition
-        // renderer; leaving it active has been observed to silently drop the video stream.
+        // The CompositionEffectBrush shares its DirectX device with the export-time
+        // compositor; leaving it active has been observed to silently drop the video stream.
         bool wasEffectsAttached = _previewEffects.IsAttached;
         if (wasEffectsAttached) _previewEffects.Detach();
+
+        // Also tear down the preview compositor so its per-source MediaPlayers release
+        // exclusive locks on the source files — the export pool needs to reopen them.
+        try { VideoCompositor?.Detach(); } catch { }
 
         using var logger = new ExportLogger(file.Path);
 
         try
         {
-            // Build the composition
-            var build = await ExportService.BuildCompositionAsync(_vm.Project, logger);
-            if (build.Composition is null)
-            {
-                await ShowDialog("Nothing to export", build.Error ?? "No clips found.");
-                return;
-            }
-
-            // Derive the encoding profile from the first source file so the codec matches
-            // (avoids the HEVC-MOV → H.264 silent-no-video bug)
-            var profile = await ExportService.GetEncodingProfileForProjectAsync(_vm.Project);
-            LogProfile(logger, "Output encoding profile", profile);
-            await RunExportAsync(build, file, profile, logger);
+            await RunCustomExportAsync(file, logger);
         }
         finally
         {
-            // Re-attach the effects layer and re-apply the current clip's grade
+            if (_vm is not null)
+            {
+                try { VideoCompositor?.Attach(_vm); } catch { }
+            }
             if (wasEffectsAttached)
             {
                 _previewEffects.Attach(ColorGradingLayer);
@@ -2688,25 +3663,9 @@ public sealed partial class EditorPage : Page
         }
     }
 
-    private static void LogProfile(ExportLogger log, string label, MediaEncodingProfile profile)
+    private async Task RunCustomExportAsync(StorageFile destination, ExportLogger log)
     {
-        log.Log("");
-        log.Log($"== {label} ==");
-        if (profile.Container is not null) log.Log($"   Container: {profile.Container.Subtype}");
-        if (profile.Video is not null)
-            log.Log($"   Video: subtype={profile.Video.Subtype}, {profile.Video.Width}x{profile.Video.Height}, " +
-                    $"bitrate={profile.Video.Bitrate}, fps={profile.Video.FrameRate?.Numerator}/{profile.Video.FrameRate?.Denominator}, " +
-                    $"profile={profile.Video.ProfileId}");
-        else log.Log("   Video: <none>");
-        if (profile.Audio is not null)
-            log.Log($"   Audio: subtype={profile.Audio.Subtype}, {profile.Audio.SampleRate}Hz, " +
-                    $"{profile.Audio.ChannelCount}ch, bitrate={profile.Audio.Bitrate}");
-        else log.Log("   Audio: <none>");
-    }
-
-    private async Task RunExportAsync(ExportService.BuildResult build, StorageFile destination, MediaEncodingProfile profile, ExportLogger log)
-    {
-        var composition = build.Composition!;
+        if (_vm is null) return;
 
         // ── Progress dialog ──────────────────────────────────────────────
         var progressBar = new ProgressBar
@@ -2721,12 +3680,6 @@ public sealed partial class EditorPage : Page
             FontSize = 11,
             Foreground = (Brush)Application.Current.Resources["TextMutedBrush"],
         };
-        var detailLabel = new TextBlock
-        {
-            Text = $"{build.VideoClips} video clip(s) · {build.AudioClips} audio clip(s)",
-            FontSize = 10.5,
-            Foreground = (Brush)Application.Current.Resources["TextFaintBrush"],
-        };
         var pathLabel = new TextBlock
         {
             Text = destination.Path,
@@ -2739,9 +3692,8 @@ public sealed partial class EditorPage : Page
         {
             Spacing = 10,
             MinWidth = 380,
-            Children = { pathLabel, progressBar, statusLabel, detailLabel },
+            Children = { pathLabel, progressBar, statusLabel },
         };
-
         var dialog = new ContentDialog
         {
             Title = "Exporting",
@@ -2751,116 +3703,66 @@ public sealed partial class EditorPage : Page
             DefaultButton = ContentDialogButton.None,
         };
 
-        log.Log("");
-        log.Log($"Calling RenderToFileAsync(MediaTrimmingPreference.Fast)…");
-        var renderStart = DateTime.Now;
-        var operation = composition.RenderToFileAsync(destination, MediaTrimmingPreference.Fast, profile);
+        var cts = new CancellationTokenSource();
+        dialog.CloseButtonClick += (_, _) => { try { cts.Cancel(); } catch { } };
 
-        double lastLoggedPct = -10;
-        operation.Progress = (_, percent) =>
+        var progress = new Progress<double>(fraction =>
         {
             DispatcherQueue.TryEnqueue(() =>
             {
-                progressBar.Value = percent;
-                statusLabel.Text = $"Rendering… {percent:F0}%";
+                progressBar.Value = Math.Clamp(fraction * 100.0, 0, 100);
+                statusLabel.Text = fraction < 0.85
+                    ? $"Rendering video… {fraction * 100:F0}%"
+                    : $"Muxing audio… {fraction * 100:F0}%";
             });
-            if (percent - lastLoggedPct >= 10)
-            {
-                log.Log($"   progress: {percent:F1}%");
-                lastLoggedPct = percent;
-            }
-        };
-
-        bool cancelled = false;
-        dialog.CloseButtonClick += (_, _) =>
-        {
-            cancelled = true;
-            try { operation.Cancel(); } catch { /* already done */ }
-        };
+        });
 
         var dialogTask = dialog.ShowAsync().AsTask();
-        var renderTask = operation.AsTask();
+        var renderStart = DateTime.Now;
 
-        TranscodeFailureReason result = TranscodeFailureReason.None;
-        Exception? renderError = null;
+        ExportRenderer.Result result;
         try
         {
-            result = await renderTask;
+            result = await ExportRenderer.RenderAsync(_vm.Project, destination, progress, log, cts.Token);
         }
-        catch (TaskCanceledException) { cancelled = true; }
-        catch (OperationCanceledException) { cancelled = true; }
-        catch (Exception ex) { renderError = ex; }
+        catch (Exception ex)
+        {
+            log.Log($"Unhandled exception during export: {ex}");
+            result = new ExportRenderer.Result { Error = ex.Message };
+        }
 
-        log.Log($"Render finished in {(DateTime.Now - renderStart).TotalSeconds:F1}s — cancelled={cancelled}, result={result}, exception={renderError?.GetType().Name}");
-        if (renderError is not null) log.Log($"Exception details: {renderError.Message}");
+        log.Log($"Total render time: {(DateTime.Now - renderStart).TotalSeconds:F1}s");
 
         dialog.Hide();
         await dialogTask;
 
-        if (cancelled)
+        if (cts.IsCancellationRequested)
         {
             log.Log("User cancelled — deleting partial file.");
             try { await destination.DeleteAsync(StorageDeleteOption.PermanentDelete); } catch { }
             return;
         }
 
-        if (renderError is not null)
+        if (!result.Success)
         {
-            await ShowDialog("Export failed", $"{renderError.Message}\n\nLog: {log.FilePath}");
+            await ShowDialog("Export failed", $"{result.Error ?? "Unknown error."}\n\nLog: {log.FilePath}");
             return;
         }
 
-        if (result != TranscodeFailureReason.None)
-        {
-            await ShowDialog("Export failed", $"Renderer returned: {result}\n\nLog: {log.FilePath}");
-            return;
-        }
-
-        // Inspect the output file
-        try
-        {
-            var outputProfile = await MediaEncodingProfile.CreateFromFileAsync(destination);
-            log.Log("");
-            log.Log("== OUTPUT file profile (as read back from disk) ==");
-            if (outputProfile?.Container is not null) log.Log($"   Container: {outputProfile.Container.Subtype}");
-            if (outputProfile?.Video is not null)
-                log.Log($"   Video: subtype={outputProfile.Video.Subtype}, " +
-                        $"{outputProfile.Video.Width}x{outputProfile.Video.Height}, " +
-                        $"bitrate={outputProfile.Video.Bitrate}, " +
-                        $"fps={outputProfile.Video.FrameRate?.Numerator}/{outputProfile.Video.FrameRate?.Denominator}");
-            else log.Log("   Video: <none>  ← THIS IS THE BUG, NO VIDEO STREAM WAS WRITTEN");
-            if (outputProfile?.Audio is not null)
-                log.Log($"   Audio: subtype={outputProfile.Audio.Subtype}, " +
-                        $"{outputProfile.Audio.SampleRate}Hz, {outputProfile.Audio.ChannelCount}ch");
-            var props = await destination.GetBasicPropertiesAsync();
-            log.Log($"   File size: {props.Size:N0} bytes");
-        }
-        catch (Exception inspectEx)
-        {
-            log.Log($"Couldn't inspect output file: {inspectEx.GetType().Name}: {inspectEx.Message}");
-        }
-
-        // Sanity-check: did the output actually contain a video stream?
+        // Verify the output actually has a video stream
         if (!await ExportService.OutputHasVideoAsync(destination))
         {
             await ShowDialog(
                 "Export missing video",
                 "The renderer wrote the file but it doesn't contain a video stream. " +
-                "This usually means the source codec couldn't be transcoded — most " +
-                "commonly an iPhone HEVC .MOV without the HEVC Video Extensions " +
-                "installed.\n\n" +
-                "Try:\n" +
-                "  • Install \"HEVC Video Extensions\" from the Microsoft Store, or\n" +
-                "  • Set iPhone Camera → Formats → \"Most Compatible\" (records as H.264), or\n" +
-                "  • Convert the source to .mp4 first.\n\n" +
-                $"A detailed log was written to:\n{log.FilePath}");
+                $"This is unexpected with the custom pipeline. See log: {log.FilePath}");
             return;
         }
 
-        await ShowExportCompleteDialog(destination, build, log.FilePath);
+        await ShowExportCompleteDialog(destination, result, log.FilePath);
     }
 
-    private async Task ShowExportCompleteDialog(StorageFile file, ExportService.BuildResult build, string? logPath = null)
+    private async Task ShowExportCompleteDialog(StorageFile file, ExportRenderer.Result build, string? logPath = null)
     {
         var props = await file.GetBasicPropertiesAsync();
         var sizeMb = props.Size / (1024.0 * 1024.0);

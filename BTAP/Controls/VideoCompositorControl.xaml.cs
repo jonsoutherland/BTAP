@@ -39,8 +39,14 @@ public sealed partial class VideoCompositorControl : UserControl
     private readonly object _layersLock = new(); // guards _layers across UI / worker / render threads
     private bool _isPlaying;
 
-    public int OutputWidth  { get; set; } = 1920;
-    public int OutputHeight { get; set; } = 1080;
+    // The preview canvas size — derived from the first imported video clip's
+    // native resolution, with a fallback to the project's export dimensions when
+    // no video has been imported yet. The project's Width/Height define only the
+    // EXPORT crop window inside this canvas (rendered as a dashed overlay by
+    // EditorPage). Reading live from the VM keeps the letterbox and per-clip
+    // transform math in sync with changes to either canvas-source or export size.
+    public int OutputWidth  => _vm?.Project.GetCanvasSize().Width  ?? 1920;
+    public int OutputHeight => _vm?.Project.GetCanvasSize().Height ?? 1080;
 
     public VideoCompositorControl()
     {
@@ -53,8 +59,6 @@ public sealed partial class VideoCompositorControl : UserControl
         if (ReferenceEquals(_vm, vm)) return;
         DisposeAllLayers();
         _vm = vm;
-        OutputWidth  = vm.Project.Width;
-        OutputHeight = vm.Project.Height;
     }
 
     public void Detach()
@@ -106,12 +110,14 @@ public sealed partial class VideoCompositorControl : UserControl
     {
         if (_vm is null) return;
 
-        // Desired layers in deepest→shallowest order
+        // Desired layers in deepest→shallowest order. Video tracks contribute video
+        // frames + audio; audio tracks contribute audio only (their layers will have
+        // no Frame and DrawLayer skips them — but the MediaPlayer plays audio).
         var desired = new List<(Track Track, TimelineClip Clip)>();
         for (int i = _vm.Tracks.Count - 1; i >= 0; i--)
         {
             var t = _vm.Tracks[i];
-            if (t.Kind != TrackKind.Video) continue;
+            if (t.Kind != TrackKind.Video && t.Kind != TrackKind.Audio) continue;
             if (t.IsMuted) continue;
             var clip = FirstClipAt(t, playhead);
             if (clip is null) continue;
@@ -179,8 +185,13 @@ public sealed partial class VideoCompositorControl : UserControl
     {
         if (_vm is null) return;
         var media = _vm.MediaBin.FirstOrDefault(m => m.Id == clip.SourceId);
-        if (media is null || media.Type != MediaType.Video) return;
+        if (media is null) return;
+        if (media.Type != MediaType.Video && media.Type != MediaType.Audio) return;
         if (!System.IO.File.Exists(media.FilePath)) return;
+
+        // Video-frame-server only matters for video media — audio-only sources have
+        // no frames and turning it on for them is wasted work.
+        bool isVideo = media.Type == MediaType.Video;
 
         MediaPlayer player;
         try
@@ -188,8 +199,8 @@ public sealed partial class VideoCompositorControl : UserControl
             player = new MediaPlayer
             {
                 AutoPlay                  = false,
-                IsMuted                   = false,       // all video layers contribute audio (mixed at OS level)
-                IsVideoFrameServerEnabled = true,        // route frames through CopyFrameToVideoSurface
+                IsMuted                   = false,
+                IsVideoFrameServerEnabled = isVideo,
             };
         }
         catch { return; }

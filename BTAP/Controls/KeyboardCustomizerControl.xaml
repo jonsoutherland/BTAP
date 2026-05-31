@@ -1,0 +1,146 @@
+<UserControl
+    x:Class="BTAP.Controls.KeyboardCustomizerControl"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Width="1320" Height="640">
+    <Grid>
+        <Grid ColumnDefinitions="220,*,300">
+            <!-- ── Unbound actions column ──────────────────────────── -->
+            <Border Grid.Column="0"
+                    BorderBrush="{StaticResource HairlineBrush}"
+                    BorderThickness="0,0,1,0"
+                    Padding="12">
+                <Grid RowDefinitions="Auto,Auto,*">
+                    <TextBlock Grid.Row="0"
+                               Text="UNBOUND ACTIONS"
+                               FontSize="9.5"
+                               CharacterSpacing="120"
+                               Foreground="{StaticResource TextMutedBrush}" />
+                    <TextBlock Grid.Row="1"
+                               x:Name="TbUnboundHelper"
+                               Text="Click an action to assign it a key."
+                               TextWrapping="Wrap"
+                               FontSize="11"
+                               Margin="0,4,0,8"
+                               Foreground="{StaticResource TextFaintBrush}" />
+                    <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto">
+                        <StackPanel x:Name="UnboundList" Spacing="4" />
+                    </ScrollViewer>
+                </Grid>
+            </Border>
+
+            <!-- ── Keyboard ───────────────────────────────────────── -->
+            <ScrollViewer Grid.Column="1"
+                          HorizontalScrollBarVisibility="Auto"
+                          VerticalScrollBarVisibility="Auto"
+                          Padding="10">
+                <StackPanel Spacing="6">
+                    <TextBlock Text="Click a key to view its bindings on the right"
+                               FontSize="11"
+                               Foreground="{StaticResource TextFaintBrush}"
+                               Margin="2,0,0,4" />
+                    <StackPanel x:Name="KeyboardRoot" Spacing="4" />
+                </StackPanel>
+            </ScrollViewer>
+
+            <!-- ── Side panel: selected-key details ───────────────── -->
+            <Border Grid.Column="2"
+                    BorderBrush="{StaticResource HairlineBrush}"
+                    BorderThickness="1,0,0,0"
+                    Padding="14">
+                <Grid RowDefinitions="Auto,Auto,Auto,*,Auto,Auto,Auto">
+                    <TextBlock Grid.Row="0"
+                               x:Name="TbHeader"
+                               Text="Select a key"
+                               FontSize="14"
+                               FontWeight="SemiBold"
+                               Foreground="{StaticResource TextPrimaryBrush}" />
+                    <TextBlock Grid.Row="1"
+                               x:Name="TbHelper"
+                               Text="Click a key on the left to view or change its shortcuts. Use the Unbound list to assign new shortcuts."
+                               TextWrapping="Wrap"
+                               FontSize="11"
+                               Margin="0,4,0,0"
+                               Foreground="{StaticResource TextFaintBrush}" />
+
+                    <TextBlock Grid.Row="2"
+                               Text="CURRENT BINDINGS"
+                               FontSize="9.5"
+                               CharacterSpacing="120"
+                               Margin="0,14,0,4"
+                               Foreground="{StaticResource TextMutedBrush}" />
+                    <ScrollViewer Grid.Row="3" VerticalScrollBarVisibility="Auto">
+                        <StackPanel x:Name="BindingsList" Spacing="4" />
+                    </ScrollViewer>
+
+                    <Border Grid.Row="4"
+                            x:Name="StatusBanner"
+                            Margin="0,10,0,0"
+                            Padding="10,8"
+                            CornerRadius="4"
+                            Visibility="Collapsed">
+                        <TextBlock x:Name="TbStatusBanner"
+                                   FontSize="10.5"
+                                   TextWrapping="Wrap" />
+                    </Border>
+
+                    <Border Grid.Row="5"
+                            Height="1"
+                            Background="{StaticResource HairlineBrush}"
+                            Margin="0,12,0,8" />
+                    <Button Grid.Row="6"
+                            Content="Reset all to defaults"
+                            Click="OnResetClick"
+                            HorizontalAlignment="Stretch" />
+                </Grid>
+            </Border>
+        </Grid>
+
+        <!-- ── Listen overlay (covers everything during key capture) ── -->
+        <Grid x:Name="ListenOverlay"
+              Background="#E6000000"
+              Visibility="Collapsed">
+            <StackPanel HorizontalAlignment="Center"
+                        VerticalAlignment="Center"
+                        Spacing="14"
+                        MaxWidth="540">
+                <TextBlock Text="LISTENING FOR SHORTCUT"
+                           FontSize="10.5"
+                           CharacterSpacing="140"
+                           HorizontalAlignment="Center"
+                           Foreground="{StaticResource AccentBrush}" />
+                <TextBlock x:Name="TbListenAction"
+                           Text="for [Action]"
+                           FontSize="22"
+                           FontWeight="SemiBold"
+                           HorizontalAlignment="Center"
+                           Foreground="White" />
+                <TextBlock x:Name="TbListenWarn"
+                           Text=""
+                           TextWrapping="Wrap"
+                           TextAlignment="Center"
+                           FontSize="11"
+                           Foreground="#FFD58A52"
+                           Visibility="Collapsed" />
+                <Border Padding="32,16"
+                        CornerRadius="8"
+                        Background="#22FFFFFF"
+                        BorderBrush="{StaticResource AccentBrush}"
+                        BorderThickness="1.5"
+                        HorizontalAlignment="Center">
+                    <TextBlock x:Name="TbListenCombo"
+                               Text="Press any key…"
+                               FontFamily="{StaticResource MonoFont}"
+                               FontSize="26"
+                               MinWidth="220"
+                               TextAlignment="Center"
+                               Foreground="White" />
+                </Border>
+                <TextBlock Text="Hold Ctrl / Shift / Alt as desired, then press a key. Press Esc to cancel."
+                           FontSize="11"
+                           TextAlignment="Center"
+                           Foreground="#88FFFFFF" />
+            </StackPanel>
+        </Grid>
+    </Grid>
+</UserControl>

@@ -7,11 +7,9 @@
     Background="{StaticResource BgPageBrush}"
     IsTabStop="True">
 
-    <Page.KeyboardAccelerators>
-        <KeyboardAccelerator Key="Z" Modifiers="Control" Invoked="OnUndoAccelerator" />
-        <KeyboardAccelerator Key="Y" Modifiers="Control" Invoked="OnRedoAccelerator" />
-        <KeyboardAccelerator Key="S" Modifiers="Control" Invoked="OnSaveAccelerator" />
-    </Page.KeyboardAccelerators>
+    <!-- Keyboard shortcuts are now driven dynamically from KeyBindingsService.
+         See EditorPage.RebuildKeyboardAccelerators(). The Help → Keyboard shortcuts
+         menu opens a visual customizer that lets the user rebind anything. -->
 
     <Grid RowDefinitions="36,36,*,22">
 
@@ -218,7 +216,7 @@
                 <Border Grid.Row="0" BorderBrush="{StaticResource HairlineBrush}"
                         BorderThickness="0,0,0,1" Padding="10,6,10,0">
                     <StackPanel Orientation="Horizontal" Spacing="0">
-                        <Button x:Name="BtnLibMedia"  Content="Media"   Tag="media"   Click="OnLibTabClick" Style="{StaticResource GhostButtonStyle}" Padding="10,6" FontSize="11.5" FontWeight="Medium" BorderBrush="{StaticResource AccentBrush}" BorderThickness="0,0,0,2" Margin="0,0,0,-1" />
+                        <Button x:Name="BtnLibMedia"  Content="Media"   Tag="media"   Click="OnLibTabClick" Style="{StaticResource GhostButtonStyle}" Padding="10,6" FontSize="11.5" FontWeight="Medium" />
                         <Button x:Name="BtnLibTitles" Content="Titles"  Tag="titles"  Click="OnLibTabClick" Style="{StaticResource GhostButtonStyle}" Padding="10,6" FontSize="11.5" FontWeight="Medium" />
                         <Button x:Name="BtnLibFX"     Content="Effects" Tag="fx"      Click="OnLibTabClick" Style="{StaticResource GhostButtonStyle}" Padding="10,6" FontSize="11.5" FontWeight="Medium" />
                         <Button x:Name="BtnLibAudio"  Content="Audio"   Tag="audio"   Click="OnLibTabClick" Style="{StaticResource GhostButtonStyle}" Padding="10,6" FontSize="11.5" FontWeight="Medium" />
@@ -355,6 +353,19 @@
                                         <MenuFlyoutItem Text="Delete"    Click="OnPreviewDeleteClip" />
                                     </MenuFlyout>
                                 </Grid.ContextFlyout>
+                                <!-- Placeholder gradient (drawn FIRST so it sits behind every
+                                     other layer — video, title text, transform handles).
+                                     IsHitTestVisible=False keeps clicks falling through to
+                                     whatever's beneath. -->
+                                <Border x:Name="PreviewPlaceholder"
+                                        IsHitTestVisible="False">
+                                    <Border.Background>
+                                        <LinearGradientBrush StartPoint="0.3,0.4" EndPoint="0.7,0.65">
+                                            <GradientStop Color="#661A3040" Offset="0"/>
+                                            <GradientStop Color="#330A1218" Offset="1"/>
+                                        </LinearGradientBrush>
+                                    </Border.Background>
+                                </Border>
                                 <!-- Win2D-based custom video compositor: single GPU swap chain,
                                      multi-track simultaneous playback, per-clip transforms. -->
                                 <controls:VideoCompositorControl x:Name="VideoCompositor"
@@ -397,6 +408,20 @@
                                            Stroke="{StaticResource AccentBrush}"
                                            StrokeThickness="1"
                                            StrokeDashArray="4,3"
+                                           Fill="Transparent"
+                                           IsHitTestVisible="False"
+                                           Visibility="Collapsed" />
+
+                                <!-- Export window: dashed indicator showing the crop region that will
+                                     be scaled to the project's export W×H. Centered inside the canvas
+                                     viewport with the export aspect ratio; only visible when canvas
+                                     and export aspects differ. Sized in code via Width/Height. -->
+                                <Rectangle x:Name="ExportWindowOverlay"
+                                           HorizontalAlignment="Center"
+                                           VerticalAlignment="Center"
+                                           Stroke="#FFE05858"
+                                           StrokeThickness="1.5"
+                                           StrokeDashArray="5,3"
                                            Fill="Transparent"
                                            IsHitTestVisible="False"
                                            Visibility="Collapsed" />
@@ -475,47 +500,131 @@
                                              PointerCaptureLost="OnTransformHandleCaptureLost" />
                                 </Canvas>
 
-                                <!-- Title-clip rendering: shown when current clip Kind == Title -->
+                                <!-- Title-clip rendering: shown when current clip Kind == Title.
+                                     The outer overlay has no Background so it doesn't hit-test the whole
+                                     preview area (which would block clicks on video clips beneath).
+                                     Only the inner TitleClipPositioner (sized to the text) is hit-testable.
+                                     Double-tap TitleClipPositioner to swap TitleClipText for TitleClipEditor
+                                     (commits on blur / Enter / Escape). The inner Grid carries a
+                                     TranslateTransform driven by clip.PosX/PosY for drag-to-position. -->
                                 <Grid x:Name="TitleClipOverlay"
-                                      Background="Black"
                                       Visibility="Collapsed">
-                                    <TextBlock x:Name="TitleClipText"
-                                               FontFamily="{StaticResource SerifFont}"
-                                               FontStyle="Italic"
-                                               FontSize="48"
-                                               FontWeight="Light"
-                                               Foreground="White"
-                                               HorizontalAlignment="Center"
-                                               VerticalAlignment="Center"
-                                               TextWrapping="Wrap"
-                                               TextAlignment="Center"
-                                               Padding="40" />
+                                    <Grid x:Name="TitleClipPositioner"
+                                          HorizontalAlignment="Center"
+                                          VerticalAlignment="Center"
+                                          Background="Transparent"
+                                          RenderTransformOrigin="0.5,0.5"
+                                          DoubleTapped="OnTitleOverlayDoubleTapped"
+                                          PointerPressed="OnTitlePositionerPointerPressed"
+                                          PointerMoved="OnTitlePositionerPointerMoved"
+                                          PointerReleased="OnTitlePositionerPointerReleased"
+                                          PointerCaptureLost="OnTitlePositionerPointerCaptureLost"
+                                          SizeChanged="OnTitlePositionerSizeChanged">
+                                        <Grid.RenderTransform>
+                                            <CompositeTransform x:Name="TitleClipTransform" />
+                                        </Grid.RenderTransform>
+                                        <!-- Selection affordance: same dashed accent border that video
+                                             clips show via TransformBox. Stretches to the text bounds. -->
+                                        <Rectangle x:Name="TitleClipBorder"
+                                                   Stroke="{StaticResource AccentBrush}"
+                                                   StrokeThickness="1.5"
+                                                   StrokeDashArray="3,2"
+                                                   Fill="Transparent"
+                                                   IsHitTestVisible="False"
+                                                   Visibility="Collapsed" />
+                                        <TextBlock x:Name="TitleClipText"
+                                                   FontFamily="Segoe UI"
+                                                   FontSize="64"
+                                                   Foreground="White"
+                                                   HorizontalAlignment="Center"
+                                                   VerticalAlignment="Center"
+                                                   TextWrapping="Wrap"
+                                                   TextAlignment="Center"
+                                                   Padding="20,8" />
+                                        <TextBox x:Name="TitleClipEditor"
+                                                 FontFamily="Segoe UI"
+                                                 FontSize="64"
+                                                 Foreground="White"
+                                                 Background="Transparent"
+                                                 BorderThickness="0"
+                                                 HorizontalAlignment="Center"
+                                                 VerticalAlignment="Center"
+                                                 TextWrapping="Wrap"
+                                                 TextAlignment="Center"
+                                                 AcceptsReturn="True"
+                                                 Padding="20,8"
+                                                 Visibility="Collapsed"
+                                                 KeyDown="OnTitleEditorKeyDown"
+                                                 LostFocus="OnTitleEditorLostFocus">
+                                            <TextBox.Resources>
+                                                <SolidColorBrush x:Key="TextControlBackground" Color="Transparent" />
+                                                <SolidColorBrush x:Key="TextControlBackgroundPointerOver" Color="Transparent" />
+                                                <SolidColorBrush x:Key="TextControlBackgroundFocused" Color="Transparent" />
+                                                <SolidColorBrush x:Key="TextControlBackgroundDisabled" Color="Transparent" />
+                                                <SolidColorBrush x:Key="TextControlBorderBrush" Color="Transparent" />
+                                                <SolidColorBrush x:Key="TextControlBorderBrushPointerOver" Color="Transparent" />
+                                                <SolidColorBrush x:Key="TextControlBorderBrushFocused" Color="Transparent" />
+                                                <SolidColorBrush x:Key="TextControlBorderBrushDisabled" Color="Transparent" />
+                                                <Thickness x:Key="TextControlBorderThemeThicknessFocused">0</Thickness>
+                                                <SolidColorBrush x:Key="TextControlButtonBackground" Color="Transparent" />
+                                                <SolidColorBrush x:Key="TextControlButtonBackgroundPointerOver" Color="Transparent" />
+                                                <SolidColorBrush x:Key="TextControlButtonBackgroundPressed" Color="Transparent" />
+                                                <SolidColorBrush x:Key="TextControlSelectionHighlightColor" Color="#552B6CB0" />
+                                            </TextBox.Resources>
+                                        </TextBox>
+                                    </Grid>
+                                    <!-- Title-clip transform handles: 4 corners scale, top knob rotates.
+                                         The handles sit ON TOP of the title text so they stay grabbable;
+                                         the title text itself remains hit-testable everywhere else (drag
+                                         to move, double-tap to edit). Body drag uses the existing
+                                         TitleClipPositioner pointer handlers. -->
+                                    <Canvas x:Name="TitleHandles" Visibility="Collapsed">
+                                        <Line x:Name="TitleRotateLine"
+                                              Stroke="{StaticResource AccentBrush}"
+                                              StrokeThickness="1" />
+                                        <Ellipse x:Name="TitleHandleRotate" Width="14" Height="14"
+                                                 Fill="White"
+                                                 Stroke="{StaticResource AccentBrush}" StrokeThickness="1.5"
+                                                 Tag="ROT"
+                                                 PointerPressed="OnTransformHandlePressed"
+                                                 PointerMoved="OnTransformHandleMoved"
+                                                 PointerReleased="OnTransformHandleReleased"
+                                                 PointerCaptureLost="OnTransformHandleCaptureLost" />
+                                        <Ellipse x:Name="TitleHandleTL" Width="12" Height="12"
+                                                 Fill="White"
+                                                 Stroke="{StaticResource AccentBrush}" StrokeThickness="1.5"
+                                                 Tag="TL"
+                                                 PointerPressed="OnTransformHandlePressed"
+                                                 PointerMoved="OnTransformHandleMoved"
+                                                 PointerReleased="OnTransformHandleReleased"
+                                                 PointerCaptureLost="OnTransformHandleCaptureLost" />
+                                        <Ellipse x:Name="TitleHandleTR" Width="12" Height="12"
+                                                 Fill="White"
+                                                 Stroke="{StaticResource AccentBrush}" StrokeThickness="1.5"
+                                                 Tag="TR"
+                                                 PointerPressed="OnTransformHandlePressed"
+                                                 PointerMoved="OnTransformHandleMoved"
+                                                 PointerReleased="OnTransformHandleReleased"
+                                                 PointerCaptureLost="OnTransformHandleCaptureLost" />
+                                        <Ellipse x:Name="TitleHandleBL" Width="12" Height="12"
+                                                 Fill="White"
+                                                 Stroke="{StaticResource AccentBrush}" StrokeThickness="1.5"
+                                                 Tag="BL"
+                                                 PointerPressed="OnTransformHandlePressed"
+                                                 PointerMoved="OnTransformHandleMoved"
+                                                 PointerReleased="OnTransformHandleReleased"
+                                                 PointerCaptureLost="OnTransformHandleCaptureLost" />
+                                        <Ellipse x:Name="TitleHandleBR" Width="12" Height="12"
+                                                 Fill="White"
+                                                 Stroke="{StaticResource AccentBrush}" StrokeThickness="1.5"
+                                                 Tag="BR"
+                                                 PointerPressed="OnTransformHandlePressed"
+                                                 PointerMoved="OnTransformHandleMoved"
+                                                 PointerReleased="OnTransformHandleReleased"
+                                                 PointerCaptureLost="OnTransformHandleCaptureLost" />
+                                    </Canvas>
                                 </Grid>
                                 </Grid>  <!-- /PreviewViewport -->
-                                <!-- Placeholder gradient (shown when no media loaded) -->
-                                <Border x:Name="PreviewPlaceholder">
-                                    <Border.Background>
-                                        <LinearGradientBrush StartPoint="0.3,0.4" EndPoint="0.7,0.65">
-                                            <GradientStop Color="#661A3040" Offset="0"/>
-                                            <GradientStop Color="#330A1218" Offset="1"/>
-                                        </LinearGradientBrush>
-                                    </Border.Background>
-                                    <!-- Title overlay -->
-                                    <StackPanel VerticalAlignment="Bottom" HorizontalAlignment="Left"
-                                                Margin="28,0,0,24">
-                                        <TextBlock x:Name="TbPreviewTitle"
-                                                   Text="No clip selected"
-                                                   FontFamily="{StaticResource SerifFont}"
-                                                   FontStyle="Italic" FontSize="28" FontWeight="Normal"
-                                                   Foreground="White" />
-                                        <TextBlock x:Name="TbPreviewSubtitle"
-                                                   Text="— Drop media here or pick a clip from the timeline"
-                                                   FontFamily="{StaticResource MonoFont}"
-                                                   FontSize="10" CharacterSpacing="120"
-                                                   Foreground="{StaticResource AccentInkBrush}"
-                                                   Margin="0,6,0,0" />
-                                    </StackPanel>
-                                </Border>
                                 <!-- Program info overlay (click to change resolution / framerate) -->
                                 <Grid Margin="12,10">
                                     <Border x:Name="BorderProgramInfo"

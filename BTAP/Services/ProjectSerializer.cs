@@ -114,6 +114,8 @@ public class MediaItemDto
     public string Type          { get; set; } = "";
     public long   DurationTicks { get; set; }
     public string Resolution    { get; set; } = "";
+    public int    Width         { get; set; }
+    public int    Height        { get; set; }
     public double FrameRate     { get; set; }
     public long   FileSizeBytes { get; set; }
 
@@ -121,7 +123,8 @@ public class MediaItemDto
     {
         Id = m.Id, Name = m.Name, FilePath = m.FilePath,
         Type = m.Type.ToString(), DurationTicks = m.Duration.Ticks,
-        Resolution = m.Resolution, FrameRate = m.FrameRate, FileSizeBytes = m.FileSizeBytes,
+        Resolution = m.Resolution, Width = m.Width, Height = m.Height,
+        FrameRate = m.FrameRate, FileSizeBytes = m.FileSizeBytes,
     };
 
     public MediaItem ToModel() => new()
@@ -129,7 +132,8 @@ public class MediaItemDto
         Id = Id, Name = Name, FilePath = FilePath,
         Type = Enum.Parse<MediaType>(Type),
         Duration = TimeSpan.FromTicks(DurationTicks),
-        Resolution = Resolution, FrameRate = FrameRate, FileSizeBytes = FileSizeBytes,
+        Resolution = Resolution, Width = Width, Height = Height,
+        FrameRate = FrameRate, FileSizeBytes = FileSizeBytes,
     };
 }
 
@@ -212,6 +216,15 @@ public class ClipDto
     public double Gamma       { get; set; }
     public double ColorGain   { get; set; }
 
+    // Title text formatting
+    public string FontFamily  { get; set; } = "Segoe UI";
+    public double FontSize    { get; set; } = 64;
+    public bool   IsBold      { get; set; }
+    public bool   IsItalic    { get; set; }
+    public bool   IsUnderline { get; set; }
+    public string TextColor   { get; set; } = "#FFFFFFFF";
+    public string TextAlign   { get; set; } = "Center";
+
     public List<ClipEffectDto> Effects { get; set; } = [];
 
     public static ClipDto From(TimelineClip c) => new()
@@ -229,6 +242,9 @@ public class ClipDto
         Exposure = c.Exposure, Contrast = c.Contrast, Saturation = c.Saturation,
         Temperature = c.Temperature, Tint = c.Tint,
         Lift = c.Lift, Gamma = c.Gamma, ColorGain = c.ColorGain,
+        FontFamily = c.FontFamily, FontSize = c.FontSize,
+        IsBold = c.IsBold, IsItalic = c.IsItalic, IsUnderline = c.IsUnderline,
+        TextColor = c.TextColor, TextAlign = c.TextAlign,
         Effects = [.. c.Effects.Select(ClipEffectDto.From)],
     };
 
@@ -250,6 +266,9 @@ public class ClipDto
             Exposure = Exposure, Contrast = Contrast, Saturation = Saturation,
             Temperature = Temperature, Tint = Tint,
             Lift = Lift, Gamma = Gamma, ColorGain = ColorGain,
+            FontFamily = FontFamily, FontSize = FontSize,
+            IsBold = IsBold, IsItalic = IsItalic, IsUnderline = IsUnderline,
+            TextColor = TextColor, TextAlign = TextAlign,
         };
         foreach (var fx in Effects) c.Effects.Add(fx.ToModel());
         return c;

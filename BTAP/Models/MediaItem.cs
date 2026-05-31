@@ -12,6 +12,8 @@ public partial class MediaItem : ObservableObject
     [ObservableProperty] private MediaType _type;
     [ObservableProperty] private TimeSpan _duration;
     [ObservableProperty] private string _resolution = string.Empty;
+    [ObservableProperty] private int _width;
+    [ObservableProperty] private int _height;
     [ObservableProperty] private double _frameRate;
     [ObservableProperty] private long _fileSizeBytes;
     [ObservableProperty] private bool _hasProxy;
@@ -73,7 +75,11 @@ public partial class MediaItem : ObservableObject
                 var props = await file.Properties.GetVideoPropertiesAsync();
                 item.Duration   = props.Duration;
                 if (props.Width > 0)
+                {
+                    item.Width      = (int)props.Width;
+                    item.Height     = (int)props.Height;
                     item.Resolution = $"{props.Width}×{props.Height}";
+                }
             }
             else if (Array.Exists(AudioExtensions, e => e == ext))
             {

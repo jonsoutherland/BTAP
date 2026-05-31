@@ -51,6 +51,15 @@ public partial class TimelineClip : ObservableObject
     [ObservableProperty] private double _gamma;
     [ObservableProperty] private double _colorGain;
 
+    // Title text formatting (only meaningful when Kind == Title)
+    [ObservableProperty] private string _fontFamily = "Segoe UI";
+    [ObservableProperty] private double _fontSize = 64;
+    [ObservableProperty] private bool   _isBold;
+    [ObservableProperty] private bool   _isItalic;
+    [ObservableProperty] private bool   _isUnderline;
+    [ObservableProperty] private string _textColor = "#FFFFFFFF";
+    [ObservableProperty] private string _textAlign = "Center"; // Left, Center, Right
+
     // Effects applied to this clip
     public ObservableCollection<ClipEffect> Effects { get; } = [];
 

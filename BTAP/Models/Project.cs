@@ -23,16 +23,55 @@ public partial class Project : ObservableObject
     public string ResolutionLabel => $"{Width}×{Height}";
     public string FrameRateLabel => $"{FrameRate:G4} fps";
 
-    public static Project CreateDefault()
+    /// <summary>
+    /// The preview/working canvas size. Derived from the first imported video clip's
+    /// native dimensions when one is available; falls back to the project's export
+    /// W×H otherwise. The canvas is what the preview displays at; the project's
+    /// Width/Height define only the EXPORT crop window centered inside the canvas.
+    /// PosX/PosY are interpreted in canvas-pixel units.
+    /// </summary>
+    public (int Width, int Height) GetCanvasSize()
     {
-        var p = new Project { Name = "New project" };
-
-        // Single starter track; additional tracks are created on demand by
-        // dragging media into the empty zones above or below the timeline.
-        p.Tracks.Add(new Track { Label = "V1", Kind = TrackKind.Video });
-
-        return p;
+        foreach (var m in MediaBin)
+        {
+            if (m.Type == MediaType.Video && m.Width > 0 && m.Height > 0)
+                return (m.Width, m.Height);
+        }
+        return (Width, Height);
     }
+
+    /// <summary>
+    /// The rectangle inside the canvas (in canvas-pixel coordinates) that will be
+    /// cropped and scaled to <see cref="Width"/>×<see cref="Height"/> for export.
+    /// Largest rect with the project's export aspect that fits inside the canvas,
+    /// centered. When canvas aspect == export aspect, returns the full canvas.
+    /// </summary>
+    public (double X, double Y, double W, double H) GetExportWindow()
+    {
+        var (cw, ch) = GetCanvasSize();
+        if (cw <= 0 || ch <= 0 || Width <= 0 || Height <= 0)
+            return (0, 0, cw, ch);
+        double exportAspect = (double)Width / Height;
+        double canvasAspect = (double)cw   / ch;
+        double w, h;
+        if (exportAspect > canvasAspect)
+        {
+            // Wider than canvas — width pinned, height shrinks
+            w = cw;
+            h = cw / exportAspect;
+        }
+        else
+        {
+            // Taller (or equal) — height pinned, width shrinks
+            h = ch;
+            w = ch * exportAspect;
+        }
+        double x = (cw - w) / 2.0;
+        double y = (ch - h) / 2.0;
+        return (x, y, w, h);
+    }
+
+    public static Project CreateDefault() => new() { Name = "New project" };
 }
 
 public record RecentProject(string Name, string LastEdited, string Duration, string Spec, string Path = "");
