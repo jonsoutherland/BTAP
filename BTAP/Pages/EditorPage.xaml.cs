@@ -188,6 +188,11 @@ public sealed partial class EditorPage : Page
         // All shortcut handling now flows through KeyboardAccelerators built
         // from _keyBindings (see RebuildKeyboardAccelerators / InvokeCommand).
         // Kept hooked up only so future non-binding key behaviors have a home.
+        if (_inCropMode && (e.Key == VirtualKey.Escape || e.Key == VirtualKey.Enter))
+        {
+            ExitCropMode();
+            e.Handled = true;
+        }
     }
 
     // ── Dynamic shortcut machinery ───────────────────────────────────────
@@ -420,6 +425,9 @@ public sealed partial class EditorPage : Page
     private void SetPresentedClip(TimelineClip? clip)
     {
         if (ReferenceEquals(_presentedClip, clip)) return;
+        // Switching clips while cropping would leave the overlay attached to a
+        // clip that's no longer on-screen — commit the current values and exit.
+        if (_inCropMode) ExitCropMode();
         if (_presentedClip is not null)
         {
             _presentedClip.PropertyChanged -= OnPresentedClipPropertyChanged;
@@ -983,6 +991,12 @@ public sealed partial class EditorPage : Page
     /// handle interaction.</summary>
     private void UpdateTransformHandles()
     {
+        if (_inCropMode)
+        {
+            TransformOverlay.Visibility = Visibility.Collapsed;
+            UpdateCropOverlay();
+            return;
+        }
         if (_vm is null || _presentedClip is null || _presentedClip.Kind == ClipKind.Title)
         {
             TransformOverlay.Visibility = Visibility.Collapsed;
@@ -1025,13 +1039,22 @@ public sealed partial class EditorPage : Page
             frY = (ch - frH) / 2;
         }
 
+        // Mirror the compositor's crop-shrink so handles bound the visible content.
         double scale = Math.Clamp(clip.Scale, 0.05, 10);
-        double dstW  = frW * scale;
-        double dstH  = frH * scale;
+        double fullW = frW * scale;
+        double fullH = frH * scale;
         double offX  = clip.PosX / (double)outW * frW;
         double offY  = clip.PosY / (double)outH * frH;
-        double dstX  = frX + (frW - dstW) / 2 + offX;
-        double dstY  = frY + (frH - dstH) / 2 + offY;
+        double fullX = frX + (frW - fullW) / 2 + offX;
+        double fullY = frY + (frH - fullH) / 2 + offY;
+        double cl = Math.Clamp(clip.CropLeft,   0, 0.95);
+        double ct = Math.Clamp(clip.CropTop,    0, 0.95);
+        double cr = Math.Clamp(clip.CropRight,  0, 0.95);
+        double cb = Math.Clamp(clip.CropBottom, 0, 0.95);
+        double dstX = fullX + cl * fullW;
+        double dstY = fullY + ct * fullH;
+        double dstW = Math.Max(1, (1 - cl - cr) * fullW);
+        double dstH = Math.Max(1, (1 - ct - cb) * fullH);
 
         // Map from VideoCompositor's coordinate space to TransformOverlay's so the
         // handles overlay the actual rendered frame even though they live under
@@ -1211,6 +1234,7 @@ public sealed partial class EditorPage : Page
         // so the text doesn't drift relative to the underlying video frame.
         if (_titleClipAtPlayhead is not null)
             ApplyTitlePosition(_titleClipAtPlayhead);
+        if (_inCropMode) UpdateCropOverlay();
     }
 
     // ── Right-click context menu on the preview ──────────────────────────
@@ -1221,6 +1245,11 @@ public sealed partial class EditorPage : Page
         bool hasClip = _presentedClip is not null && _presentedClip.Kind != ClipKind.Title;
         foreach (var item in PreviewContextMenu.Items)
             if (item is Control c) c.IsEnabled = hasClip;
+
+        // Crop entry toggles label when already in crop mode so the same menu
+        // serves to enter and to commit/exit.
+        if (CropMenuItem is not null)
+            CropMenuItem.Text = _inCropMode ? "Done cropping" : "Crop";
     }
 
     private void OnPreviewCenterAlign(object sender, RoutedEventArgs e)
@@ -1597,6 +1626,303 @@ public sealed partial class EditorPage : Page
         _gesture = TransformGesture.None;
         _activeHandle = null;
     }
+
+    // ── Crop mode (right-click → Crop) ────────────────────────────────────
+
+    private enum CropGesture { None, Move, L, R, T, B, TL, TR, BL, BR }
+    private CropGesture _cropGesture;
+    private bool _inCropMode;
+    private TimelineClip? _croppingClip;
+    private Windows.Foundation.Point _cropGestureStart;
+    private double _cropStartLeft, _cropStartTop, _cropStartRight, _cropStartBottom;
+    private Windows.Foundation.Rect _cropDestRect;
+
+    private void OnPreviewEnterCropMode(object sender, RoutedEventArgs e)
+    {
+        if (_inCropMode) { ExitCropMode(); return; }
+        if (_presentedClip is null || _presentedClip.Kind == ClipKind.Title) return;
+        EnterCropMode(_presentedClip);
+    }
+
+    private void EnterCropMode(TimelineClip clip)
+    {
+        _inCropMode = true;
+        _croppingClip = clip;
+        VideoCompositor.BypassCropClipId = clip.Id;
+        TransformOverlay.Visibility = Visibility.Collapsed;
+        CropOverlay.Visibility = Visibility.Visible;
+        if (CropMenuItem is not null) CropMenuItem.Text = "Done cropping";
+        UpdateCropOverlay();
+    }
+
+    private void ExitCropMode()
+    {
+        if (!_inCropMode) return;
+        _inCropMode = false;
+        _croppingClip = null;
+        VideoCompositor.BypassCropClipId = null;
+        CropOverlay.Visibility = Visibility.Collapsed;
+        if (CropMenuItem is not null) CropMenuItem.Text = "Crop";
+        UpdateTransformHandles();
+        if (_vm is not null) _vm.Project.IsModified = true;
+    }
+
+    private void UpdateCropOverlay()
+    {
+        if (!_inCropMode || _croppingClip is null || _vm is null)
+        {
+            CropOverlay.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        var clip = _croppingClip;
+        double cw = VideoCompositor.ActualWidth;
+        double ch = VideoCompositor.ActualHeight;
+        if (cw <= 0 || ch <= 0) { CropOverlay.Visibility = Visibility.Collapsed; return; }
+
+        // Replicate the compositor's letterbox math (matches UpdateTransformHandles).
+        var (canvasW, canvasH) = _vm.Project.GetCanvasSize();
+        int outW = Math.Max(1, canvasW);
+        int outH = Math.Max(1, canvasH);
+        double outAspect = (double)outW / outH;
+        double cAspect = cw / ch;
+        double frX, frY, frW, frH;
+        if (cAspect > outAspect)
+        {
+            frH = ch; frW = frH * outAspect;
+            frX = (cw - frW) / 2; frY = 0;
+        }
+        else
+        {
+            frW = cw; frH = frW / outAspect;
+            frX = 0; frY = (ch - frH) / 2;
+        }
+
+        // BypassCropClipId makes the compositor draw the FULL source frame into
+        // the dest rect, so the dest rect maps 1:1 to the un-cropped source.
+        double scale = Math.Clamp(clip.Scale, 0.05, 10);
+        double dstW = frW * scale;
+        double dstH = frH * scale;
+        double offX = clip.PosX / (double)outW * frW;
+        double offY = clip.PosY / (double)outH * frH;
+        double dstX = frX + (frW - dstW) / 2 + offX;
+        double dstY = frY + (frH - dstH) / 2 + offY;
+
+        Windows.Foundation.Point tl, br;
+        try
+        {
+            var ge = VideoCompositor.TransformToVisual(CropOverlay);
+            tl = ge.TransformPoint(new Windows.Foundation.Point(dstX, dstY));
+            br = ge.TransformPoint(new Windows.Foundation.Point(dstX + dstW, dstY + dstH));
+        }
+        catch
+        {
+            CropOverlay.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        double dx = Math.Min(tl.X, br.X);
+        double dy = Math.Min(tl.Y, br.Y);
+        double dw = Math.Abs(br.X - tl.X);
+        double dh = Math.Abs(br.Y - tl.Y);
+        if (dw < 8 || dh < 8) { CropOverlay.Visibility = Visibility.Collapsed; return; }
+
+        _cropDestRect = new Windows.Foundation.Rect(dx, dy, dw, dh);
+
+        double cl = Math.Clamp(clip.CropLeft, 0, 0.95);
+        double ct = Math.Clamp(clip.CropTop, 0, 0.95);
+        double cr = Math.Clamp(clip.CropRight, 0, 0.95);
+        double cb = Math.Clamp(clip.CropBottom, 0, 0.95);
+        double bx = dx + cl * dw;
+        double by = dy + ct * dh;
+        double bw = Math.Max(8, (1 - cl - cr) * dw);
+        double bh = Math.Max(8, (1 - ct - cb) * dh);
+
+        Canvas.SetLeft(CropBox, bx);
+        Canvas.SetTop(CropBox, by);
+        CropBox.Width = bw;
+        CropBox.Height = bh;
+
+        SetCropMask(CropMaskLeft,   dx,      dy,       Math.Max(0, bx - dx),                   dh);
+        SetCropMask(CropMaskRight,  bx + bw, dy,       Math.Max(0, dx + dw - (bx + bw)),       dh);
+        SetCropMask(CropMaskTop,    bx,      dy,       bw,                                     Math.Max(0, by - dy));
+        SetCropMask(CropMaskBottom, bx,      by + bh,  bw,                                     Math.Max(0, dy + dh - (by + bh)));
+
+        Canvas.SetLeft(CropEdgeL, bx - CropEdgeL.Width / 2);
+        Canvas.SetTop(CropEdgeL, by);
+        CropEdgeL.Height = bh;
+
+        Canvas.SetLeft(CropEdgeR, bx + bw - CropEdgeR.Width / 2);
+        Canvas.SetTop(CropEdgeR, by);
+        CropEdgeR.Height = bh;
+
+        Canvas.SetLeft(CropEdgeT, bx);
+        Canvas.SetTop(CropEdgeT, by - CropEdgeT.Height / 2);
+        CropEdgeT.Width = bw;
+
+        Canvas.SetLeft(CropEdgeB, bx);
+        Canvas.SetTop(CropEdgeB, by + bh - CropEdgeB.Height / 2);
+        CropEdgeB.Width = bw;
+
+        PlaceCropCorner(CropHandleTL, bx,      by);
+        PlaceCropCorner(CropHandleTR, bx + bw, by);
+        PlaceCropCorner(CropHandleBL, bx,      by + bh);
+        PlaceCropCorner(CropHandleBR, bx + bw, by + bh);
+
+        // Confirm button: centered under the crop box, clamped inside the dest
+        // rect so it stays reachable even when the user crops near the bottom.
+        double btnW = CropConfirmBtn.Width;
+        double btnH = CropConfirmBtn.Height;
+        double btnX = bx + (bw - btnW) / 2;
+        double btnY = by + bh + 10;
+        double maxY = dy + dh - btnH - 4;
+        if (btnY > maxY) btnY = by + bh - btnH - 6;  // tuck inside the box if no room below
+        Canvas.SetLeft(CropConfirmBtn, btnX);
+        Canvas.SetTop(CropConfirmBtn, btnY);
+    }
+
+    private static void SetCropMask(Microsoft.UI.Xaml.Shapes.Rectangle r, double x, double y, double w, double h)
+    {
+        Canvas.SetLeft(r, x);
+        Canvas.SetTop(r, y);
+        r.Width = Math.Max(0, w);
+        r.Height = Math.Max(0, h);
+    }
+
+    private static void PlaceCropCorner(Microsoft.UI.Xaml.Shapes.Rectangle r, double cx, double cy)
+    {
+        Canvas.SetLeft(r, cx - r.Width / 2);
+        Canvas.SetTop(r, cy - r.Height / 2);
+    }
+
+    private void OnCropBodyPressed(object sender, PointerRoutedEventArgs e)
+    {
+        if (!_inCropMode || _croppingClip is null) return;
+        _cropGesture = CropGesture.Move;
+        _cropGestureStart = e.GetCurrentPoint(CropOverlay).Position;
+        _cropStartLeft   = _croppingClip.CropLeft;
+        _cropStartTop    = _croppingClip.CropTop;
+        _cropStartRight  = _croppingClip.CropRight;
+        _cropStartBottom = _croppingClip.CropBottom;
+        (sender as UIElement)?.CapturePointer(e.Pointer);
+        e.Handled = true;
+    }
+
+    private void OnCropBodyMoved(object sender, PointerRoutedEventArgs e)
+    {
+        if (_cropGesture != CropGesture.Move || _croppingClip is null) return;
+        var pt = e.GetCurrentPoint(CropOverlay).Position;
+        if (!e.GetCurrentPoint(CropOverlay).Properties.IsLeftButtonPressed) return;
+
+        double dw = _cropDestRect.Width;
+        double dh = _cropDestRect.Height;
+        if (dw < 1 || dh < 1) return;
+
+        double fxDelta = (pt.X - _cropGestureStart.X) / dw;
+        double fyDelta = (pt.Y - _cropGestureStart.Y) / dh;
+
+        double winW = 1 - _cropStartLeft - _cropStartRight;
+        double winH = 1 - _cropStartTop  - _cropStartBottom;
+        double newLeft = Math.Clamp(_cropStartLeft + fxDelta, 0, Math.Max(0, 1 - winW));
+        double newTop  = Math.Clamp(_cropStartTop  + fyDelta, 0, Math.Max(0, 1 - winH));
+        _croppingClip.CropLeft   = newLeft;
+        _croppingClip.CropRight  = Math.Max(0, 1 - winW - newLeft);
+        _croppingClip.CropTop    = newTop;
+        _croppingClip.CropBottom = Math.Max(0, 1 - winH - newTop);
+        e.Handled = true;
+    }
+
+    private void OnCropBodyReleased(object sender, PointerRoutedEventArgs e)
+    {
+        if (_cropGesture != CropGesture.Move) return;
+        (sender as UIElement)?.ReleasePointerCapture(e.Pointer);
+        if (_vm is not null) _vm.Project.IsModified = true;
+        _cropGesture = CropGesture.None;
+        e.Handled = true;
+    }
+
+    private void OnCropBodyCaptureLost(object sender, PointerRoutedEventArgs e)
+    {
+        _cropGesture = CropGesture.None;
+    }
+
+    private void OnCropHandlePressed(object sender, PointerRoutedEventArgs e)
+    {
+        if (!_inCropMode || _croppingClip is null || sender is not FrameworkElement fe) return;
+        _cropGesture = (fe.Tag as string) switch
+        {
+            "L"  => CropGesture.L,
+            "R"  => CropGesture.R,
+            "T"  => CropGesture.T,
+            "B"  => CropGesture.B,
+            "TL" => CropGesture.TL,
+            "TR" => CropGesture.TR,
+            "BL" => CropGesture.BL,
+            "BR" => CropGesture.BR,
+            _    => CropGesture.None,
+        };
+        if (_cropGesture == CropGesture.None) return;
+        _cropGestureStart = e.GetCurrentPoint(CropOverlay).Position;
+        _cropStartLeft   = _croppingClip.CropLeft;
+        _cropStartTop    = _croppingClip.CropTop;
+        _cropStartRight  = _croppingClip.CropRight;
+        _cropStartBottom = _croppingClip.CropBottom;
+        fe.CapturePointer(e.Pointer);
+        e.Handled = true;
+    }
+
+    private void OnCropHandleMoved(object sender, PointerRoutedEventArgs e)
+    {
+        if (_cropGesture is CropGesture.None or CropGesture.Move || _croppingClip is null) return;
+        var pt = e.GetCurrentPoint(CropOverlay).Position;
+        if (!e.GetCurrentPoint(CropOverlay).Properties.IsLeftButtonPressed) return;
+
+        double dw = _cropDestRect.Width;
+        double dh = _cropDestRect.Height;
+        if (dw < 1 || dh < 1) return;
+
+        double fxDelta = (pt.X - _cropGestureStart.X) / dw;
+        double fyDelta = (pt.Y - _cropGestureStart.Y) / dh;
+
+        const double MaxPerSide = 0.95;
+        const double MinWindow  = 0.05;
+
+        double l = _cropStartLeft;
+        double t = _cropStartTop;
+        double r = _cropStartRight;
+        double b = _cropStartBottom;
+
+        if (_cropGesture is CropGesture.L or CropGesture.TL or CropGesture.BL)
+            l = Math.Clamp(_cropStartLeft + fxDelta, 0, Math.Min(MaxPerSide, 1 - _cropStartRight - MinWindow));
+        if (_cropGesture is CropGesture.R or CropGesture.TR or CropGesture.BR)
+            r = Math.Clamp(_cropStartRight - fxDelta, 0, Math.Min(MaxPerSide, 1 - _cropStartLeft - MinWindow));
+        if (_cropGesture is CropGesture.T or CropGesture.TL or CropGesture.TR)
+            t = Math.Clamp(_cropStartTop + fyDelta, 0, Math.Min(MaxPerSide, 1 - _cropStartBottom - MinWindow));
+        if (_cropGesture is CropGesture.B or CropGesture.BL or CropGesture.BR)
+            b = Math.Clamp(_cropStartBottom - fyDelta, 0, Math.Min(MaxPerSide, 1 - _cropStartTop - MinWindow));
+
+        _croppingClip.CropLeft   = l;
+        _croppingClip.CropTop    = t;
+        _croppingClip.CropRight  = r;
+        _croppingClip.CropBottom = b;
+        e.Handled = true;
+    }
+
+    private void OnCropHandleReleased(object sender, PointerRoutedEventArgs e)
+    {
+        if (_cropGesture == CropGesture.None) return;
+        (sender as UIElement)?.ReleasePointerCapture(e.Pointer);
+        if (_vm is not null) _vm.Project.IsModified = true;
+        _cropGesture = CropGesture.None;
+        e.Handled = true;
+    }
+
+    private void OnCropHandleCaptureLost(object sender, PointerRoutedEventArgs e)
+    {
+        _cropGesture = CropGesture.None;
+    }
+
+    private void OnCropConfirmClick(object sender, RoutedEventArgs e) => ExitCropMode();
 
     // ── Drag onto preview area ─────────────────────────────────────────
 

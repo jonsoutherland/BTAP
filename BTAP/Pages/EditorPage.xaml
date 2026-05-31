@@ -332,6 +332,8 @@
                                         <MenuFlyoutItem Text="Center align"      Click="OnPreviewCenterAlign" />
                                         <MenuFlyoutItem Text="Fit to frame"      Click="OnPreviewFitToFrame" />
                                         <MenuFlyoutItem Text="Reset transform"   Click="OnPreviewResetTransform" />
+                                        <MenuFlyoutItem x:Name="CropMenuItem"
+                                                        Text="Crop"             Click="OnPreviewEnterCropMode" />
                                         <MenuFlyoutItem Text="Reset crop"        Click="OnPreviewResetCrop" />
                                         <MenuFlyoutSeparator />
                                         <MenuFlyoutItem Text="Flip horizontal"   Click="OnPreviewFlipH" />
@@ -498,6 +500,100 @@
                                              PointerMoved="OnTransformHandleMoved"
                                              PointerReleased="OnTransformHandleReleased"
                                              PointerCaptureLost="OnTransformHandleCaptureLost" />
+                                </Canvas>
+
+                                <!-- Crop overlay: enter via right-click → Crop. Four dimmed mask rectangles
+                                     surround the crop window so the kept region stays bright. Body drag pans
+                                     the window; 4 corner + 4 edge handles resize it. While visible, the clip
+                                     is rendered un-cropped (BypassCropClipId) so the full source frame shows. -->
+                                <Canvas x:Name="CropOverlay"
+                                        IsHitTestVisible="True"
+                                        Visibility="Collapsed">
+                                    <Rectangle x:Name="CropMaskLeft"   Fill="#A0000000" IsHitTestVisible="False" />
+                                    <Rectangle x:Name="CropMaskRight"  Fill="#A0000000" IsHitTestVisible="False" />
+                                    <Rectangle x:Name="CropMaskTop"    Fill="#A0000000" IsHitTestVisible="False" />
+                                    <Rectangle x:Name="CropMaskBottom" Fill="#A0000000" IsHitTestVisible="False" />
+                                    <Rectangle x:Name="CropBox"
+                                               Stroke="{StaticResource AccentBrush}"
+                                               StrokeThickness="1.5"
+                                               StrokeDashArray="3,2"
+                                               Fill="Transparent"
+                                               PointerPressed="OnCropBodyPressed"
+                                               PointerMoved="OnCropBodyMoved"
+                                               PointerReleased="OnCropBodyReleased"
+                                               PointerCaptureLost="OnCropBodyCaptureLost" />
+                                    <Rectangle x:Name="CropEdgeL" Width="6" Fill="Transparent"
+                                               Tag="L"
+                                               PointerPressed="OnCropHandlePressed"
+                                               PointerMoved="OnCropHandleMoved"
+                                               PointerReleased="OnCropHandleReleased"
+                                               PointerCaptureLost="OnCropHandleCaptureLost" />
+                                    <Rectangle x:Name="CropEdgeR" Width="6" Fill="Transparent"
+                                               Tag="R"
+                                               PointerPressed="OnCropHandlePressed"
+                                               PointerMoved="OnCropHandleMoved"
+                                               PointerReleased="OnCropHandleReleased"
+                                               PointerCaptureLost="OnCropHandleCaptureLost" />
+                                    <Rectangle x:Name="CropEdgeT" Height="6" Fill="Transparent"
+                                               Tag="T"
+                                               PointerPressed="OnCropHandlePressed"
+                                               PointerMoved="OnCropHandleMoved"
+                                               PointerReleased="OnCropHandleReleased"
+                                               PointerCaptureLost="OnCropHandleCaptureLost" />
+                                    <Rectangle x:Name="CropEdgeB" Height="6" Fill="Transparent"
+                                               Tag="B"
+                                               PointerPressed="OnCropHandlePressed"
+                                               PointerMoved="OnCropHandleMoved"
+                                               PointerReleased="OnCropHandleReleased"
+                                               PointerCaptureLost="OnCropHandleCaptureLost" />
+                                    <Rectangle x:Name="CropHandleTL" Width="12" Height="12"
+                                               Fill="White"
+                                               Stroke="{StaticResource AccentBrush}" StrokeThickness="1.5"
+                                               Tag="TL"
+                                               PointerPressed="OnCropHandlePressed"
+                                               PointerMoved="OnCropHandleMoved"
+                                               PointerReleased="OnCropHandleReleased"
+                                               PointerCaptureLost="OnCropHandleCaptureLost" />
+                                    <Rectangle x:Name="CropHandleTR" Width="12" Height="12"
+                                               Fill="White"
+                                               Stroke="{StaticResource AccentBrush}" StrokeThickness="1.5"
+                                               Tag="TR"
+                                               PointerPressed="OnCropHandlePressed"
+                                               PointerMoved="OnCropHandleMoved"
+                                               PointerReleased="OnCropHandleReleased"
+                                               PointerCaptureLost="OnCropHandleCaptureLost" />
+                                    <Rectangle x:Name="CropHandleBL" Width="12" Height="12"
+                                               Fill="White"
+                                               Stroke="{StaticResource AccentBrush}" StrokeThickness="1.5"
+                                               Tag="BL"
+                                               PointerPressed="OnCropHandlePressed"
+                                               PointerMoved="OnCropHandleMoved"
+                                               PointerReleased="OnCropHandleReleased"
+                                               PointerCaptureLost="OnCropHandleCaptureLost" />
+                                    <Rectangle x:Name="CropHandleBR" Width="12" Height="12"
+                                               Fill="White"
+                                               Stroke="{StaticResource AccentBrush}" StrokeThickness="1.5"
+                                               Tag="BR"
+                                               PointerPressed="OnCropHandlePressed"
+                                               PointerMoved="OnCropHandleMoved"
+                                               PointerReleased="OnCropHandleReleased"
+                                               PointerCaptureLost="OnCropHandleCaptureLost" />
+                                    <!-- Confirm-and-exit affordance: positioned beneath the crop box
+                                         in UpdateCropOverlay. Click commits the current crop. -->
+                                    <Button x:Name="CropConfirmBtn"
+                                            Width="32" Height="32"
+                                            Padding="0"
+                                            Background="{StaticResource AccentBrush}"
+                                            BorderBrush="White"
+                                            BorderThickness="1.5"
+                                            CornerRadius="16"
+                                            Click="OnCropConfirmClick"
+                                            ToolTipService.ToolTip="Apply crop (Enter)">
+                                        <FontIcon Glyph="&#xE73E;"
+                                                  FontFamily="Segoe MDL2 Assets"
+                                                  FontSize="14"
+                                                  Foreground="White" />
+                                    </Button>
                                 </Canvas>
 
                                 <!-- Title-clip rendering: shown when current clip Kind == Title.

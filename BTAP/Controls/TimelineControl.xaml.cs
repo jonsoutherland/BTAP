@@ -365,6 +365,15 @@ public sealed partial class TimelineControl : UserControl
         }
         contentRoot.Children.Add(label);
 
+        // Volume-automation overlay: horizontal line + keyframe circles. Sits on top
+        // so its hit zones intercept clicks before they bubble up to the clip Border
+        // (which would otherwise start a clip drag/trim).
+        if (clip.Kind is ClipKind.Video or ClipKind.Audio or ClipKind.Music)
+        {
+            var envelope = BuildVolumeEnvelopeOverlay(clip, w, trackHeight - 3);
+            contentRoot.Children.Add(envelope);
+        }
+
         var border = new Border
         {
             Width = w,
@@ -2098,6 +2107,10 @@ public sealed partial class TimelineControl : UserControl
             for (int i = i0; i <= i1; i++)
                 if (data.Peaks[i] > peak) peak = data.Peaks[i];
 
+            double timeRel = (x + 0.5) / width;
+            double vol = Math.Clamp(clip.GetVolumeAt(timeRel), 0, 1);
+            peak = (float)(peak * vol);
+
             int peakH = (int)Math.Round(Math.Clamp(peak, 0f, 1f) * (mid - 1));
             int top    = mid - peakH;
             int bottom = mid + peakH;
@@ -2161,6 +2174,427 @@ public sealed partial class TimelineControl : UserControl
             if (t.Kind == needKind) return t;
         }
         return null;
+    }
+
+    // ── Volume-automation overlay ───────────────────────────────────────
+    //
+    // Each video / audio / music clip carries a Canvas overlay with two polylines
+    // (one wide-stroke transparent line for hit-testing, one thin visible line)
+    // plus an Ellipse per VolumePoint. Y inside the canvas maps to volume:
+    // top = 1.0, bottom = 0.0, with EnvelopePad pixels of padding at each edge so
+    // the line and circles don't collide with the clip's rounded border.
+    //
+    // Interactions:
+    //   • Left-click + drag on the line  →  if no keyframes, drag adjusts clip.Volume
+    //                                       (whole flat line moves); if keyframes
+    //                                       exist, shifts the segment under the
+    //                                       cursor (one or both bracketing points)
+    //                                       up/down by the pointer's Y delta.
+    //   • Left-click + drag on a circle  →  moves that keyframe in X and Y.
+    //   • Right-click on the line        →  inserts a keyframe at (timeRel, vol).
+    //   • Right-click on a circle        →  removes that keyframe.
+
+    private const double EnvelopePad = 3.0;
+
+    private TimelineClip?  _envDragClip;
+    private Canvas?        _envDragCanvas;
+    private Polyline?      _envDragHitLine;
+    private Polyline?      _envDragVisLine;
+    private List<Ellipse>? _envDragCircles;
+    private double         _envDragStartPointerY;
+    private double         _envDragStartClipVolume;
+    // Indices into clip.VolumeEnvelope of the points affected by the current segment-drag,
+    // and their start volumes for delta math. Null when 0-keyframe Volume-drag is active.
+    private int[]?         _envDragAffectedIdx;
+    private double[]?      _envDragAffectedStartVols;
+
+    // Single-point drag state (left-drag on a circle)
+    private VolumePoint?   _envDragPoint;
+    private double         _envDragPointStartTimeRel;
+    private double         _envDragPointStartVolume;
+    private double         _envDragPointStartPointerX;
+    private double         _envDragPointStartPointerY;
+
+    private Canvas BuildVolumeEnvelopeOverlay(TimelineClip clip, double clipW, double clipH)
+    {
+        var canvas = new Canvas
+        {
+            Width  = clipW,
+            Height = clipH,
+            Background = null,
+            Tag = clip,
+        };
+
+        var hitLine = new Polyline
+        {
+            Stroke = new SolidColorBrush(Color.FromArgb(0, 0, 0, 0)),
+            StrokeThickness = 14,
+            StrokeStartLineCap = PenLineCap.Round,
+            StrokeEndLineCap   = PenLineCap.Round,
+            StrokeLineJoin     = PenLineJoin.Round,
+            IsHitTestVisible = true,
+        };
+        hitLine.Tag = "envHit";
+        hitLine.PointerPressed     += OnEnvelopeLinePointerPressed;
+        hitLine.PointerMoved       += OnEnvelopeLinePointerMoved;
+        hitLine.PointerReleased    += OnEnvelopeLinePointerReleased;
+        hitLine.PointerCaptureLost += OnEnvelopeLinePointerCaptureLost;
+        canvas.Children.Add(hitLine);
+
+        var visLine = new Polyline
+        {
+            Stroke = new SolidColorBrush(Color.FromArgb(230, 255, 220, 110)),
+            StrokeThickness = 1.5,
+            StrokeStartLineCap = PenLineCap.Round,
+            StrokeEndLineCap   = PenLineCap.Round,
+            StrokeLineJoin     = PenLineJoin.Round,
+            IsHitTestVisible = false,
+        };
+        visLine.Tag = "envVis";
+        canvas.Children.Add(visLine);
+
+        RefreshEnvelopeOverlay(canvas, clip);
+        return canvas;
+    }
+
+    /// <summary>Re-position the line + circles inside <paramref name="canvas"/> to match
+    /// <paramref name="clip"/>'s current envelope. Re-uses the existing hit/visible
+    /// polylines (so an active pointer capture survives) and only adds/removes Ellipses
+    /// to match the point count.</summary>
+    private void RefreshEnvelopeOverlay(Canvas canvas, TimelineClip clip)
+    {
+        double clipW = canvas.Width;
+        double clipH = canvas.Height;
+
+        Polyline? hitLine = null;
+        Polyline? visLine = null;
+        var circles = new List<Ellipse>();
+        foreach (var child in canvas.Children)
+        {
+            if (child is Polyline pl)
+            {
+                if ((pl.Tag as string) == "envHit") hitLine = pl;
+                else if ((pl.Tag as string) == "envVis") visLine = pl;
+            }
+            else if (child is Ellipse el)
+            {
+                circles.Add(el);
+            }
+        }
+        if (hitLine is null || visLine is null) return;
+
+        var sorted = clip.VolumeEnvelope.OrderBy(p => p.TimeRel).ToList();
+        var linePoints = new PointCollection();
+        if (sorted.Count == 0)
+        {
+            double y = EnvelopeYForVolume(clip.Volume, clipH);
+            linePoints.Add(new Point(0, y));
+            linePoints.Add(new Point(clipW, y));
+        }
+        else
+        {
+            double yFirst = EnvelopeYForVolume(sorted[0].Volume, clipH);
+            linePoints.Add(new Point(0, yFirst));
+            foreach (var p in sorted)
+                linePoints.Add(new Point(EnvelopeXForTime(p.TimeRel, clipW),
+                                         EnvelopeYForVolume(p.Volume, clipH)));
+            double yLast = EnvelopeYForVolume(sorted[^1].Volume, clipH);
+            linePoints.Add(new Point(clipW, yLast));
+        }
+        hitLine.Points = linePoints;
+        var visCopy = new PointCollection();
+        foreach (var p in linePoints) visCopy.Add(p);
+        visLine.Points = visCopy;
+
+        // Sync ellipse count to envelope point count
+        while (circles.Count > clip.VolumeEnvelope.Count)
+        {
+            var last = circles[^1];
+            canvas.Children.Remove(last);
+            circles.RemoveAt(circles.Count - 1);
+        }
+        while (circles.Count < clip.VolumeEnvelope.Count)
+        {
+            var el = new Ellipse
+            {
+                Width  = 9,
+                Height = 9,
+                Fill   = new SolidColorBrush(Color.FromArgb(255, 255, 220, 110)),
+                Stroke = new SolidColorBrush(Color.FromArgb(255, 80, 60, 10)),
+                StrokeThickness = 1,
+                IsHitTestVisible = true,
+            };
+            el.PointerPressed     += OnEnvelopeCirclePointerPressed;
+            el.PointerMoved       += OnEnvelopeCirclePointerMoved;
+            el.PointerReleased    += OnEnvelopeCirclePointerReleased;
+            el.PointerCaptureLost += OnEnvelopeCirclePointerCaptureLost;
+            canvas.Children.Add(el);
+            circles.Add(el);
+        }
+        for (int i = 0; i < clip.VolumeEnvelope.Count; i++)
+        {
+            var pt = clip.VolumeEnvelope[i];
+            var el = circles[i];
+            el.Tag = (pt, clip, canvas);
+            double cx = EnvelopeXForTime(pt.TimeRel, clipW);
+            double cy = EnvelopeYForVolume(pt.Volume, clipH);
+            Canvas.SetLeft(el, cx - el.Width  / 2);
+            Canvas.SetTop (el, cy - el.Height / 2);
+        }
+    }
+
+    private static double EnvelopeYForVolume(double volume, double clipH)
+    {
+        double range = Math.Max(1, clipH - 2 * EnvelopePad);
+        return EnvelopePad + (1 - Math.Clamp(volume, 0, 1)) * range;
+    }
+
+    private static double EnvelopeXForTime(double timeRel, double clipW) =>
+        Math.Clamp(timeRel, 0, 1) * clipW;
+
+    private static double EnvelopeVolumeForY(double y, double clipH)
+    {
+        double range = Math.Max(1, clipH - 2 * EnvelopePad);
+        return Math.Clamp(1 - (y - EnvelopePad) / range, 0, 1);
+    }
+
+    /// <summary>Find the Border whose Tag references this clip, so we can refresh
+    /// the waveform image after the envelope changes without rebuilding the whole
+    /// timeline.</summary>
+    private Border? FindClipBorder(TimelineClip clip)
+    {
+        foreach (var child in ClipCanvas.Children)
+            if (child is Border b && b.Tag is (TimelineClip c, Track _) && ReferenceEquals(c, clip))
+                return b;
+        return null;
+    }
+
+    /// <summary>Re-render the waveform bitmap for <paramref name="clip"/> in-place so
+    /// it reflects the new envelope without tearing down the Border (which would
+    /// kill any pointer capture in progress).</summary>
+    private void RefreshClipWaveform(TimelineClip clip)
+    {
+        if (ViewModel is null) return;
+        var border = FindClipBorder(clip);
+        if (border?.Child is not Grid grid) return;
+        Image? img = null;
+        foreach (var child in grid.Children)
+        {
+            if (child is Canvas host)
+                foreach (var c in host.Children)
+                    if (c is Image i) { img = i; break; }
+            if (img is not null) break;
+        }
+        if (img is null) return;
+        if (string.IsNullOrEmpty(clip.SourceId)) return;
+        var media = ViewModel.MediaBin.FirstOrDefault(m => m.Id == clip.SourceId);
+        if (media is null || string.IsNullOrEmpty(media.FilePath)) return;
+        var peaks = BTAP.Services.WaveformService.GetCachedPeaks(media.FilePath);
+        if (peaks is null) return;
+        var color = clip.Kind == ClipKind.Audio || clip.Kind == ClipKind.Music
+            ? Color.FromArgb(230, 130, 220, 160)
+            : Color.FromArgb(200, 230, 240, 250);
+        img.Source = RenderWaveformBitmap(peaks, color, clip, img.Width);
+    }
+
+    // ── Envelope line: left-drag = adjust segment, right-click = add keyframe ──
+
+    private void OnEnvelopeLinePointerPressed(object sender, PointerRoutedEventArgs e)
+    {
+        if (sender is not Polyline line) return;
+        if (line.Parent is not Canvas canvas || canvas.Tag is not TimelineClip clip) return;
+
+        var pt = e.GetCurrentPoint(canvas);
+        if (pt.Properties.IsRightButtonPressed)
+        {
+            double clipW = canvas.Width;
+            double clipH = canvas.Height;
+            double timeRel = Math.Clamp(pt.Position.X / Math.Max(1, clipW), 0, 1);
+            double vol     = EnvelopeVolumeForY(pt.Position.Y, clipH);
+            // Seed any new point's "vol" with the click position rather than the
+            // current interpolated value, so the user gets a keyframe right under
+            // their cursor.
+            clip.VolumeEnvelope.Add(new VolumePoint { TimeRel = timeRel, Volume = vol });
+            if (ViewModel is not null) ViewModel.Project.IsModified = true;
+            RefreshEnvelopeOverlay(canvas, clip);
+            RefreshClipWaveform(clip);
+            e.Handled = true;
+            return;
+        }
+
+        if (!pt.Properties.IsLeftButtonPressed) return;
+
+        _envDragClip   = clip;
+        _envDragCanvas = canvas;
+        _envDragHitLine = line;
+        _envDragVisLine = canvas.Children.OfType<Polyline>().FirstOrDefault(p => (p.Tag as string) == "envVis");
+        _envDragCircles = canvas.Children.OfType<Ellipse>().ToList();
+        _envDragStartPointerY  = pt.Position.Y;
+        _envDragStartClipVolume = clip.Volume;
+
+        if (clip.VolumeEnvelope.Count == 0)
+        {
+            _envDragAffectedIdx        = null;
+            _envDragAffectedStartVols  = null;
+        }
+        else
+        {
+            // Find the bracketing points around pt.Position.X. Either or both may be
+            // null when the cursor is outside [firstTimeRel, lastTimeRel].
+            double clipW = canvas.Width;
+            double timeRel = Math.Clamp(pt.Position.X / Math.Max(1, clipW), 0, 1);
+            int prevIdx = -1, nextIdx = -1;
+            double prevT = double.NegativeInfinity, nextT = double.PositiveInfinity;
+            for (int i = 0; i < clip.VolumeEnvelope.Count; i++)
+            {
+                var p = clip.VolumeEnvelope[i];
+                if (p.TimeRel <= timeRel && p.TimeRel > prevT) { prevT = p.TimeRel; prevIdx = i; }
+                if (p.TimeRel >= timeRel && p.TimeRel < nextT) { nextT = p.TimeRel; nextIdx = i; }
+            }
+            var affected = new List<int>();
+            if (prevIdx >= 0) affected.Add(prevIdx);
+            if (nextIdx >= 0 && nextIdx != prevIdx) affected.Add(nextIdx);
+            _envDragAffectedIdx       = affected.ToArray();
+            _envDragAffectedStartVols = affected.Select(i => clip.VolumeEnvelope[i].Volume).ToArray();
+        }
+
+        line.CapturePointer(e.Pointer);
+        e.Handled = true;
+    }
+
+    private void OnEnvelopeLinePointerMoved(object sender, PointerRoutedEventArgs e)
+    {
+        if (_envDragClip is null || _envDragCanvas is null) return;
+        if (sender is not Polyline) return;
+        var pt = e.GetCurrentPoint(_envDragCanvas);
+        if (!pt.Properties.IsLeftButtonPressed) return;
+
+        double clipH = _envDragCanvas.Height;
+        double range = Math.Max(1, clipH - 2 * EnvelopePad);
+        double deltaY = pt.Position.Y - _envDragStartPointerY;
+        double deltaVol = -deltaY / range;
+
+        if (_envDragAffectedIdx is null)
+        {
+            _envDragClip.Volume = Math.Clamp(_envDragStartClipVolume + deltaVol, 0, 1);
+        }
+        else
+        {
+            for (int i = 0; i < _envDragAffectedIdx.Length; i++)
+            {
+                int idx = _envDragAffectedIdx[i];
+                if (idx < 0 || idx >= _envDragClip.VolumeEnvelope.Count) continue;
+                _envDragClip.VolumeEnvelope[idx].Volume = Math.Clamp(
+                    _envDragAffectedStartVols![i] + deltaVol, 0, 1);
+            }
+        }
+
+        RefreshEnvelopeOverlay(_envDragCanvas, _envDragClip);
+        e.Handled = true;
+    }
+
+    private void OnEnvelopeLinePointerReleased(object sender, PointerRoutedEventArgs e)
+    {
+        if (_envDragClip is null) return;
+        var clip = _envDragClip;
+        var canvas = _envDragCanvas;
+        if (sender is Polyline line) line.ReleasePointerCapture(e.Pointer);
+        if (ViewModel is not null) ViewModel.Project.IsModified = true;
+        EndEnvelopeLineDrag();
+        if (canvas is not null) RefreshEnvelopeOverlay(canvas, clip);
+        RefreshClipWaveform(clip);
+        e.Handled = true;
+    }
+
+    private void OnEnvelopeLinePointerCaptureLost(object sender, PointerRoutedEventArgs e) =>
+        EndEnvelopeLineDrag();
+
+    private void EndEnvelopeLineDrag()
+    {
+        _envDragClip = null;
+        _envDragCanvas = null;
+        _envDragHitLine = null;
+        _envDragVisLine = null;
+        _envDragCircles = null;
+        _envDragAffectedIdx = null;
+        _envDragAffectedStartVols = null;
+    }
+
+    // ── Envelope circle: left-drag = move, right-click = delete ──
+
+    private void OnEnvelopeCirclePointerPressed(object sender, PointerRoutedEventArgs e)
+    {
+        if (sender is not Ellipse el) return;
+        if (el.Tag is not (VolumePoint vp, TimelineClip clip, Canvas canvas)) return;
+
+        var pt = e.GetCurrentPoint(canvas);
+        if (pt.Properties.IsRightButtonPressed)
+        {
+            clip.VolumeEnvelope.Remove(vp);
+            if (ViewModel is not null) ViewModel.Project.IsModified = true;
+            RefreshEnvelopeOverlay(canvas, clip);
+            RefreshClipWaveform(clip);
+            e.Handled = true;
+            return;
+        }
+        if (!pt.Properties.IsLeftButtonPressed) return;
+
+        _envDragPoint              = vp;
+        _envDragClip               = clip;
+        _envDragCanvas             = canvas;
+        _envDragPointStartTimeRel  = vp.TimeRel;
+        _envDragPointStartVolume   = vp.Volume;
+        _envDragPointStartPointerX = pt.Position.X;
+        _envDragPointStartPointerY = pt.Position.Y;
+        el.CapturePointer(e.Pointer);
+        e.Handled = true;
+    }
+
+    private void OnEnvelopeCirclePointerMoved(object sender, PointerRoutedEventArgs e)
+    {
+        if (_envDragPoint is null || _envDragClip is null || _envDragCanvas is null) return;
+        var pt = e.GetCurrentPoint(_envDragCanvas);
+        if (!pt.Properties.IsLeftButtonPressed) return;
+
+        double clipW = _envDragCanvas.Width;
+        double clipH = _envDragCanvas.Height;
+        double range = Math.Max(1, clipH - 2 * EnvelopePad);
+
+        double dx = pt.Position.X - _envDragPointStartPointerX;
+        double dy = pt.Position.Y - _envDragPointStartPointerY;
+        _envDragPoint.TimeRel = Math.Clamp(
+            _envDragPointStartTimeRel + dx / Math.Max(1, clipW), 0, 1);
+        _envDragPoint.Volume = Math.Clamp(
+            _envDragPointStartVolume - dy / range, 0, 1);
+
+        RefreshEnvelopeOverlay(_envDragCanvas, _envDragClip);
+        e.Handled = true;
+    }
+
+    private void OnEnvelopeCirclePointerReleased(object sender, PointerRoutedEventArgs e)
+    {
+        if (_envDragPoint is null) return;
+        var clip = _envDragClip;
+        var canvas = _envDragCanvas;
+        if (sender is Ellipse el) el.ReleasePointerCapture(e.Pointer);
+        if (ViewModel is not null) ViewModel.Project.IsModified = true;
+        EndEnvelopeCircleDrag();
+        if (clip is not null && canvas is not null) RefreshEnvelopeOverlay(canvas, clip);
+        if (clip is not null) RefreshClipWaveform(clip);
+        e.Handled = true;
+    }
+
+    private void OnEnvelopeCirclePointerCaptureLost(object sender, PointerRoutedEventArgs e) =>
+        EndEnvelopeCircleDrag();
+
+    private void EndEnvelopeCircleDrag()
+    {
+        _envDragPoint = null;
+        // Don't null _envDragClip / _envDragCanvas here — line-drag uses them too and
+        // releases them via EndEnvelopeLineDrag. But when a circle drag is in progress,
+        // no line drag is active, so it's safe to also clear them.
+        _envDragClip = null;
+        _envDragCanvas = null;
     }
 
     private Track? CreateAndInsertTrack(MediaType mediaType, bool insertAtTop)

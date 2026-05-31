@@ -118,13 +118,19 @@ public sealed class ExportFrameCompositor : IDisposable
                                Math.Max(1, (1 - cl - cr) * srcW),
                                Math.Max(1, (1 - ct - cb) * srcH));
 
-        // Destination: canvas frame, per-clip scale, per-clip offset.
-        // PosX/PosY are in canvas-pixel space (matches the preview).
+        // Destination: canvas frame, per-clip scale, per-clip offset, then carve
+        // out the cropped sub-rect so cropped pixels keep their original on-screen
+        // size instead of stretching to fill the un-cropped dest. PosX/PosY are
+        // in canvas-pixel space (matches the preview).
         double scale = Math.Clamp(clip.Scale, 0.05, 10);
-        double dstW = _canvasW * scale;
-        double dstH = _canvasH * scale;
-        double dstX = (_canvasW - dstW) / 2 + clip.PosX;
-        double dstY = (_canvasH - dstH) / 2 + clip.PosY;
+        double fullW = _canvasW * scale;
+        double fullH = _canvasH * scale;
+        double fullX = (_canvasW - fullW) / 2 + clip.PosX;
+        double fullY = (_canvasH - fullH) / 2 + clip.PosY;
+        double dstX = fullX + cl * fullW;
+        double dstY = fullY + ct * fullH;
+        double dstW = Math.Max(1, (1 - cl - cr) * fullW);
+        double dstH = Math.Max(1, (1 - ct - cb) * fullH);
         var destRect = new Rect(dstX, dstY, dstW, dstH);
 
         float opacity = (float)Math.Clamp(clip.Opacity, 0, 1);

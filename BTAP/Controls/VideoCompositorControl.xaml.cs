@@ -48,6 +48,10 @@ public sealed partial class VideoCompositorControl : UserControl
     public int OutputWidth  => _vm?.Project.GetCanvasSize().Width  ?? 1920;
     public int OutputHeight => _vm?.Project.GetCanvasSize().Height ?? 1080;
 
+    // When non-null, the clip with this Id is drawn ignoring its CropL/T/R/B so
+    // the user can see the full source frame while picking a crop region.
+    public string? BypassCropClipId { get; set; }
+
     public VideoCompositorControl()
     {
         InitializeComponent();
@@ -156,14 +160,21 @@ public sealed partial class VideoCompositorControl : UserControl
             });
 
             // Every active video layer plays its audio — the OS mixer sums them at the
-            // output. Per-clip Volume from the inspector is honored via Player.Volume.
+            // output. Per-clip Volume from the inspector is honored via Player.Volume,
+            // sampled from the clip's volume envelope at the current playhead so
+            // automation keyframes drive the audible level (not just the waveform).
             for (int i = 0; i < _layers.Count; i++)
             {
                 if (_layers[i].Disposed) continue;
+                var clip = _layers[i].Clip;
+                double timeRel = clip.Duration.TotalSeconds > 0
+                    ? (playhead - clip.TimelineStart).TotalSeconds / clip.Duration.TotalSeconds
+                    : 0;
+                double vol = clip.GetVolumeAt(Math.Clamp(timeRel, 0, 1));
                 try
                 {
                     _layers[i].Player.IsMuted = false;
-                    _layers[i].Player.Volume  = Math.Clamp(_layers[i].Clip.Volume, 0, 1);
+                    _layers[i].Player.Volume  = Math.Clamp(vol, 0, 1);
                 }
                 catch { }
             }
@@ -380,26 +391,35 @@ public sealed partial class VideoCompositorControl : UserControl
     private void DrawLayer(CanvasDrawingSession ds,
                            CanvasRenderTarget frame, TimelineClip clip, Rect frameRect)
     {
-        // Source rect with crop (CropLeft/Top/Right/Bottom are 0..1 fractions)
+        // Source rect with crop (CropLeft/Top/Right/Bottom are 0..1 fractions).
+        // When this clip is the active crop-mode target, render un-cropped so the
+        // user can see the full source frame while picking a crop region.
         double srcW = frame.SizeInPixels.Width;
         double srcH = frame.SizeInPixels.Height;
-        double cl = Math.Clamp(clip.CropLeft,   0, 0.95);
-        double ct = Math.Clamp(clip.CropTop,    0, 0.95);
-        double cr = Math.Clamp(clip.CropRight,  0, 0.95);
-        double cb = Math.Clamp(clip.CropBottom, 0, 0.95);
+        bool bypassCrop = BypassCropClipId is not null && BypassCropClipId == clip.Id;
+        double cl = bypassCrop ? 0 : Math.Clamp(clip.CropLeft,   0, 0.95);
+        double ct = bypassCrop ? 0 : Math.Clamp(clip.CropTop,    0, 0.95);
+        double cr = bypassCrop ? 0 : Math.Clamp(clip.CropRight,  0, 0.95);
+        double cb = bypassCrop ? 0 : Math.Clamp(clip.CropBottom, 0, 0.95);
         var srcRect = new Rect(cl * srcW, ct * srcH,
                                Math.Max(1, (1 - cl - cr) * srcW),
                                Math.Max(1, (1 - ct - cb) * srcH));
 
         // Destination rect: project frame fitted into frameRect, then per-clip
         // Scale and PosX/Y (PosX/Y are in project-pixel units, e.g. -1920..1920).
+        // Then carve out the cropped sub-rect so cropped pixels keep their original
+        // on-screen size instead of stretching to fill the un-cropped dest.
         double scale = Math.Clamp(clip.Scale, 0.05, 10);
-        double dstW  = frameRect.Width  * scale;
-        double dstH  = frameRect.Height * scale;
+        double fullW = frameRect.Width  * scale;
+        double fullH = frameRect.Height * scale;
         double offX  = clip.PosX / Math.Max(1, OutputWidth)  * frameRect.Width;
         double offY  = clip.PosY / Math.Max(1, OutputHeight) * frameRect.Height;
-        double dstX  = frameRect.X + (frameRect.Width  - dstW) / 2 + offX;
-        double dstY  = frameRect.Y + (frameRect.Height - dstH) / 2 + offY;
+        double fullX = frameRect.X + (frameRect.Width  - fullW) / 2 + offX;
+        double fullY = frameRect.Y + (frameRect.Height - fullH) / 2 + offY;
+        double dstX = fullX + cl * fullW;
+        double dstY = fullY + ct * fullH;
+        double dstW = Math.Max(1, (1 - cl - cr) * fullW);
+        double dstH = Math.Max(1, (1 - ct - cb) * fullH);
         var destRect = new Rect(dstX, dstY, dstW, dstH);
 
         float opacity = (float)Math.Clamp(clip.Opacity, 0, 1);

@@ -63,10 +63,44 @@ public partial class TimelineClip : ObservableObject
     // Effects applied to this clip
     public ObservableCollection<ClipEffect> Effects { get; } = [];
 
+    // Volume automation envelope. Empty = flat at Volume. Each point's TimeRel is a
+    // fraction of the clip's Duration (0..1) so trimming the clip leaves the envelope
+    // proportionally intact. Points are not required to be sorted in storage —
+    // GetVolumeAt sorts on read.
+    public ObservableCollection<VolumePoint> VolumeEnvelope { get; } = [];
+
+    public double GetVolumeAt(double timeRel)
+    {
+        if (VolumeEnvelope.Count == 0) return Volume;
+        if (VolumeEnvelope.Count == 1) return VolumeEnvelope[0].Volume;
+
+        VolumePoint? prev = null;
+        VolumePoint? next = null;
+        foreach (var p in VolumeEnvelope)
+        {
+            if (p.TimeRel <= timeRel && (prev is null || p.TimeRel > prev.TimeRel)) prev = p;
+            if (p.TimeRel >= timeRel && (next is null || p.TimeRel < next.TimeRel)) next = p;
+        }
+        if (prev is null && next is not null) return next.Volume;
+        if (next is null && prev is not null) return prev.Volume;
+        if (prev is null || next is null) return Volume;
+        if (ReferenceEquals(prev, next)) return prev.Volume;
+        double span = next.TimeRel - prev.TimeRel;
+        if (span <= 0) return prev.Volume;
+        double t = (timeRel - prev.TimeRel) / span;
+        return prev.Volume + (next.Volume - prev.Volume) * t;
+    }
+
     // Hue for filmstrip color (0–360)
     public int ColorHue { get; init; } = 138;
 
     public TimeSpan TimelineEnd => TimelineStart + Duration;
+}
+
+public partial class VolumePoint : ObservableObject
+{
+    [ObservableProperty] private double _timeRel; // 0..1 within clip duration
+    [ObservableProperty] private double _volume = 1.0; // 0..1
 }
 
 public partial class ClipEffect : ObservableObject
