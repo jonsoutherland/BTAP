@@ -4126,6 +4126,12 @@ public sealed partial class EditorPage : Page
         }
     }
 
+    /// <summary>Static parameter slider for the Effects tab. Keyframe management
+    /// lives entirely in the Automations tab — right-click the clip on the
+    /// timeline → Add keyframe at playhead to create one. When a parameter has
+    /// keyframes the slider here only edits the fallback (used when no keyframes
+    /// exist), so we mute its visuals and append an "Animated" badge so the user
+    /// knows the live value comes from the Automations tab.</summary>
     private UIElement MakeEffectNumberSlider(ClipEffect fx, ClipEffectsChain.NumberParam p)
     {
         bool isAnimated = fx.IsAnimated(p.Key);
@@ -4144,95 +4150,67 @@ public sealed partial class EditorPage : Page
         {
             Text = p.Label,
             FontSize = 10,
-            Foreground = (Brush)Application.Current.Resources["TextMutedBrush"],
+            Foreground = (Brush)Application.Current.Resources[
+                isAnimated ? "TextFaintBrush" : "TextMutedBrush"],
             VerticalAlignment = VerticalAlignment.Center,
         };
         double current = fx.GetNumber(p.Key, p.Default);
 
-        // Header value: when animated, show "start → end" so the user sees both
-        // endpoints at a glance without expanding anything. Otherwise just the
-        // single static value.
         var valLbl = new TextBlock
         {
-            Text = isAnimated
-                ? $"{FormatEffectNumber(fx.Keyframes[p.Key][0].Value)} → {FormatEffectNumber(fx.Keyframes[p.Key][^1].Value)}"
-                : FormatEffectNumber(current),
+            Text = FormatEffectNumber(current),
             FontSize = 10,
             FontFamily = new FontFamily("JetBrains Mono, Consolas"),
-            Foreground = (Brush)Application.Current.Resources["TextDimBrush"],
+            Foreground = (Brush)Application.Current.Resources[
+                isAnimated ? "TextFaintBrush" : "TextDimBrush"],
             VerticalAlignment = VerticalAlignment.Center,
-            Margin = new Thickness(0, 0, 6, 0),
+            Margin = new Thickness(0, 0, isAnimated ? 6 : 0, 0),
         };
-
-        // Animate toggle button — small diamond icon, accent-colored when active.
-        // Toggling on seeds a two-keyframe automation (start + end) at the current
-        // static value; toggling off removes the keyframes (static value remains).
-        var animBtn = new Button
-        {
-            Content = MakeKeyframeIcon(isAnimated),
-            Padding = new Thickness(3, 0, 3, 0),
-            MinWidth = 20,
-            Height = 18,
-            Style = (Style)Application.Current.Resources["GhostButtonStyle"],
-        };
-        ToolTipService.SetToolTip(animBtn, isAnimated
-            ? "Animation on · click to remove keyframes"
-            : "Animate this parameter from a start value to an end value");
-        animBtn.Click += (_, _) =>
-        {
-            if (fx.IsAnimated(p.Key))
-                fx.StopAnimation(p.Key);
-            else
-                fx.StartAnimation(p.Key, current, current);
-            if (_vm is not null) _vm.Project.IsModified = true;
-            if (_vm?.SelectedClip is { } sel) UpdateInspector(sel);
-        };
-
         labelRow.Children.Add(lbl);
         Grid.SetColumn(lbl, 0);
         labelRow.Children.Add(valLbl);
         Grid.SetColumn(valLbl, 1);
-        labelRow.Children.Add(animBtn);
-        Grid.SetColumn(animBtn, 2);
+
+        if (isAnimated)
+        {
+            // Subtle accent pill so users can tell at a glance that this
+            // parameter's live value is being driven by keyframes elsewhere.
+            var badge = new Border
+            {
+                Background = (Brush)Application.Current.Resources["AccentSoftBrush"],
+                CornerRadius = new CornerRadius(2),
+                Padding = new Thickness(5, 0, 5, 0),
+                VerticalAlignment = VerticalAlignment.Center,
+                Child = new TextBlock
+                {
+                    Text = "ANIMATED",
+                    FontSize = 8.5,
+                    CharacterSpacing = 80,
+                    Foreground = (Brush)Application.Current.Resources["AccentInkBrush"],
+                },
+            };
+            ToolTipService.SetToolTip(badge, "Live value is driven by keyframes — edit them in the Automations tab.");
+            labelRow.Children.Add(badge);
+            Grid.SetColumn(badge, 2);
+        }
+
         panel.Children.Add(labelRow);
 
-        if (!isAnimated)
+        var slider = MakeBareSlider(p.Min, p.Max, current, v =>
         {
-            panel.Children.Add(MakeBareSlider(p.Min, p.Max, current, v =>
-            {
-                fx.SetNumber(p.Key, v);
-                valLbl.Text = FormatEffectNumber(v);
-                if (_vm is not null) _vm.Project.IsModified = true;
-            }));
-        }
-        else
-        {
-            // Two-keyframe automation: edit start (TimeRel=0) and end (TimeRel=1)
-            // values. Storage is a list to leave room for arbitrary keyframes in a
-            // future version; the inspector just shows the first/last entries.
-            var kfs = fx.Keyframes[p.Key];
-            var startKf = kfs[0];
-            var endKf   = kfs[^1];
-
-            panel.Children.Add(MakeAutomationEndpointRow("Start", p.Min, p.Max, startKf.Value, v =>
-            {
-                startKf.Value = v;
-                valLbl.Text = $"{FormatEffectNumber(startKf.Value)} → {FormatEffectNumber(endKf.Value)}";
-                if (_vm is not null) _vm.Project.IsModified = true;
-            }));
-            panel.Children.Add(MakeAutomationEndpointRow("End", p.Min, p.Max, endKf.Value, v =>
-            {
-                endKf.Value = v;
-                valLbl.Text = $"{FormatEffectNumber(startKf.Value)} → {FormatEffectNumber(endKf.Value)}";
-                if (_vm is not null) _vm.Project.IsModified = true;
-            }));
-        }
-
+            fx.SetNumber(p.Key, v);
+            valLbl.Text = FormatEffectNumber(v);
+            if (_vm is not null) _vm.Project.IsModified = true;
+        });
+        // When the parameter is animated, the static value is a fallback that
+        // doesn't affect the rendered frame — dim the slider to signal that.
+        if (isAnimated) slider.Opacity = 0.45;
+        panel.Children.Add(slider);
         return panel;
     }
 
     /// <summary>Compact slider with no surrounding label — used as the inner
-    /// editor inside MakeEffectNumberSlider and the automation endpoint rows.</summary>
+    /// editor inside MakeEffectNumberSlider and the Automations details rows.</summary>
     private Slider MakeBareSlider(double min, double max, double value, Action<double> onChange)
     {
         double range = max - min;
@@ -4249,69 +4227,6 @@ public sealed partial class EditorPage : Page
         };
         slider.ValueChanged += (_, ev) => onChange(ev.NewValue);
         return slider;
-    }
-
-    /// <summary>Indented Start / End row used when a parameter is animated.</summary>
-    private UIElement MakeAutomationEndpointRow(string label, double min, double max,
-                                                double value, Action<double> onChange)
-    {
-        var stack = new StackPanel { Spacing = 0, Margin = new Thickness(10, 0, 0, 0) };
-
-        var head = new Grid
-        {
-            ColumnDefinitions =
-            {
-                new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) },
-                new ColumnDefinition { Width = GridLength.Auto },
-            },
-        };
-        var lbl = new TextBlock
-        {
-            Text = label,
-            FontSize = 9.5,
-            Foreground = (Brush)Application.Current.Resources["TextFaintBrush"],
-        };
-        var valLbl = new TextBlock
-        {
-            Text = FormatEffectNumber(value),
-            FontSize = 9.5,
-            FontFamily = new FontFamily("JetBrains Mono, Consolas"),
-            Foreground = (Brush)Application.Current.Resources["TextDimBrush"],
-        };
-        head.Children.Add(lbl);
-        Grid.SetColumn(lbl, 0);
-        head.Children.Add(valLbl);
-        Grid.SetColumn(valLbl, 1);
-        stack.Children.Add(head);
-        stack.Children.Add(MakeBareSlider(min, max, value, v =>
-        {
-            valLbl.Text = FormatEffectNumber(v);
-            onChange(v);
-        }));
-        return stack;
-    }
-
-    /// <summary>Tiny diamond — the conventional keyframe marker. Filled with the
-    /// accent color when the parameter is animated, just an outline otherwise.</summary>
-    private static UIElement MakeKeyframeIcon(bool active)
-    {
-        var fill = active
-            ? (Brush)Application.Current.Resources["AccentBrush"]
-            : (Brush)Application.Current.Resources["TransparentBrush"];
-        var stroke = active
-            ? (Brush)Application.Current.Resources["AccentBrush"]
-            : (Brush)Application.Current.Resources["TextMutedBrush"];
-        var diamond = new Rectangle
-        {
-            Width = 8,
-            Height = 8,
-            Fill = fill,
-            Stroke = stroke,
-            StrokeThickness = 1.2,
-            RenderTransformOrigin = new Windows.Foundation.Point(0.5, 0.5),
-            RenderTransform = new RotateTransform { Angle = 45 },
-        };
-        return diamond;
     }
 
     private static string FormatEffectNumber(double v) =>
