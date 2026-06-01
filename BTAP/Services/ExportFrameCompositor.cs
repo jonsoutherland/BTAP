@@ -1,9 +1,7 @@
 using System.Numerics;
 using Microsoft.Graphics.Canvas;
-using Microsoft.Graphics.Canvas.Effects;
 using Microsoft.Graphics.Canvas.Text;
 using Windows.Foundation;
-using Windows.Graphics.Effects;
 using Windows.UI;
 using Microsoft.UI;
 using BTAP.Models;
@@ -68,7 +66,7 @@ public sealed class ExportFrameCompositor : IDisposable
                 if (clip.Kind == ClipKind.Title) continue;
                 if (string.IsNullOrEmpty(clip.SourceId)) continue;
                 if (!layerFrames.TryGetValue(clip, out var frame) || frame is null) continue;
-                DrawVideoLayer(ds, frame, clip);
+                DrawVideoLayer(ds, frame, clip, playhead);
             }
 
             foreach (var track in _project.Tracks)
@@ -105,8 +103,12 @@ public sealed class ExportFrameCompositor : IDisposable
         return null;
     }
 
-    private void DrawVideoLayer(CanvasDrawingSession ds, CanvasBitmap frame, TimelineClip clip)
+    private void DrawVideoLayer(CanvasDrawingSession ds, CanvasBitmap frame, TimelineClip clip, TimeSpan playhead)
     {
+        double clipTimeRel = clip.Duration.TotalSeconds > 0
+            ? Math.Clamp((playhead - clip.TimelineStart).TotalSeconds / clip.Duration.TotalSeconds, 0, 1)
+            : 0;
+
         // Source rect with crop (CropLeft/Top/Right/Bottom are 0..1 fractions)
         double srcW = frame.SizeInPixels.Width;
         double srcH = frame.SizeInPixels.Height;
@@ -135,51 +137,14 @@ public sealed class ExportFrameCompositor : IDisposable
 
         float opacity = (float)Math.Clamp(clip.Opacity, 0, 1);
 
-        // Color-grading effect chain rooted at the source frame. Built and disposed per
-        // call — these are lightweight ICanvasEffect graphs, not GPU resources themselves.
+        // Color-grading + named-effect chain rooted at the source frame. Built and
+        // disposed per call — these are lightweight ICanvasEffect graphs, not GPU
+        // resources themselves. Shared with VideoCompositorControl so the export
+        // matches the preview pixel-for-pixel.
         var graph = new List<IDisposable>();
         try
         {
-            IGraphicsEffectSource src = frame;
-
-            if (Math.Abs(clip.Exposure) > 0.0001)
-            {
-                var e = new ExposureEffect { Source = src, Exposure = Clamp((float)clip.Exposure, -2f, 2f) };
-                graph.Add(e); src = e;
-            }
-            if (Math.Abs(clip.Contrast) > 0.0001)
-            {
-                var e = new ContrastEffect { Source = src, Contrast = Clamp((float)clip.Contrast / 100f, -1f, 1f) };
-                graph.Add(e); src = e;
-            }
-            if (Math.Abs(clip.Saturation) > 0.0001)
-            {
-                var e = new SaturationEffect { Source = src, Saturation = Clamp(1f + (float)clip.Saturation / 100f, 0f, 2f) };
-                graph.Add(e); src = e;
-            }
-            if (Math.Abs(clip.Temperature) > 0.0001 || Math.Abs(clip.Tint) > 0.0001)
-            {
-                var e = new TemperatureAndTintEffect
-                {
-                    Source = src,
-                    Temperature = Clamp((float)clip.Temperature / 100f, -1f, 1f),
-                    Tint        = Clamp((float)clip.Tint        / 100f, -1f, 1f),
-                };
-                graph.Add(e); src = e;
-            }
-            foreach (var fx in clip.Effects)
-            {
-                if (!fx.Enabled) continue;
-                if (fx.Name == "Gaussian Blur")
-                {
-                    float blur = (float)(Math.Clamp(fx.Intensity, 0.0, 1.0) * 50.0);
-                    if (blur > 0.01f)
-                    {
-                        var e = new GaussianBlurEffect { Source = src, BlurAmount = blur, BorderMode = EffectBorderMode.Hard };
-                        graph.Add(e); src = e;
-                    }
-                }
-            }
+            var src = ClipEffectsChain.Build(frame, clip, clipTimeRel, graph);
 
             // Flip + rotation around the clip's center. ds.Transform applies to DrawImage's
             // destination, leaving srcRect untouched.
@@ -261,8 +226,6 @@ public sealed class ExportFrameCompositor : IDisposable
         if (!byte.TryParse(s.Substring(6, 2), System.Globalization.NumberStyles.HexNumber, null, out var b)) return Colors.White;
         return Color.FromArgb(a, r, g, b);
     }
-
-    private static float Clamp(float v, float min, float max) => v < min ? min : (v > max ? max : v);
 
     public void Dispose()
     {

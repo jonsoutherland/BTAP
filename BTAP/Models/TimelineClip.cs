@@ -108,4 +108,88 @@ public partial class ClipEffect : ObservableObject
     [ObservableProperty] private string _name = string.Empty;
     [ObservableProperty] private double _intensity = 1.0;
     [ObservableProperty] private bool _enabled = true;
+
+    // Per-effect parameters. Numbers cover sliders (amount, angle, radius, etc.);
+    // Strings cover colors and other non-numeric values (stored as #AARRGGBB hex).
+    // Bag-style storage so the model stays effect-agnostic — ClipEffectsChain owns
+    // the parameter names and defaults for each effect.
+    public Dictionary<string, double> Numbers { get; init; } = new();
+    public Dictionary<string, string> Strings { get; init; } = new();
+
+    // Per-parameter automation: list of keyframes interpolated linearly between.
+    // When a parameter has any keyframes, GetAutomatedNumber returns the
+    // interpolated value at the given clip-relative time (0..1) and Numbers is
+    // ignored for that key. Empty/missing = use static Numbers value.
+    public Dictionary<string, ObservableCollection<EffectKeyframe>> Keyframes { get; init; } = new();
+
+    public double GetNumber(string key, double @default) =>
+        Numbers.TryGetValue(key, out var v) ? v : @default;
+
+    public string GetString(string key, string @default) =>
+        Strings.TryGetValue(key, out var v) ? v : @default;
+
+    public void SetNumber(string key, double value)
+    {
+        Numbers[key] = value;
+        OnPropertyChanged(nameof(Numbers));
+    }
+
+    public void SetString(string key, string value)
+    {
+        Strings[key] = value;
+        OnPropertyChanged(nameof(Strings));
+    }
+
+    /// <summary>Returns the parameter's value at the given clip-relative time,
+    /// linearly interpolating between automation keyframes. Falls through to the
+    /// static <see cref="GetNumber"/> when no keyframes exist for this key.</summary>
+    public double GetAutomatedNumber(string key, double timeRel, double @default)
+    {
+        if (!Keyframes.TryGetValue(key, out var kfs) || kfs.Count == 0)
+            return GetNumber(key, @default);
+        if (kfs.Count == 1) return kfs[0].Value;
+
+        EffectKeyframe? prev = null;
+        EffectKeyframe? next = null;
+        foreach (var k in kfs)
+        {
+            if (k.TimeRel <= timeRel && (prev is null || k.TimeRel > prev.TimeRel)) prev = k;
+            if (k.TimeRel >= timeRel && (next is null || k.TimeRel < next.TimeRel)) next = k;
+        }
+        if (prev is null && next is not null) return next.Value;
+        if (next is null && prev is not null) return prev.Value;
+        if (prev is null || next is null) return @default;
+        if (ReferenceEquals(prev, next)) return prev.Value;
+        double span = next.TimeRel - prev.TimeRel;
+        if (span <= 0) return prev.Value;
+        double t = (timeRel - prev.TimeRel) / span;
+        return prev.Value + (next.Value - prev.Value) * t;
+    }
+
+    public bool IsAnimated(string key) =>
+        Keyframes.TryGetValue(key, out var kfs) && kfs.Count > 0;
+
+    /// <summary>Initialize a simple start→end animation for a parameter. The
+    /// inspector can edit each keyframe's value afterwards.</summary>
+    public void StartAnimation(string key, double startValue, double endValue)
+    {
+        Keyframes[key] = new ObservableCollection<EffectKeyframe>
+        {
+            new() { TimeRel = 0, Value = startValue },
+            new() { TimeRel = 1, Value = endValue },
+        };
+        OnPropertyChanged(nameof(Keyframes));
+    }
+
+    public void StopAnimation(string key)
+    {
+        if (Keyframes.Remove(key))
+            OnPropertyChanged(nameof(Keyframes));
+    }
+}
+
+public partial class EffectKeyframe : ObservableObject
+{
+    [ObservableProperty] private double _timeRel; // 0..1 within clip duration
+    [ObservableProperty] private double _value;
 }

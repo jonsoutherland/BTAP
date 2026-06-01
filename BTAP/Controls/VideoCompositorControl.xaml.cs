@@ -8,6 +8,7 @@ using Windows.Media.Core;
 using Windows.Media.Playback;
 using Windows.Storage;
 using BTAP.Models;
+using BTAP.Services;
 using BTAP.ViewModels;
 
 namespace BTAP.Controls;
@@ -349,9 +350,14 @@ public sealed partial class VideoCompositorControl : UserControl
 
     private void OnDraw(ICanvasAnimatedControl sender, CanvasAnimatedDrawEventArgs args)
     {
-        var ds = args.DrawingSession;
-        var bounds = sender.Size;
+        DrawScene(args.DrawingSession, sender.Size);
+    }
 
+    /// <summary>Renders every active layer at the current playhead into
+    /// <paramref name="ds"/>, sized to <paramref name="bounds"/> (control units).
+    /// Pulled out of OnDraw so SamplePixelAt can reuse the same composition.</summary>
+    private void DrawScene(CanvasDrawingSession ds, Windows.Foundation.Size bounds)
+    {
         if (bounds.Width <= 0 || bounds.Height <= 0) return;
         if (OutputWidth <= 0 || OutputHeight <= 0) return;
 
@@ -385,6 +391,41 @@ public sealed partial class VideoCompositorControl : UserControl
                 try { DrawLayer(ds, layer.Frame, layer.Clip, frameRect); }
                 catch { /* defensive — disposed frame, device loss, etc */ }
             }
+        }
+    }
+
+    /// <summary>Samples the rendered pixel color at <paramref name="ptInControl"/>
+    /// (control-local coordinates). Re-renders the current scene into a one-pixel
+    /// CanvasRenderTarget at the click position so we only pay for the pixel we
+    /// actually need. Returns null if the device isn't ready or the point is out
+    /// of bounds. Used by the inspector's eye-dropper to pick chroma-key /
+    /// vignette colors directly from the video.</summary>
+    public Windows.UI.Color? SamplePixelAt(Windows.Foundation.Point ptInControl)
+    {
+        var device = _device;
+        if (device is null) return null;
+
+        var bounds = new Windows.Foundation.Size(Canvas.ActualWidth, Canvas.ActualHeight);
+        if (bounds.Width <= 0 || bounds.Height <= 0) return null;
+        if (ptInControl.X < 0 || ptInControl.Y < 0) return null;
+        if (ptInControl.X >= bounds.Width || ptInControl.Y >= bounds.Height) return null;
+
+        try
+        {
+            // 1px render target translated so the click point lands at (0,0).
+            using var rt = new CanvasRenderTarget(device, 1, 1, 96);
+            using (var ds = rt.CreateDrawingSession())
+            {
+                ds.Clear(Windows.UI.Color.FromArgb(0, 0, 0, 0));
+                ds.Transform = Matrix3x2.CreateTranslation((float)-ptInControl.X, (float)-ptInControl.Y);
+                DrawScene(ds, bounds);
+            }
+            var colors = rt.GetPixelColors(0, 0, 1, 1);
+            return colors.Length > 0 ? colors[0] : null;
+        }
+        catch
+        {
+            return null;
         }
     }
 
@@ -424,17 +465,49 @@ public sealed partial class VideoCompositorControl : UserControl
 
         float opacity = (float)Math.Clamp(clip.Opacity, 0, 1);
 
-        // Rotation around the clip's center
-        var oldTransform = ds.Transform;
-        double rot = clip.Rotation * Math.PI / 180.0;
-        if (Math.Abs(rot) > 0.0001)
+        // Color-grading + named-effect chain rooted at the source frame. Same builder
+        // as the export pipeline, so what the preview shows is what gets baked. The
+        // graph is rebuilt per draw and disposed at the end — these are lightweight
+        // effect descriptors, not GPU resources.
+        double clipTimeRel = 0;
+        var playhead = _vm?.Project.Playhead;
+        if (playhead is { } p && clip.Duration.TotalSeconds > 0)
+            clipTimeRel = Math.Clamp((p - clip.TimelineStart).TotalSeconds / clip.Duration.TotalSeconds, 0, 1);
+
+        var graph = new List<IDisposable>();
+        try
         {
-            var center = new Vector2((float)(dstX + dstW / 2), (float)(dstY + dstH / 2));
-            ds.Transform = Matrix3x2.CreateRotation((float)rot, center);
+            var src = ClipEffectsChain.Build(frame, clip, clipTimeRel, graph);
+
+            // Flip + rotation around the clip's center
+            var oldTransform = ds.Transform;
+            var t = Matrix3x2.Identity;
+            if (clip.FlipX || clip.FlipY)
+            {
+                var center = new Vector2((float)(dstX + dstW / 2), (float)(dstY + dstH / 2));
+                t = Matrix3x2.CreateScale(clip.FlipX ? -1f : 1f, clip.FlipY ? -1f : 1f, center);
+            }
+            double rot = clip.Rotation * Math.PI / 180.0;
+            if (Math.Abs(rot) > 0.0001)
+            {
+                var center = new Vector2((float)(dstX + dstW / 2), (float)(dstY + dstH / 2));
+                t = t * Matrix3x2.CreateRotation((float)rot, center);
+            }
+            if (t != Matrix3x2.Identity) ds.Transform = t;
+
+            try
+            {
+                ds.DrawImage((Microsoft.Graphics.Canvas.ICanvasImage)src, destRect, srcRect, opacity);
+            }
+            finally
+            {
+                ds.Transform = oldTransform;
+            }
         }
-
-        ds.DrawImage(frame, destRect, srcRect, opacity);
-
-        ds.Transform = oldTransform;
+        finally
+        {
+            for (int i = graph.Count - 1; i >= 0; i--)
+                try { graph[i].Dispose(); } catch { }
+        }
     }
 }

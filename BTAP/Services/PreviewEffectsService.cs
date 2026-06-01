@@ -10,8 +10,15 @@ namespace BTAP.Services;
 
 /// <summary>
 /// Manages a Win2D composition-effect chain that runs on the backdrop of an overlay
-/// element placed on top of the MediaPlayerElement.  Color-grading slider values from
+/// element placed on top of a MediaPlayerElement.  Color-grading slider values from
 /// the active TimelineClip drive animatable properties on the resulting brush.
+///
+/// NOTE: Not currently attached at runtime — the live preview now renders through
+/// VideoCompositorControl (a Win2D CanvasAnimatedControl + MediaPlayer frame-server
+/// pipeline) which applies the full color-grading + effect chain via
+/// <see cref="ClipEffectsChain"/>. This service is kept for the legacy
+/// MediaPlayerElement path; it only covers color grading + Gaussian Blur and does
+/// not duplicate the full effect catalog supported by the active renderer.
 /// </summary>
 public sealed class PreviewEffectsService
 {

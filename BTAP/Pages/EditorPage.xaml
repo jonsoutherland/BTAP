@@ -894,7 +894,9 @@
                                           SelectionCleared="OnTimelineSelectionCleared"
                                           ClipDeleted="OnTimelineClipDeleted"
                                           PlayheadChanged="OnPlayheadChanged"
-                                          ZoomChanged="OnTimelineZoomChanged" />
+                                          ZoomChanged="OnTimelineZoomChanged"
+                                          AddKeyframeRequested="OnTimelineAddKeyframeRequested"
+                                          KeyframeSelectionChanged="OnTimelineKeyframeSelectionChanged" />
             </Grid>
 
             <!-- ── Inspector panel ────────────────────────────────── -->
@@ -929,18 +931,42 @@
 
                         <!-- Inspector tabs -->
                         <StackPanel Orientation="Horizontal" Spacing="2">
-                            <Button x:Name="BtnInspVideo"  Content="Video"   Tag="video"   Click="OnInspTabClick" Style="{StaticResource GhostButtonStyle}" FontSize="10.5" Padding="7,3" Background="{StaticResource BgElevatedBrush}" Foreground="{StaticResource TextPrimaryBrush}" />
-                            <Button x:Name="BtnInspAudio"  Content="Audio"   Tag="audio"   Click="OnInspTabClick" Style="{StaticResource GhostButtonStyle}" FontSize="10.5" Padding="7,3" />
-                            <Button x:Name="BtnInspFX"     Content="Effects" Tag="effects" Click="OnInspTabClick" Style="{StaticResource GhostButtonStyle}" FontSize="10.5" Padding="7,3" />
-                            <Button x:Name="BtnInspColor"  Content="Color"   Tag="color"   Click="OnInspTabClick" Style="{StaticResource GhostButtonStyle}" FontSize="10.5" Padding="7,3" />
+                            <Button x:Name="BtnInspVideo"  Content="Video"       Tag="video"       Click="OnInspTabClick" Style="{StaticResource GhostButtonStyle}" FontSize="10.5" Padding="7,3" Background="{StaticResource BgElevatedBrush}" Foreground="{StaticResource TextPrimaryBrush}" />
+                            <Button x:Name="BtnInspAudio"  Content="Audio"       Tag="audio"       Click="OnInspTabClick" Style="{StaticResource GhostButtonStyle}" FontSize="10.5" Padding="7,3" />
+                            <Button x:Name="BtnInspFX"     Content="Effects"     Tag="effects"     Click="OnInspTabClick" Style="{StaticResource GhostButtonStyle}" FontSize="10.5" Padding="7,3" />
+                            <Button x:Name="BtnInspColor"  Content="Color"       Tag="color"       Click="OnInspTabClick" Style="{StaticResource GhostButtonStyle}" FontSize="10.5" Padding="7,3" />
+                            <Button x:Name="BtnInspAuto"   Content="Automations" Tag="automations" Click="OnInspTabClick" Style="{StaticResource GhostButtonStyle}" FontSize="10.5" Padding="7,3" />
                         </StackPanel>
                     </StackPanel>
                 </Border>
 
-                <!-- Inspector scroll content -->
-                <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto">
-                    <StackPanel x:Name="InspectorContent" Spacing="0" />
-                </ScrollViewer>
+                <!-- Inspector content: two parallel layouts.
+                     • InspectorScrollViewer holds the regular tabs (video / audio /
+                       effects / color).
+                     • AutomationsLayout is shown only on the Automations tab — a
+                       Grid with a scrollable keyframe list on top and a fixed-height
+                       editor box at the bottom so the user can edit a selected
+                       keyframe's value/time without the editor scrolling out of view. -->
+                <Grid Grid.Row="2">
+                    <ScrollViewer x:Name="InspectorScrollViewer" VerticalScrollBarVisibility="Auto">
+                        <StackPanel x:Name="InspectorContent" Spacing="0" />
+                    </ScrollViewer>
+                    <Grid x:Name="AutomationsLayout" Visibility="Collapsed">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="*" />
+                            <RowDefinition Height="Auto" />
+                        </Grid.RowDefinitions>
+                        <ScrollViewer Grid.Row="0" VerticalScrollBarVisibility="Auto">
+                            <StackPanel x:Name="AutomationsListPanel" Spacing="0" />
+                        </ScrollViewer>
+                        <Border Grid.Row="1"
+                                BorderBrush="{StaticResource HairlineBrush}"
+                                BorderThickness="0,1,0,0"
+                                Background="{StaticResource BgSurfaceBrush}">
+                            <StackPanel x:Name="AutomationsEditorPanel" Spacing="0" />
+                        </Border>
+                    </Grid>
+                </Grid>
             </Grid>
         </Grid>
 

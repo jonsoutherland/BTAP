@@ -77,6 +77,40 @@ public partial class EditorViewModel : ObservableObject
     public ObservableCollection<MediaItem> MediaBin => _project.MediaBin;
     public EditHistory History { get; } = new();
 
+    /// <summary>The set of automation keyframes currently selected, shared between
+    /// the Automations inspector list and the timeline diamond overlays so click
+    /// state stays in sync from either side. ReferenceEqualityComparer keeps
+    /// selection keyed to the actual ObservableObject instance, which is what
+    /// both sides reference.</summary>
+    public HashSet<EffectKeyframe> SelectedKeyframes { get; } =
+        new HashSet<EffectKeyframe>(ReferenceEqualityComparer.Instance);
+
+    public event EventHandler? SelectedKeyframesChanged;
+
+    public void SetKeyframeSelection(EffectKeyframe kf, bool additive)
+    {
+        if (!additive)
+        {
+            SelectedKeyframes.Clear();
+            SelectedKeyframes.Add(kf);
+        }
+        else if (!SelectedKeyframes.Add(kf))
+        {
+            SelectedKeyframes.Remove(kf);
+        }
+        SelectedKeyframesChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    public void ClearKeyframeSelection()
+    {
+        if (SelectedKeyframes.Count == 0) return;
+        SelectedKeyframes.Clear();
+        SelectedKeyframesChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    public void RaiseSelectedKeyframesChanged() =>
+        SelectedKeyframesChanged?.Invoke(this, EventArgs.Empty);
+
     [ObservableProperty] private EditorMode _mode = EditorMode.Edit;
     [ObservableProperty] private ActiveTool _activeTool = ActiveTool.Cursor;
     [ObservableProperty] private bool _isPlaying;

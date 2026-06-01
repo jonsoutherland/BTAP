@@ -76,9 +76,27 @@ public partial class MediaItem : ObservableObject
                 item.Duration   = props.Duration;
                 if (props.Width > 0)
                 {
-                    item.Width      = (int)props.Width;
-                    item.Height     = (int)props.Height;
-                    item.Resolution = $"{props.Width}×{props.Height}";
+                    int w = (int)props.Width;
+                    int h = (int)props.Height;
+                    // VideoProperties reports raw encoded dimensions; MediaPlayer
+                    // applies the rotation flag on playback (NaturalVideoWidth/Height
+                    // come back swapped). Match that here or portrait phone clips
+                    // get stretched into a landscape canvas.
+                    try
+                    {
+                        var extra = await file.Properties.RetrievePropertiesAsync(
+                            new[] { "System.Video.Orientation" });
+                        if (extra.TryGetValue("System.Video.Orientation", out var rotObj)
+                            && rotObj is uint rot
+                            && (rot == 90 || rot == 270))
+                        {
+                            (w, h) = (h, w);
+                        }
+                    }
+                    catch { }
+                    item.Width      = w;
+                    item.Height     = h;
+                    item.Resolution = $"{w}×{h}";
                 }
             }
             else if (Array.Exists(AudioExtensions, e => e == ext))

@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using System.Diagnostics;
 using Microsoft.UI.Dispatching;
 using Microsoft.UI.Input;
 using Microsoft.UI.Xaml;
@@ -35,10 +36,14 @@ public sealed partial class EditorPage : Page
     private readonly ObservableCollection<MediaTileData> _mediaTiles = [];
 
     private DispatcherTimer? _playbackTimer;
+    private readonly Stopwatch _playClock = new();
+    private TimeSpan _lastTickElapsed;
     private DispatcherTimer? _statusTimer;
     private DateTime _lastSaved = DateTime.Now;
     private readonly PreviewEffectsService _previewEffects = new();
     private readonly KeyBindingsService _keyBindings = new();
+    private Border? _eyedropOverlay;
+    private Action<Color>? _eyedropCallback;
 
     public EditorPage()
     {
@@ -129,8 +134,11 @@ public sealed partial class EditorPage : Page
         if (_presentedClip is null)
         {
             // Nothing to show — clear the player so the deleted clip's last frame
-            // doesn't linger over the placeholder.
+            // doesn't linger over the placeholder. Sync the compositor too: it
+            // caches each layer's last frame and would otherwise keep drawing the
+            // deleted clip's frame on top of the transparent clear.
             ClearPreview();
+            VideoCompositor.Sync(_vm.Project.Playhead);
         }
         else
         {
@@ -191,6 +199,13 @@ public sealed partial class EditorPage : Page
         if (_inCropMode && (e.Key == VirtualKey.Escape || e.Key == VirtualKey.Enter))
         {
             ExitCropMode();
+            e.Handled = true;
+            return;
+        }
+
+        if (_eyedropOverlay is not null && e.Key == VirtualKey.Escape)
+        {
+            EndEyedrop();
             e.Handled = true;
         }
     }
@@ -287,6 +302,12 @@ public sealed partial class EditorPage : Page
         _playbackTimer.Interval = TimeSpan.FromSeconds(1.0 / _vm.Project.FrameRate);
         _playbackTimer.Tick -= OnPlaybackTick;
         _playbackTimer.Tick += OnPlaybackTick;
+        // Drive the playhead off wall-clock elapsed time between ticks rather than
+        // a fixed 1/FrameRate increment — DispatcherTimer can fire late and never
+        // makes up the lost time, so a count-the-ticks approach drifts behind
+        // MediaPlayer (which plays in real wall-clock time).
+        _lastTickElapsed = TimeSpan.Zero;
+        _playClock.Restart();
         _playbackTimer.Start();
     }
 
@@ -296,6 +317,7 @@ public sealed partial class EditorPage : Page
         _vm.IsPlaying = false;
         PlaybackBar.SetIsPlaying(false);
         _playbackTimer?.Stop();
+        _playClock.Stop();
         VideoCompositor.Pause();
     }
 
@@ -1988,8 +2010,11 @@ public sealed partial class EditorPage : Page
     private void OnPlaybackTick(object? sender, object e)
     {
         if (_vm is null) return;
-        var frame = TimeSpan.FromSeconds(1.0 / _vm.Project.FrameRate);
-        _vm.Project.Playhead += frame;
+        var nowElapsed = _playClock.Elapsed;
+        var dt = nowElapsed - _lastTickElapsed;
+        _lastTickElapsed = nowElapsed;
+        if (dt < TimeSpan.Zero) dt = TimeSpan.Zero;
+        _vm.Project.Playhead += dt;
 
         if (_vm.Project.Playhead >= _vm.Project.Duration)
         {
@@ -2191,14 +2216,19 @@ public sealed partial class EditorPage : Page
         foreach (var (name, kind) in new (string, string)[]
         {
             ("Gaussian Blur",   "Blur · 0–50px"),
-            ("Cross Dissolve",  "Transition · 1.0s"),
-            ("Chroma Key",      "Green screen removal"),
             ("Sharpen",         "Edge enhancement"),
             ("Vignette",        "Edge darken"),
-            ("Pixelate",        "Mosaic effect"),
+            ("Pixelate",        "Mosaic blocks"),
             ("Glow",            "Soft bloom"),
             ("Drop Shadow",     "Layer shadow"),
-            ("Mirror",          "Reflection"),
+            ("Chroma Key",      "Green-screen removal"),
+            ("Invert",          "Negative colors"),
+            ("Grayscale",       "Desaturate to gray"),
+            ("Sepia",           "Warm tone wash"),
+            ("Edge Detect",     "Outline edges"),
+            ("Posterize",       "Quantize colors"),
+            ("Emboss",          "Raised relief"),
+            ("Hue Rotate",      "Shift hues 0–360°"),
         })
         {
             var effectName = name;
@@ -2398,6 +2428,25 @@ public sealed partial class EditorPage : Page
         UpdateInspector(null);
         Timeline.Refresh();
         RefreshPresentation();
+    }
+
+    private void OnTimelineAddKeyframeRequested(object? sender,
+        (TimelineClip Clip, ClipEffect Fx, string ParamKey) args)
+    {
+        AddKeyframeAtPlayhead(args.Clip, args.Fx, args.ParamKey);
+        // Make sure the clip is selected so the inspector reflects the change.
+        if (_vm is not null && !ReferenceEquals(_vm.SelectedClip, args.Clip))
+        {
+            _vm.SelectedClip = args.Clip;
+            UpdateClipHeader(args.Clip);
+            UpdatePreviewOverlay(args.Clip);
+        }
+    }
+
+    private void OnTimelineKeyframeSelectionChanged(object? sender, EventArgs e)
+    {
+        if (_vm?.SelectedClip is { } clip && _vm.InspectorTab == "automations")
+            UpdateInspector(clip);
     }
 
     private void UpdatePreviewOverlay(TimelineClip clip)
@@ -2758,16 +2807,31 @@ public sealed partial class EditorPage : Page
     private static string FormatHms(TimeSpan ts) =>
         $"{(int)ts.TotalHours:D2}:{ts.Minutes:D2}:{ts.Seconds:D2}:{(int)(ts.Milliseconds / 41.667):D2}";
 
+    private void ShowInspectorLayout(bool automations)
+    {
+        InspectorScrollViewer.Visibility = automations ? Visibility.Collapsed : Visibility.Visible;
+        AutomationsLayout.Visibility     = automations ? Visibility.Visible   : Visibility.Collapsed;
+    }
+
     private void UpdateInspector(TimelineClip? clip)
     {
         InspectorContent.Children.Clear();
-        if (clip is null || _vm is null) return;
+        AutomationsListPanel.Children.Clear();
+        AutomationsEditorPanel.Children.Clear();
+        if (clip is null || _vm is null)
+        {
+            ShowInspectorLayout(automations: false);
+            return;
+        }
+
+        ShowInspectorLayout(automations: _vm.InspectorTab == "automations");
 
         switch (_vm.InspectorTab)
         {
-            case "audio":   BuildInspectorAudio(clip);   break;
-            case "effects": BuildInspectorEffects(clip); break;
-            case "color":   BuildInspectorColor(clip);   break;
+            case "audio":       BuildInspectorAudio(clip);       break;
+            case "effects":     BuildInspectorEffects(clip);     break;
+            case "color":       BuildInspectorColor(clip);       break;
+            case "automations": BuildInspectorAutomations(clip); break;
             default:        BuildInspectorVideo(clip);   break;
         }
     }
@@ -3427,16 +3491,9 @@ public sealed partial class EditorPage : Page
 
     private void BuildInspectorEffects(TimelineClip clip)
     {
-        InspectorContent.Children.Add(MakeInspSectionHeader("APPLIED"));
-        if (clip.Effects.Count == 0)
-            AddInspField("Effects", "None");
-        else
-            foreach (var fx in clip.Effects)
-                InspectorContent.Children.Add(MakeAppliedEffectRow(clip, fx));
-
-        InspectorContent.Children.Add(MakeInspSectionHeader("AVAILABLE"));
-        foreach (var name in AvailableVideoEffects)
-            InspectorContent.Children.Add(MakeEffectRow(name, () => AddEffectToSelected(name)));
+        InspectorContent.Children.Add(MakeInspSectionHeader("EFFECTS"));
+        foreach (var name in ClipEffectsChain.AvailableVideoEffects)
+            InspectorContent.Children.Add(MakeEffectToggleRow(clip, name));
     }
 
     private void BuildInspectorColor(TimelineClip clip)
@@ -3456,57 +3513,518 @@ public sealed partial class EditorPage : Page
         AddInspSlider("Gain",  clip.ColorGain, -50, 50, v => clip.ColorGain = v);
     }
 
-    private static readonly string[] AvailableVideoEffects =
+    /// <summary>Flat-list automations browser: every keyframe across every effect
+    /// parameter on the clip, sorted by time. Click selects, Ctrl-click toggles
+    /// multi-select, selection is shared with the timeline (diamonds on the clip
+    /// highlight in sync). The bottom editor panel shows details for the current
+    /// selection so the user can adjust the value/time without losing the list.</summary>
+    private void BuildInspectorAutomations(TimelineClip clip)
     {
-        "Gaussian Blur", "Cross Dissolve", "Chroma Key",
-        "Sharpen", "Vignette", "Pixelate", "Glow", "Drop Shadow", "Mirror",
-    };
+        if (_vm is null) return;
 
-    private void AddEffectToSelected(string effectName)
-    {
-        if (_vm?.SelectedClip is not { } clip) return;
-        if (clip.Effects.Any(fx => fx.Name == effectName)) return; // dedupe
-        clip.Effects.Add(new ClipEffect { Name = effectName });
-        _vm.Project.IsModified = true;
-        UpdateInspector(clip);
+        // Enumerate every (effect, paramKey, keyframe) triple on the clip.
+        var rows = new List<(ClipEffect Fx, string Key, EffectKeyframe Kf)>();
+        foreach (var fx in clip.Effects)
+            foreach (var kv in fx.Keyframes)
+                foreach (var kf in kv.Value)
+                    rows.Add((fx, kv.Key, kf));
+        rows.Sort((a, b) => a.Kf.TimeRel.CompareTo(b.Kf.TimeRel));
+
+        // ── TOP: scrollable list ──────────────────────────────────────────
+        AutomationsListPanel.Children.Add(MakeInspSectionHeader("KEYFRAMES"));
+        AutomationsListPanel.Children.Add(MakeAutomationsToolbar(clip, rows));
+
+        if (rows.Count == 0)
+        {
+            var hint = new TextBlock
+            {
+                Text = "No keyframes yet. Right-click the clip on the timeline " +
+                       "and choose Add keyframe → [parameter], or use the diamond " +
+                       "toggle next to a parameter in the Effects tab.",
+                FontSize = 11,
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(14, 8, 14, 10),
+                Foreground = (Brush)Application.Current.Resources["TextMutedBrush"],
+            };
+            AutomationsListPanel.Children.Add(hint);
+        }
+        else
+        {
+            foreach (var (fx, key, kf) in rows)
+                AutomationsListPanel.Children.Add(MakeAutomationRow(clip, fx, key, kf));
+        }
+
+        // ── BOTTOM: details / editor for the current selection ────────────
+        BuildAutomationDetailsEditor(clip, rows);
     }
 
-    private UIElement MakeEffectRow(string name, Action onAdd)
+    /// <summary>Bottom-panel editor for the keyframe(s) currently selected. Shows
+    /// time + value sliders for a single selection; falls back to a bulk-edit
+    /// view (set-all + time-shift) for multi-selection; placeholder hint for
+    /// empty selection. Lives in <see cref="AutomationsEditorPanel"/> so the
+    /// keyframe list scrolls independently above it.</summary>
+    private void BuildAutomationDetailsEditor(TimelineClip clip,
+        IReadOnlyList<(ClipEffect Fx, string Key, EffectKeyframe Kf)> allRows)
     {
-        var grid = new Grid
+        if (_vm is null) return;
+
+        var sel = _vm.SelectedKeyframes;
+
+        // Map selected keyframes back to their owning (Fx, Key) triples so we can
+        // resolve parameter schema (label + min/max) for the editor sliders.
+        var selectedTriples = allRows.Where(t => sel.Contains(t.Kf)).ToList();
+
+        AutomationsEditorPanel.Children.Add(MakeInspSectionHeader("DETAILS"));
+
+        if (selectedTriples.Count == 0)
+        {
+            AutomationsEditorPanel.Children.Add(new TextBlock
+            {
+                Text = "Select a keyframe above or click a diamond on the clip to edit its value and time.",
+                FontSize = 11,
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(14, 8, 14, 10),
+                Foreground = (Brush)Application.Current.Resources["TextMutedBrush"],
+            });
+            return;
+        }
+
+        if (selectedTriples.Count == 1)
+        {
+            var (fx, key, kf) = selectedTriples[0];
+            var schema = ClipEffectsChain.NumberParams(fx.Name).FirstOrDefault(p => p.Key == key);
+            var label  = !string.IsNullOrEmpty(schema.Label) ? schema.Label : key;
+            double min = !string.IsNullOrEmpty(schema.Key)   ? schema.Min   : 0;
+            double max = !string.IsNullOrEmpty(schema.Key)   ? schema.Max   : 1;
+
+            // Header row: hue dot · "Effect · Param"
+            var header = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, Margin = new Thickness(14, 6, 14, 0) };
+            header.Children.Add(new Ellipse
+            {
+                Width = 10, Height = 10,
+                Fill = new SolidColorBrush(KeyframeHueFor(fx.Name, key)),
+                VerticalAlignment = VerticalAlignment.Center,
+            });
+            header.Children.Add(new TextBlock
+            {
+                Text = $"{fx.Name} · {label}",
+                FontSize = 11,
+                FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+                Foreground = (Brush)Application.Current.Resources["TextPrimaryBrush"],
+                VerticalAlignment = VerticalAlignment.Center,
+            });
+            AutomationsEditorPanel.Children.Add(header);
+
+            // Value slider — bound to the keyframe's value
+            AutomationsEditorPanel.Children.Add(MakeNamedSliderRow("Value", min, max, kf.Value, v =>
+            {
+                kf.Value = v;
+                _vm.Project.IsModified = true;
+                // Refresh the corresponding row in the list so its value updates.
+                UpdateInspector(clip);
+            }));
+
+            // Time slider — 0..1 within clip duration. Show absolute timecode beside.
+            AutomationsEditorPanel.Children.Add(MakeKeyframeTimeRow(clip, kf));
+
+            // Delete button
+            var deleteBtn = new Button
+            {
+                Content = "Delete this keyframe",
+                FontSize = 11,
+                Margin = new Thickness(14, 8, 14, 10),
+                HorizontalAlignment = HorizontalAlignment.Stretch,
+                Style = (Style)Application.Current.Resources["GhostButtonStyle"],
+            };
+            deleteBtn.Click += (_, _) => BulkDeleteSelectedKeyframes(clip);
+            AutomationsEditorPanel.Children.Add(deleteBtn);
+        }
+        else
+        {
+            AutomationsEditorPanel.Children.Add(new TextBlock
+            {
+                Text = $"{selectedTriples.Count} keyframes selected",
+                FontSize = 11,
+                FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+                Margin = new Thickness(14, 6, 14, 4),
+                Foreground = (Brush)Application.Current.Resources["TextPrimaryBrush"],
+            });
+            AutomationsEditorPanel.Children.Add(new TextBlock
+            {
+                Text = "Use the toolbar above to delete, nudge, or set a common value. " +
+                       "Pick a single keyframe to edit its value and time precisely.",
+                FontSize = 11,
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(14, 0, 14, 10),
+                Foreground = (Brush)Application.Current.Resources["TextMutedBrush"],
+            });
+        }
+    }
+
+    /// <summary>Slider row with label + live value readout — shared between the
+    /// Value slider and the helpers in the details editor.</summary>
+    private UIElement MakeNamedSliderRow(string label, double min, double max,
+                                         double current, Action<double> onChange)
+    {
+        var panel = new StackPanel { Padding = new Thickness(14, 6, 14, 0), Spacing = 1 };
+        var head = new Grid
         {
             ColumnDefinitions =
             {
                 new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) },
                 new ColumnDefinition { Width = GridLength.Auto },
             },
-            Padding = new Thickness(14, 5, 14, 5),
         };
         var lbl = new TextBlock
         {
-            Text = name,
-            FontSize = 11,
-            Foreground = (Brush)Application.Current.Resources["TextDimBrush"],
-            VerticalAlignment = VerticalAlignment.Center,
+            Text = label,
+            FontSize = 10,
+            Foreground = (Brush)Application.Current.Resources["TextMutedBrush"],
         };
-        var addBtn = new Button
+        var valLbl = new TextBlock
         {
-            Content = "＋",
-            Padding = new Thickness(8, 1, 8, 1),
-            FontSize = 11,
-            Style = (Style)Application.Current.Resources["GhostButtonStyle"],
+            Text = FormatEffectNumber(current),
+            FontSize = 10,
+            FontFamily = new FontFamily("JetBrains Mono, Consolas"),
+            Foreground = (Brush)Application.Current.Resources["TextDimBrush"],
         };
-        addBtn.Click += (_, _) => onAdd();
-        grid.Children.Add(lbl);
+        head.Children.Add(lbl);
         Grid.SetColumn(lbl, 0);
-        grid.Children.Add(addBtn);
-        Grid.SetColumn(addBtn, 1);
-        return grid;
+        head.Children.Add(valLbl);
+        Grid.SetColumn(valLbl, 1);
+
+        panel.Children.Add(head);
+        panel.Children.Add(MakeBareSlider(min, max, current, v =>
+        {
+            valLbl.Text = FormatEffectNumber(v);
+            onChange(v);
+        }));
+        return panel;
     }
 
-    private UIElement MakeAppliedEffectRow(TimelineClip clip, ClipEffect fx)
+    /// <summary>"Time" row in the keyframe details editor — slider 0..1 with a
+    /// live absolute-timecode label beside it so the user can see where on the
+    /// timeline the keyframe sits while dragging.</summary>
+    private UIElement MakeKeyframeTimeRow(TimelineClip clip, EffectKeyframe kf)
     {
-        var panel = new StackPanel { Padding = new Thickness(14, 4, 14, 6), Spacing = 3 };
+        var panel = new StackPanel { Padding = new Thickness(14, 6, 14, 4), Spacing = 1 };
+        var head = new Grid
+        {
+            ColumnDefinitions =
+            {
+                new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) },
+                new ColumnDefinition { Width = GridLength.Auto },
+            },
+        };
+        var lbl = new TextBlock
+        {
+            Text = "Time",
+            FontSize = 10,
+            Foreground = (Brush)Application.Current.Resources["TextMutedBrush"],
+        };
+        TimeSpan AbsTime(double rel) =>
+            clip.TimelineStart + TimeSpan.FromSeconds(rel * clip.Duration.TotalSeconds);
+        var valLbl = new TextBlock
+        {
+            Text = FormatHms(AbsTime(kf.TimeRel)),
+            FontSize = 10,
+            FontFamily = new FontFamily("JetBrains Mono, Consolas"),
+            Foreground = (Brush)Application.Current.Resources["TextDimBrush"],
+        };
+        head.Children.Add(lbl);
+        Grid.SetColumn(lbl, 0);
+        head.Children.Add(valLbl);
+        Grid.SetColumn(valLbl, 1);
+
+        panel.Children.Add(head);
+        panel.Children.Add(MakeBareSlider(0, 1, kf.TimeRel, v =>
+        {
+            kf.TimeRel = Math.Clamp(v, 0, 1);
+            valLbl.Text = FormatHms(AbsTime(kf.TimeRel));
+            if (_vm is not null) _vm.Project.IsModified = true;
+            Timeline.Refresh();
+        }));
+        return panel;
+    }
+
+    private UIElement MakeAutomationsToolbar(TimelineClip clip,
+        IReadOnlyList<(ClipEffect Fx, string Key, EffectKeyframe Kf)> rows)
+    {
+        var selCount = _vm?.SelectedKeyframes.Count ?? 0;
+
+        var summary = new TextBlock
+        {
+            Text = $"{rows.Count} keyframe(s) · {selCount} selected",
+            FontSize = 10,
+            VerticalAlignment = VerticalAlignment.Center,
+            Foreground = (Brush)Application.Current.Resources["TextMutedBrush"],
+        };
+
+        var actions = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 4 };
+
+        var delBtn = MakeBulkActionButton("Delete", selCount > 0, () => BulkDeleteSelectedKeyframes(clip));
+        var nudgeBackBtn = MakeBulkActionButton("◀ 1f", selCount > 0, () => BulkNudgeSelectedKeyframes(clip, -1));
+        var nudgeFwdBtn = MakeBulkActionButton("1f ▶", selCount > 0, () => BulkNudgeSelectedKeyframes(clip, +1));
+        var setValBtn = MakeBulkActionButton("Set value…", selCount > 0, () => BulkSetSelectedKeyframeValue(clip));
+        var clearBtn = MakeBulkActionButton("Clear sel.", selCount > 0, () => { _vm?.ClearKeyframeSelection(); UpdateInspector(clip); Timeline.Refresh(); });
+
+        actions.Children.Add(nudgeBackBtn);
+        actions.Children.Add(nudgeFwdBtn);
+        actions.Children.Add(setValBtn);
+        actions.Children.Add(delBtn);
+        actions.Children.Add(clearBtn);
+
+        var grid = new Grid
+        {
+            Padding = new Thickness(14, 4, 14, 6),
+            ColumnDefinitions =
+            {
+                new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) },
+                new ColumnDefinition { Width = GridLength.Auto },
+            },
+        };
+        grid.Children.Add(summary);
+        Grid.SetColumn(summary, 0);
+        grid.Children.Add(actions);
+        Grid.SetColumn(actions, 1);
+
+        var outer = new StackPanel { Spacing = 0 };
+        outer.Children.Add(grid);
+        return outer;
+    }
+
+    private Button MakeBulkActionButton(string label, bool enabled, Action onClick)
+    {
+        var btn = new Button
+        {
+            Content = label,
+            FontSize = 10,
+            Padding = new Thickness(6, 1, 6, 1),
+            MinWidth = 0,
+            IsEnabled = enabled,
+            Style = (Style)Application.Current.Resources["GhostButtonStyle"],
+        };
+        btn.Click += (_, _) => onClick();
+        return btn;
+    }
+
+    private UIElement MakeAutomationRow(TimelineClip clip, ClipEffect fx, string paramKey, EffectKeyframe kf)
+    {
+        bool selected = _vm?.SelectedKeyframes.Contains(kf) == true;
+        var accent = (Brush)Application.Current.Resources["AccentBrush"];
+        var hairline = (Brush)Application.Current.Resources["HairlineBrush"];
+
+        // Lookup the parameter's label + range so we can display friendly names
+        // and constrain the inline value editor.
+        var allParams = ClipEffectsChain.NumberParams(fx.Name);
+        var paramSchema = allParams.FirstOrDefault(p => p.Key == paramKey);
+        string paramLabel = !string.IsNullOrEmpty(paramSchema.Label) ? paramSchema.Label : paramKey;
+
+        // Stable per-parameter accent hue (matches the timeline diamond hue) so
+        // a user can connect the row to the marker on the clip visually.
+        var hue = KeyframeHueFor(fx.Name, paramKey);
+
+        var accentColor = accent is SolidColorBrush sb
+            ? Color.FromArgb(70, sb.Color.R, sb.Color.G, sb.Color.B)
+            : Color.FromArgb(70, 127, 176, 105);
+        var border = new Border
+        {
+            Background = selected ? new SolidColorBrush(accentColor) : null,
+            BorderBrush = selected ? accent : hairline,
+            BorderThickness = new Thickness(selected ? 1.5 : 0, 0, 0, 1),
+            Padding = new Thickness(14, 5, 8, 5),
+        };
+
+        var row = new Grid
+        {
+            ColumnDefinitions =
+            {
+                new ColumnDefinition { Width = new GridLength(10) },                          // hue dot
+                new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) },        // effect · param
+                new ColumnDefinition { Width = new GridLength(48) },                          // time
+                new ColumnDefinition { Width = new GridLength(56) },                          // value
+            },
+        };
+
+        var dot = new Ellipse
+        {
+            Width = 8,
+            Height = 8,
+            Fill = new SolidColorBrush(hue),
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        row.Children.Add(dot);
+        Grid.SetColumn(dot, 0);
+
+        var nameLbl = new TextBlock
+        {
+            Text = $"{fx.Name} · {paramLabel}",
+            FontSize = 11,
+            Foreground = (Brush)Application.Current.Resources["TextPrimaryBrush"],
+            VerticalAlignment = VerticalAlignment.Center,
+            TextTrimming = TextTrimming.CharacterEllipsis,
+            Margin = new Thickness(6, 0, 6, 0),
+        };
+        row.Children.Add(nameLbl);
+        Grid.SetColumn(nameLbl, 1);
+
+        var timeLbl = new TextBlock
+        {
+            Text = FormatHms(clip.TimelineStart + TimeSpan.FromSeconds(kf.TimeRel * clip.Duration.TotalSeconds)),
+            FontSize = 10,
+            FontFamily = new FontFamily("JetBrains Mono, Consolas"),
+            Foreground = (Brush)Application.Current.Resources["TextMutedBrush"],
+            VerticalAlignment = VerticalAlignment.Center,
+            TextAlignment = TextAlignment.Right,
+        };
+        row.Children.Add(timeLbl);
+        Grid.SetColumn(timeLbl, 2);
+
+        var valLbl = new TextBlock
+        {
+            Text = FormatEffectNumber(kf.Value),
+            FontSize = 10,
+            FontFamily = new FontFamily("JetBrains Mono, Consolas"),
+            Foreground = (Brush)Application.Current.Resources["TextPrimaryBrush"],
+            VerticalAlignment = VerticalAlignment.Center,
+            TextAlignment = TextAlignment.Right,
+            Margin = new Thickness(0, 0, 4, 0),
+        };
+        row.Children.Add(valLbl);
+        Grid.SetColumn(valLbl, 3);
+
+        border.Child = row;
+
+        // Click to select. Ctrl/Shift = additive. Also jumps the playhead to the
+        // keyframe so the user can see the value applied in the preview.
+        border.PointerPressed += (_, e) =>
+        {
+            if (_vm is null) return;
+            var ctrl  = (Microsoft.UI.Input.InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.Control)
+                            & Windows.UI.Core.CoreVirtualKeyStates.Down) != 0;
+            var shift = (Microsoft.UI.Input.InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.Shift)
+                            & Windows.UI.Core.CoreVirtualKeyStates.Down) != 0;
+            _vm.SetKeyframeSelection(kf, ctrl || shift);
+            _vm.Project.Playhead = clip.TimelineStart + TimeSpan.FromSeconds(kf.TimeRel * clip.Duration.TotalSeconds);
+            UpdateInspector(clip);
+            Timeline.Refresh();
+            e.Handled = true;
+        };
+
+        return border;
+    }
+
+    // Hue helper moved to BTAP.Services.KeyframeColors so TimelineControl can
+    // share the same palette for the diamond overlays. Local alias for brevity.
+    private static Color KeyframeHueFor(string effectName, string paramKey) =>
+        KeyframeColors.HueFor(effectName, paramKey);
+
+    private void BulkDeleteSelectedKeyframes(TimelineClip clip)
+    {
+        if (_vm is null || _vm.SelectedKeyframes.Count == 0) return;
+        var targets = _vm.SelectedKeyframes.ToList();
+        foreach (var fx in clip.Effects)
+        {
+            foreach (var key in fx.Keyframes.Keys.ToList())
+            {
+                var list = fx.Keyframes[key];
+                for (int i = list.Count - 1; i >= 0; i--)
+                    if (targets.Contains(list[i])) list.RemoveAt(i);
+                if (list.Count == 0) fx.Keyframes.Remove(key);
+            }
+        }
+        _vm.SelectedKeyframes.Clear();
+        _vm.Project.IsModified = true;
+        UpdateInspector(clip);
+        Timeline.Refresh();
+    }
+
+    private void BulkNudgeSelectedKeyframes(TimelineClip clip, int frames)
+    {
+        if (_vm is null || _vm.SelectedKeyframes.Count == 0) return;
+        if (clip.Duration.TotalSeconds <= 0) return;
+        double deltaRel = (frames / Math.Max(1, _vm.Project.FrameRate)) / clip.Duration.TotalSeconds;
+        foreach (var kf in _vm.SelectedKeyframes)
+            kf.TimeRel = Math.Clamp(kf.TimeRel + deltaRel, 0, 1);
+        _vm.Project.IsModified = true;
+        UpdateInspector(clip);
+        Timeline.Refresh();
+    }
+
+    private async void BulkSetSelectedKeyframeValue(TimelineClip clip)
+    {
+        if (_vm is null || _vm.SelectedKeyframes.Count == 0) return;
+        var dialog = new ContentDialog
+        {
+            Title = "Set value for selected keyframes",
+            CloseButtonText = "Cancel",
+            PrimaryButtonText = "Apply",
+            DefaultButton = ContentDialogButton.Primary,
+            XamlRoot = XamlRoot,
+        };
+        var box = new TextBox
+        {
+            PlaceholderText = "Numeric value (e.g. 25 or 0.5)",
+            Text = FormatEffectNumber(_vm.SelectedKeyframes.First().Value),
+        };
+        dialog.Content = box;
+        var result = await dialog.ShowAsync();
+        if (result != ContentDialogResult.Primary) return;
+        if (!double.TryParse(box.Text, System.Globalization.CultureInfo.InvariantCulture, out double value)) return;
+        foreach (var kf in _vm.SelectedKeyframes) kf.Value = value;
+        _vm.Project.IsModified = true;
+        UpdateInspector(clip);
+        Timeline.Refresh();
+    }
+
+    /// <summary>Adds a keyframe to the given parameter at the current playhead,
+    /// using the currently-interpolated value as the initial keyframe value (so
+    /// adding a keyframe doesn't visually change the effect at that moment).</summary>
+    public void AddKeyframeAtPlayhead(TimelineClip clip, ClipEffect fx, string paramKey)
+    {
+        if (_vm is null) return;
+        if (clip.Duration.TotalSeconds <= 0) return;
+        double timeRel = Math.Clamp((_vm.Project.Playhead - clip.TimelineStart).TotalSeconds / clip.Duration.TotalSeconds, 0, 1);
+        var schema = ClipEffectsChain.NumberParams(fx.Name).FirstOrDefault(p => p.Key == paramKey);
+        double @default = !string.IsNullOrEmpty(schema.Key) ? schema.Default : 0;
+        double value = fx.GetAutomatedNumber(paramKey, timeRel, @default);
+
+        if (!fx.Keyframes.TryGetValue(paramKey, out var list))
+        {
+            list = new System.Collections.ObjectModel.ObservableCollection<EffectKeyframe>();
+            fx.Keyframes[paramKey] = list;
+        }
+        // Avoid stacking duplicates exactly at the same time — replace instead.
+        var existing = list.FirstOrDefault(k => Math.Abs(k.TimeRel - timeRel) < 0.0005);
+        if (existing is not null) existing.Value = value;
+        else list.Add(new EffectKeyframe { TimeRel = timeRel, Value = value });
+
+        _vm.Project.IsModified = true;
+        UpdateInspector(clip);
+        Timeline.Refresh();
+    }
+
+    /// <summary>Click-to-enable behavior used by the media-library Effects panel
+    /// cards. Adds the effect to the selected clip with defaults, or re-enables it
+    /// if it was previously toggled off (keeping the user's tuned parameters).</summary>
+    private void AddEffectToSelected(string effectName)
+    {
+        if (_vm?.SelectedClip is not { } clip) return;
+        var existing = clip.Effects.FirstOrDefault(fx => fx.Name == effectName);
+        if (existing is not null)
+            existing.Enabled = true;
+        else
+            clip.Effects.Add(new ClipEffect { Name = effectName, Enabled = true });
+        _vm.Project.IsModified = true;
+        UpdateInspector(clip);
+    }
+
+    private UIElement MakeEffectToggleRow(TimelineClip clip, string effectName)
+    {
+        var fx = clip.Effects.FirstOrDefault(f => f.Name == effectName);
+        bool isOn = fx is { Enabled: true };
+
+        var outer = new StackPanel { Spacing = 0 };
 
         var header = new Grid
         {
@@ -3515,45 +4033,594 @@ public sealed partial class EditorPage : Page
                 new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) },
                 new ColumnDefinition { Width = GridLength.Auto },
             },
+            Padding = new Thickness(14, 4, 8, 2),
         };
-        var name = new TextBlock
+
+        var label = new TextBlock
         {
-            Text = fx.Name,
+            Text = effectName,
             FontSize = 11,
-            FontWeight = Microsoft.UI.Text.FontWeights.Medium,
-            Foreground = (Brush)Application.Current.Resources["TextPrimaryBrush"],
+            FontWeight = isOn ? Microsoft.UI.Text.FontWeights.SemiBold : Microsoft.UI.Text.FontWeights.Normal,
+            Foreground = isOn
+                ? (Brush)Application.Current.Resources["TextPrimaryBrush"]
+                : (Brush)Application.Current.Resources["TextDimBrush"],
             VerticalAlignment = VerticalAlignment.Center,
         };
-        var removeBtn = new Button
+
+        // Clear OnContent/OffContent so the switch reads as a compact pill without
+        // the default "On"/"Off" text taking ~40px of horizontal space.
+        var toggle = new ToggleSwitch
         {
-            Content = "✕",
-            FontSize = 10,
-            Padding = new Thickness(6, 0, 6, 0),
-            Style = (Style)Application.Current.Resources["GhostButtonStyle"],
+            IsOn = isOn,
+            OnContent = string.Empty,
+            OffContent = string.Empty,
+            MinWidth = 0,
+            Padding = new Thickness(0),
+            VerticalAlignment = VerticalAlignment.Center,
         };
-        removeBtn.Click += (_, _) =>
+        toggle.Toggled += (_, _) =>
         {
-            clip.Effects.Remove(fx);
-            if (_vm is not null) _vm.Project.IsModified = true;
+            SetEffectEnabledOnClip(clip, effectName, toggle.IsOn);
             UpdateInspector(clip);
         };
-        header.Children.Add(name);
-        Grid.SetColumn(name, 0);
-        header.Children.Add(removeBtn);
-        Grid.SetColumn(removeBtn, 1);
 
+        header.Children.Add(label);
+        Grid.SetColumn(label, 0);
+        header.Children.Add(toggle);
+        Grid.SetColumn(toggle, 1);
+
+        outer.Children.Add(header);
+
+        if (isOn && fx is not null)
+        {
+            var optionsContainer = new Border
+            {
+                Margin = new Thickness(14, 2, 14, 8),
+                Padding = new Thickness(10, 6, 10, 8),
+                Background = new SolidColorBrush(Color.FromArgb(40, 14, 22, 28)),
+                CornerRadius = new CornerRadius(4),
+            };
+            var options = new StackPanel { Spacing = 6 };
+            AppendEffectOptions(options, fx);
+            optionsContainer.Child = options;
+            outer.Children.Add(optionsContainer);
+        }
+
+        return outer;
+    }
+
+    private void SetEffectEnabledOnClip(TimelineClip clip, string effectName, bool enabled)
+    {
+        var fx = clip.Effects.FirstOrDefault(f => f.Name == effectName);
+        if (enabled)
+        {
+            if (fx is null)
+                clip.Effects.Add(new ClipEffect { Name = effectName, Enabled = true });
+            else
+                fx.Enabled = true;
+        }
+        else if (fx is not null)
+        {
+            fx.Enabled = false;
+        }
+        if (_vm is not null) _vm.Project.IsModified = true;
+    }
+
+    private void AppendEffectOptions(StackPanel parent, ClipEffect fx)
+    {
+        foreach (var sp in ClipEffectsChain.StringParams(fx.Name))
+            parent.Children.Add(MakeEffectColorRow(fx, sp));
+
+        foreach (var np in ClipEffectsChain.NumberParams(fx.Name))
+            parent.Children.Add(MakeEffectNumberSlider(fx, np));
+
+        if (ClipEffectsChain.NumberParams(fx.Name).Count == 0
+            && ClipEffectsChain.StringParams(fx.Name).Count == 0)
+        {
+            parent.Children.Add(new TextBlock
+            {
+                Text = "No parameters",
+                FontSize = 10,
+                Foreground = (Brush)Application.Current.Resources["TextMutedBrush"],
+            });
+        }
+    }
+
+    private UIElement MakeEffectNumberSlider(ClipEffect fx, ClipEffectsChain.NumberParam p)
+    {
+        bool isAnimated = fx.IsAnimated(p.Key);
+        var panel = new StackPanel { Spacing = 1 };
+
+        var labelRow = new Grid
+        {
+            ColumnDefinitions =
+            {
+                new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) },
+                new ColumnDefinition { Width = GridLength.Auto },
+                new ColumnDefinition { Width = GridLength.Auto },
+            },
+        };
+        var lbl = new TextBlock
+        {
+            Text = p.Label,
+            FontSize = 10,
+            Foreground = (Brush)Application.Current.Resources["TextMutedBrush"],
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        double current = fx.GetNumber(p.Key, p.Default);
+
+        // Header value: when animated, show "start → end" so the user sees both
+        // endpoints at a glance without expanding anything. Otherwise just the
+        // single static value.
+        var valLbl = new TextBlock
+        {
+            Text = isAnimated
+                ? $"{FormatEffectNumber(fx.Keyframes[p.Key][0].Value)} → {FormatEffectNumber(fx.Keyframes[p.Key][^1].Value)}"
+                : FormatEffectNumber(current),
+            FontSize = 10,
+            FontFamily = new FontFamily("JetBrains Mono, Consolas"),
+            Foreground = (Brush)Application.Current.Resources["TextDimBrush"],
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(0, 0, 6, 0),
+        };
+
+        // Animate toggle button — small diamond icon, accent-colored when active.
+        // Toggling on seeds a two-keyframe automation (start + end) at the current
+        // static value; toggling off removes the keyframes (static value remains).
+        var animBtn = new Button
+        {
+            Content = MakeKeyframeIcon(isAnimated),
+            Padding = new Thickness(3, 0, 3, 0),
+            MinWidth = 20,
+            Height = 18,
+            Style = (Style)Application.Current.Resources["GhostButtonStyle"],
+        };
+        ToolTipService.SetToolTip(animBtn, isAnimated
+            ? "Animation on · click to remove keyframes"
+            : "Animate this parameter from a start value to an end value");
+        animBtn.Click += (_, _) =>
+        {
+            if (fx.IsAnimated(p.Key))
+                fx.StopAnimation(p.Key);
+            else
+                fx.StartAnimation(p.Key, current, current);
+            if (_vm is not null) _vm.Project.IsModified = true;
+            if (_vm?.SelectedClip is { } sel) UpdateInspector(sel);
+        };
+
+        labelRow.Children.Add(lbl);
+        Grid.SetColumn(lbl, 0);
+        labelRow.Children.Add(valLbl);
+        Grid.SetColumn(valLbl, 1);
+        labelRow.Children.Add(animBtn);
+        Grid.SetColumn(animBtn, 2);
+        panel.Children.Add(labelRow);
+
+        if (!isAnimated)
+        {
+            panel.Children.Add(MakeBareSlider(p.Min, p.Max, current, v =>
+            {
+                fx.SetNumber(p.Key, v);
+                valLbl.Text = FormatEffectNumber(v);
+                if (_vm is not null) _vm.Project.IsModified = true;
+            }));
+        }
+        else
+        {
+            // Two-keyframe automation: edit start (TimeRel=0) and end (TimeRel=1)
+            // values. Storage is a list to leave room for arbitrary keyframes in a
+            // future version; the inspector just shows the first/last entries.
+            var kfs = fx.Keyframes[p.Key];
+            var startKf = kfs[0];
+            var endKf   = kfs[^1];
+
+            panel.Children.Add(MakeAutomationEndpointRow("Start", p.Min, p.Max, startKf.Value, v =>
+            {
+                startKf.Value = v;
+                valLbl.Text = $"{FormatEffectNumber(startKf.Value)} → {FormatEffectNumber(endKf.Value)}";
+                if (_vm is not null) _vm.Project.IsModified = true;
+            }));
+            panel.Children.Add(MakeAutomationEndpointRow("End", p.Min, p.Max, endKf.Value, v =>
+            {
+                endKf.Value = v;
+                valLbl.Text = $"{FormatEffectNumber(startKf.Value)} → {FormatEffectNumber(endKf.Value)}";
+                if (_vm is not null) _vm.Project.IsModified = true;
+            }));
+        }
+
+        return panel;
+    }
+
+    /// <summary>Compact slider with no surrounding label — used as the inner
+    /// editor inside MakeEffectNumberSlider and the automation endpoint rows.</summary>
+    private Slider MakeBareSlider(double min, double max, double value, Action<double> onChange)
+    {
+        double range = max - min;
         var slider = new Slider
         {
-            Minimum = 0,
-            Maximum = 100,
-            Value   = fx.Intensity * 100,
-            Style   = (Style)Application.Current.Resources["BtapSliderStyle"],
+            Minimum = min,
+            Maximum = max,
+            Value   = value,
+            Foreground = (Brush)Application.Current.Resources["AccentBrush"],
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            StepFrequency = range > 20 ? 1 : 0.01,
+            SmallChange   = range > 20 ? 1 : 0.01,
+            Margin = new Thickness(0, -4, 0, -8),
         };
-        slider.ValueChanged += (_, ev) => fx.Intensity = ev.NewValue / 100.0;
+        slider.ValueChanged += (_, ev) => onChange(ev.NewValue);
+        return slider;
+    }
 
-        panel.Children.Add(header);
-        panel.Children.Add(slider);
+    /// <summary>Indented Start / End row used when a parameter is animated.</summary>
+    private UIElement MakeAutomationEndpointRow(string label, double min, double max,
+                                                double value, Action<double> onChange)
+    {
+        var stack = new StackPanel { Spacing = 0, Margin = new Thickness(10, 0, 0, 0) };
+
+        var head = new Grid
+        {
+            ColumnDefinitions =
+            {
+                new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) },
+                new ColumnDefinition { Width = GridLength.Auto },
+            },
+        };
+        var lbl = new TextBlock
+        {
+            Text = label,
+            FontSize = 9.5,
+            Foreground = (Brush)Application.Current.Resources["TextFaintBrush"],
+        };
+        var valLbl = new TextBlock
+        {
+            Text = FormatEffectNumber(value),
+            FontSize = 9.5,
+            FontFamily = new FontFamily("JetBrains Mono, Consolas"),
+            Foreground = (Brush)Application.Current.Resources["TextDimBrush"],
+        };
+        head.Children.Add(lbl);
+        Grid.SetColumn(lbl, 0);
+        head.Children.Add(valLbl);
+        Grid.SetColumn(valLbl, 1);
+        stack.Children.Add(head);
+        stack.Children.Add(MakeBareSlider(min, max, value, v =>
+        {
+            valLbl.Text = FormatEffectNumber(v);
+            onChange(v);
+        }));
+        return stack;
+    }
+
+    /// <summary>Tiny diamond — the conventional keyframe marker. Filled with the
+    /// accent color when the parameter is animated, just an outline otherwise.</summary>
+    private static UIElement MakeKeyframeIcon(bool active)
+    {
+        var fill = active
+            ? (Brush)Application.Current.Resources["AccentBrush"]
+            : (Brush)Application.Current.Resources["TransparentBrush"];
+        var stroke = active
+            ? (Brush)Application.Current.Resources["AccentBrush"]
+            : (Brush)Application.Current.Resources["TextMutedBrush"];
+        var diamond = new Rectangle
+        {
+            Width = 8,
+            Height = 8,
+            Fill = fill,
+            Stroke = stroke,
+            StrokeThickness = 1.2,
+            RenderTransformOrigin = new Windows.Foundation.Point(0.5, 0.5),
+            RenderTransform = new RotateTransform { Angle = 45 },
+        };
+        return diamond;
+    }
+
+    private static string FormatEffectNumber(double v) =>
+        Math.Abs(v) >= 10 ? v.ToString("F0") : v.ToString("F2");
+
+    private UIElement MakeEffectColorRow(ClipEffect fx, ClipEffectsChain.StringParam p)
+    {
+        var panel = new StackPanel { Spacing = 2 };
+        panel.Children.Add(new TextBlock
+        {
+            Text = p.Label,
+            FontSize = 10,
+            Foreground = (Brush)Application.Current.Resources["TextMutedBrush"],
+        });
+
+        var row = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 4 };
+        string current = fx.GetString(p.Key, p.Default);
+
+        // Current-color swatch (shows whatever's set — wheel/eyedrop pick won't
+        // match a preset, so this is the only swatch that always reflects truth).
+        var currentBrush = ParseColorBrush(current) ?? new SolidColorBrush(Microsoft.UI.Colors.White);
+        var currentSwatch = new Border
+        {
+            Width = 22,
+            Height = 18,
+            CornerRadius = new CornerRadius(3),
+            Background = currentBrush,
+            BorderBrush = (Brush)Application.Current.Resources["AccentBrush"],
+            BorderThickness = new Thickness(2),
+        };
+        ToolTipService.SetToolTip(currentSwatch, current);
+        row.Children.Add(currentSwatch);
+
+        // Thin separator between the live swatch and the preset palette.
+        row.Children.Add(new Border
+        {
+            Width = 1,
+            Height = 16,
+            Background = (Brush)Application.Current.Resources["HairlineBrush"],
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(2, 0, 2, 0),
+        });
+
+        foreach (var (lbl, hex) in EffectColorSwatches)
+        {
+            var fill = ParseColorBrush(hex) ?? new SolidColorBrush(Microsoft.UI.Colors.White);
+            bool isSelected = string.Equals(current, hex, StringComparison.OrdinalIgnoreCase);
+            var swatch = new Border
+            {
+                Width = 18,
+                Height = 18,
+                CornerRadius = new CornerRadius(3),
+                Background = fill,
+                BorderBrush = isSelected
+                    ? (Brush)Application.Current.Resources["AccentBrush"]
+                    : (Brush)Application.Current.Resources["HairlineBrush"],
+                BorderThickness = new Thickness(isSelected ? 2 : 1),
+            };
+            ToolTipService.SetToolTip(swatch, lbl);
+            var hexLocal = hex;
+            swatch.Tapped += (_, _) =>
+            {
+                fx.SetString(p.Key, hexLocal);
+                if (_vm is not null) _vm.Project.IsModified = true;
+                if (_vm?.SelectedClip is { } sel) UpdateInspector(sel);
+            };
+            row.Children.Add(swatch);
+        }
+
+        // Wheel button → opens a Flyout containing the WinUI ColorPicker so the
+        // user can pick any color outside the preset palette.
+        var wheelBtn = new Button
+        {
+            Content = MakeColorWheelIcon(),
+            Padding = new Thickness(4, 0, 4, 0),
+            MinWidth = 22,
+            Height = 20,
+            Style = (Style)Application.Current.Resources["GhostButtonStyle"],
+        };
+        ToolTipService.SetToolTip(wheelBtn, "Color wheel");
+        var picker = new ColorPicker
+        {
+            Color = ParseColor(current),
+            IsAlphaEnabled = false,
+            ColorSpectrumShape = ColorSpectrumShape.Ring,
+            IsMoreButtonVisible = true,
+        };
+        picker.ColorChanged += (_, e) =>
+        {
+            string hex = $"#{e.NewColor.A:X2}{e.NewColor.R:X2}{e.NewColor.G:X2}{e.NewColor.B:X2}";
+            fx.SetString(p.Key, hex);
+            currentSwatch.Background = new SolidColorBrush(e.NewColor);
+            ToolTipService.SetToolTip(currentSwatch, hex);
+            if (_vm is not null) _vm.Project.IsModified = true;
+        };
+        var wheelFlyout = new Flyout
+        {
+            Content = picker,
+            Placement = FlyoutPlacementMode.Bottom,
+        };
+        wheelFlyout.Closed += (_, _) =>
+        {
+            if (_vm?.SelectedClip is { } sel) UpdateInspector(sel); // refresh swatch highlight
+        };
+        wheelBtn.Flyout = wheelFlyout;
+        row.Children.Add(wheelBtn);
+
+        // Eye-dropper button → sample a pixel from the live preview by clicking
+        // anywhere on it. Lets the user pick the actual green of a chroma-keyed
+        // background instead of guessing from presets.
+        var eyedropBtn = new Button
+        {
+            Content = MakeEyedropperIcon(),
+            Padding = new Thickness(4, 0, 4, 0),
+            MinWidth = 22,
+            Height = 20,
+            Style = (Style)Application.Current.Resources["GhostButtonStyle"],
+        };
+        ToolTipService.SetToolTip(eyedropBtn, "Eye-dropper · click the preview to sample");
+        eyedropBtn.Click += (_, _) => BeginEyedrop(color =>
+        {
+            string hex = $"#{color.A:X2}{color.R:X2}{color.G:X2}{color.B:X2}";
+            fx.SetString(p.Key, hex);
+            if (_vm is not null) _vm.Project.IsModified = true;
+            if (_vm?.SelectedClip is { } sel) UpdateInspector(sel);
+        });
+        row.Children.Add(eyedropBtn);
+
+        panel.Children.Add(row);
         return panel;
+    }
+
+    private static Color ParseColor(string? hex)
+    {
+        if (string.IsNullOrWhiteSpace(hex)) return Microsoft.UI.Colors.White;
+        var s = hex.Trim().TrimStart('#');
+        if (s.Length == 6) s = "FF" + s;
+        if (s.Length != 8) return Microsoft.UI.Colors.White;
+        if (!byte.TryParse(s[..2],            System.Globalization.NumberStyles.HexNumber, null, out var a)) return Microsoft.UI.Colors.White;
+        if (!byte.TryParse(s.Substring(2, 2), System.Globalization.NumberStyles.HexNumber, null, out var r)) return Microsoft.UI.Colors.White;
+        if (!byte.TryParse(s.Substring(4, 2), System.Globalization.NumberStyles.HexNumber, null, out var g)) return Microsoft.UI.Colors.White;
+        if (!byte.TryParse(s.Substring(6, 2), System.Globalization.NumberStyles.HexNumber, null, out var b)) return Microsoft.UI.Colors.White;
+        return Color.FromArgb(a, r, g, b);
+    }
+
+    private static readonly (string Label, string Hex)[] EffectColorSwatches =
+    {
+        ("Black",   "#FF000000"),
+        ("White",   "#FFFFFFFF"),
+        ("Green",   "#FF00FF00"),
+        ("Blue",    "#FF0000FF"),
+        ("Red",     "#FFFF0000"),
+        ("Cyan",    "#FF00FFFF"),
+        ("Magenta", "#FFFF00FF"),
+        ("Yellow",  "#FFFFFF00"),
+    };
+
+    /// <summary>Tiny rainbow-circle icon that conveys "pick any color." Drawn from
+    /// XAML primitives instead of a font glyph so it renders the same on every
+    /// machine regardless of installed icon fonts.</summary>
+    private static UIElement MakeColorWheelIcon()
+    {
+        var gradient = new LinearGradientBrush
+        {
+            StartPoint = new Windows.Foundation.Point(0, 0),
+            EndPoint   = new Windows.Foundation.Point(1, 1),
+        };
+        gradient.GradientStops.Add(new GradientStop { Color = Color.FromArgb(255, 255,  80,  80), Offset = 0.00 });
+        gradient.GradientStops.Add(new GradientStop { Color = Color.FromArgb(255, 255, 200,  60), Offset = 0.20 });
+        gradient.GradientStops.Add(new GradientStop { Color = Color.FromArgb(255, 110, 220, 110), Offset = 0.40 });
+        gradient.GradientStops.Add(new GradientStop { Color = Color.FromArgb(255,  80, 200, 220), Offset = 0.60 });
+        gradient.GradientStops.Add(new GradientStop { Color = Color.FromArgb(255, 110, 110, 230), Offset = 0.80 });
+        gradient.GradientStops.Add(new GradientStop { Color = Color.FromArgb(255, 220,  90, 200), Offset = 1.00 });
+
+        return new Ellipse
+        {
+            Width = 12,
+            Height = 12,
+            Fill = gradient,
+            Stroke = (Brush)Application.Current.Resources["HairlineStrongBrush"],
+            StrokeThickness = 1,
+        };
+    }
+
+    /// <summary>Drawn eye-dropper glyph (rotated dropper outline + tip). Same
+    /// drawn-from-XAML reasoning as the wheel icon.</summary>
+    private static UIElement MakeEyedropperIcon()
+    {
+        var stroke = (Brush)Application.Current.Resources["TextPrimaryBrush"];
+        var canvas = new Microsoft.UI.Xaml.Controls.Canvas
+        {
+            Width = 14,
+            Height = 14,
+        };
+
+        // Barrel: thick diagonal line from upper-left to lower-right.
+        var barrel = new Line
+        {
+            X1 = 3, Y1 = 3, X2 = 10, Y2 = 10,
+            Stroke = stroke,
+            StrokeThickness = 2,
+            StrokeStartLineCap = PenLineCap.Round,
+            StrokeEndLineCap   = PenLineCap.Round,
+        };
+        canvas.Children.Add(barrel);
+
+        // Bulb: small square on the upper-left end of the barrel, rotated 45° so
+        // it reads as the dropper's reservoir.
+        var bulb = new Rectangle
+        {
+            Width = 6,
+            Height = 4,
+            Fill = stroke,
+            RadiusX = 1,
+            RadiusY = 1,
+            RenderTransformOrigin = new Windows.Foundation.Point(0.5, 0.5),
+            RenderTransform = new RotateTransform { Angle = 45 },
+        };
+        Microsoft.UI.Xaml.Controls.Canvas.SetLeft(bulb, -1);
+        Microsoft.UI.Xaml.Controls.Canvas.SetTop(bulb, 1);
+        canvas.Children.Add(bulb);
+
+        // Tip: small accent-colored droplet at the lower-right end.
+        var tip = new Ellipse
+        {
+            Width = 3,
+            Height = 3,
+            Fill = (Brush)Application.Current.Resources["AccentBrush"],
+        };
+        Microsoft.UI.Xaml.Controls.Canvas.SetLeft(tip, 9.5);
+        Microsoft.UI.Xaml.Controls.Canvas.SetTop(tip, 9.5);
+        canvas.Children.Add(tip);
+
+        return canvas;
+    }
+
+    /// <summary>Enter eye-dropper mode: drops a transparent capture overlay over
+    /// PreviewArea with a hint banner. The next click samples the pixel at that
+    /// position from VideoCompositor's rendered output and invokes
+    /// <paramref name="onPicked"/>. Esc cancels.</summary>
+    private void BeginEyedrop(Action<Color> onPicked)
+    {
+        EndEyedrop(); // collapse any prior session so callbacks don't stack
+
+        _eyedropCallback = onPicked;
+
+        var overlay = new Border
+        {
+            // Near-transparent fill (alpha 1) so the overlay is hit-testable —
+            // a fully-Transparent background would let clicks fall through.
+            Background = new SolidColorBrush(Color.FromArgb(1, 0, 0, 0)),
+            IsHitTestVisible = true,
+        };
+
+        var banner = new Border
+        {
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Top,
+            Margin = new Thickness(0, 10, 0, 0),
+            Padding = new Thickness(12, 6, 12, 6),
+            CornerRadius = new CornerRadius(4),
+            Background = new SolidColorBrush(Color.FromArgb(220, 14, 22, 28)),
+            BorderBrush = (Brush)Application.Current.Resources["AccentBrush"],
+            BorderThickness = new Thickness(1),
+            Child = new TextBlock
+            {
+                Text = "💧 Click anywhere on the preview to sample · Esc to cancel",
+                FontSize = 11,
+                Foreground = (Brush)Application.Current.Resources["TextPrimaryBrush"],
+            },
+        };
+        overlay.Child = banner;
+
+        overlay.PointerPressed += OnEyedropOverlayPressed;
+
+        PreviewArea.Children.Add(overlay);
+        _eyedropOverlay = overlay;
+    }
+
+    private void OnEyedropOverlayPressed(object sender, PointerRoutedEventArgs e)
+    {
+        if (_eyedropOverlay is null || _eyedropCallback is null) { EndEyedrop(); return; }
+
+        // Translate the click from the overlay's coord space to VideoCompositor's
+        // so the pixel sample lands on the same point the user clicked.
+        Color? color = null;
+        try
+        {
+            var transform = _eyedropOverlay.TransformToVisual(VideoCompositor);
+            var ptInComp = transform.TransformPoint(e.GetCurrentPoint(_eyedropOverlay).Position);
+            color = VideoCompositor.SamplePixelAt(ptInComp);
+        }
+        catch { }
+
+        var cb = _eyedropCallback;
+        EndEyedrop();
+        if (color is { } c) cb?.Invoke(c);
+        e.Handled = true;
+    }
+
+    private void EndEyedrop()
+    {
+        if (_eyedropOverlay is not null)
+        {
+            _eyedropOverlay.PointerPressed -= OnEyedropOverlayPressed;
+            PreviewArea.Children.Remove(_eyedropOverlay);
+            _eyedropOverlay = null;
+        }
+        _eyedropCallback = null;
     }
 
     private void AddInspField(string label, string value)

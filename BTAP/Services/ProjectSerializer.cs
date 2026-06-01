@@ -281,15 +281,44 @@ public class ClipEffectDto
     public double Intensity { get; set; } = 1.0;
     public bool   Enabled   { get; set; } = true;
 
-    public static ClipEffectDto From(ClipEffect e) => new()
-    {
-        Name = e.Name, Intensity = e.Intensity, Enabled = e.Enabled,
-    };
+    public Dictionary<string, double> Numbers { get; set; } = new();
+    public Dictionary<string, string> Strings { get; set; } = new();
+    public Dictionary<string, List<EffectKeyframeDto>> Keyframes { get; set; } = new();
 
-    public ClipEffect ToModel() => new()
+    public static ClipEffectDto From(ClipEffect e)
     {
-        Name = Name, Intensity = Intensity, Enabled = Enabled,
-    };
+        var dto = new ClipEffectDto
+        {
+            Name = e.Name, Intensity = e.Intensity, Enabled = e.Enabled,
+            Numbers = new Dictionary<string, double>(e.Numbers),
+            Strings = new Dictionary<string, string>(e.Strings),
+        };
+        foreach (var kv in e.Keyframes)
+            dto.Keyframes[kv.Key] = kv.Value
+                .Select(k => new EffectKeyframeDto { TimeRel = k.TimeRel, Value = k.Value })
+                .ToList();
+        return dto;
+    }
+
+    public ClipEffect ToModel()
+    {
+        var fx = new ClipEffect { Name = Name, Intensity = Intensity, Enabled = Enabled };
+        foreach (var kv in Numbers) fx.Numbers[kv.Key] = kv.Value;
+        foreach (var kv in Strings) fx.Strings[kv.Key] = kv.Value;
+        foreach (var kv in Keyframes)
+        {
+            var list = new System.Collections.ObjectModel.ObservableCollection<EffectKeyframe>();
+            foreach (var k in kv.Value) list.Add(new EffectKeyframe { TimeRel = k.TimeRel, Value = k.Value });
+            fx.Keyframes[kv.Key] = list;
+        }
+        return fx;
+    }
+}
+
+public class EffectKeyframeDto
+{
+    public double TimeRel { get; set; }
+    public double Value   { get; set; }
 }
 
 public class MarkerDto

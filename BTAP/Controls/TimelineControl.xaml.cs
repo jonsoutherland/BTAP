@@ -11,7 +11,9 @@ using Windows.ApplicationModel.DataTransfer;
 using Windows.Foundation;
 using Windows.UI;
 using BTAP.Models;
+using BTAP.Services;
 using BTAP.ViewModels;
+using Windows.System;
 
 namespace BTAP.Controls;
 
@@ -41,6 +43,15 @@ public sealed partial class TimelineControl : UserControl
     public event EventHandler<TimeSpan>? PlayheadChanged;
     public event EventHandler<TimelineClip>? ClipDeleted;
     public event EventHandler<double>? ZoomChanged;
+
+    /// <summary>Raised when the user picks a parameter from the clip's right-click
+    /// "Add keyframe at playhead" submenu. EditorPage handles the actual model
+    /// mutation so the inspector + history stay in sync.</summary>
+    public event EventHandler<(TimelineClip Clip, ClipEffect Fx, string ParamKey)>? AddKeyframeRequested;
+
+    /// <summary>Raised when keyframe selection changes by clicking a diamond — so
+    /// EditorPage can refresh the Automations list.</summary>
+    public event EventHandler? KeyframeSelectionChanged;
 
     private double _pixelsPerSec = BasePixelsPerSec;
     private Line? _playheadLine;
@@ -80,6 +91,22 @@ public sealed partial class TimelineControl : UserControl
     private TimeSpan       _trimOriginalStart;
     private TimeSpan       _trimOriginalDuration;
     private TimeSpan       _trimOriginalSourceStart;
+    // Per-keyframe absolute source-time captured at trim-begin. Each trim move
+    // re-derives TimeRel from this so keyframes stay anchored to the underlying
+    // source content (and aren't dragged along by a proportional reflow that
+    // would shift them when the clip is shortened/lengthened).
+    private Dictionary<EffectKeyframe, double>? _trimKfSourceTimes;
+
+    // Keyframe-diamond drag state. Press captures the diamond; if pointer moves
+    // past KfDragThresholdPx the drag mutates the kf's TimeRel; release without
+    // crossing the threshold falls back to single-click selection semantics.
+    private Rectangle?       _kfDragDiamond;
+    private EffectKeyframe?  _kfDragKf;
+    private TimelineClip?    _kfDragClip;
+    private Canvas?          _kfDragCanvas;
+    private double           _kfDragStartPointerX;
+    private bool             _kfDragMoved;
+    private const double     KfDragThresholdPx = 3.0;
 
     // Drop indicator
     private Line?          _dropIndicator;
@@ -374,6 +401,13 @@ public sealed partial class TimelineControl : UserControl
             contentRoot.Children.Add(envelope);
         }
 
+        // Effect-parameter keyframe diamonds along the top edge of the clip — one
+        // small rotated square per keyframe. Hue matches the Automations row dot
+        // so the user can connect a row to a marker visually. Selected ones get a
+        // brighter outline.
+        var kfOverlay = BuildKeyframeDiamondOverlay(clip, w, trackHeight - 3);
+        if (kfOverlay is not null) contentRoot.Children.Add(kfOverlay);
+
         var border = new Border
         {
             Width = w,
@@ -409,6 +443,8 @@ public sealed partial class TimelineControl : UserControl
         miDel.Click += (_, _) => DeleteClip(clip, track);
         flyout.Items.Add(miSplit);
         flyout.Items.Add(miDup);
+        flyout.Items.Add(new MenuFlyoutSeparator());
+        flyout.Items.Add(BuildAddKeyframeSubmenu(clip));
         flyout.Items.Add(new MenuFlyoutSeparator());
         flyout.Items.Add(miDel);
         border.ContextFlyout = flyout;
@@ -639,6 +675,12 @@ public sealed partial class TimelineControl : UserControl
         if (sender is not Border { Tag: (TimelineClip clip, Track track) } b) return;
         if (track.IsLocked) return;
 
+        // Right-click must fall through to the Border's ContextFlyout — capturing
+        // the pointer or marking the event handled here would suppress it. We
+        // also skip middle-click; only left-clicks initiate drag / trim / select.
+        var pressProps = e.GetCurrentPoint(b).Properties;
+        if (pressProps.IsRightButtonPressed || pressProps.IsMiddleButtonPressed) return;
+
         // Razor tool: enter slice mode instead of drag/trim. The user can drag
         // sideways to position the cut line, and the clip is split on release.
         if (ViewModel?.ActiveTool == ActiveTool.Razor)
@@ -716,6 +758,15 @@ public sealed partial class TimelineControl : UserControl
             _isTrimMode = false;
             // If this clip is part of a multi-selection, drag will move the whole group.
             _multiDragItems = clip.IsSelected ? CaptureMultiDragItems(clip) : null;
+        }
+
+        if (_isTrimMode)
+        {
+            _trimKfSourceTimes = new Dictionary<EffectKeyframe, double>(ReferenceEqualityComparer.Instance);
+            foreach (var fx in clip.Effects)
+                foreach (var kv in fx.Keyframes)
+                    foreach (var kf in kv.Value)
+                        _trimKfSourceTimes[kf] = clip.SourceStart.TotalSeconds + kf.TimeRel * clip.Duration.TotalSeconds;
         }
 
         b.CapturePointer(e.Pointer);
@@ -822,6 +873,21 @@ public sealed partial class TimelineControl : UserControl
                 double newDurSec = _trimOriginalDuration.TotalSeconds + delta;
                 _dragClip.Duration = TimeSpan.FromSeconds(newDurSec);
                 _dragBorder.Width = Math.Max(newDurSec * _pixelsPerSec, 4);
+            }
+            // Re-anchor every keyframe to the source-time we captured at trim-begin
+            // so keyframes stay glued to the underlying content rather than reflowing
+            // proportionally with Duration. Falls off the edge → clamped (and will
+            // un-clamp if the user reverses the trim within the same gesture, because
+            // _trimKfSourceTimes preserves the original anchor for the whole drag).
+            if (_trimKfSourceTimes is not null)
+            {
+                double newSrc = _dragClip.SourceStart.TotalSeconds;
+                double newDur = Math.Max(0.001, _dragClip.Duration.TotalSeconds);
+                foreach (var kv in _trimKfSourceTimes)
+                {
+                    double newRel = (kv.Value - newSrc) / newDur;
+                    kv.Key.TimeRel = Math.Clamp(newRel, 0, 1);
+                }
             }
             UpdateTrimHandlePosition(_dragBorder, _trimFromLeft);
 
@@ -1139,6 +1205,7 @@ public sealed partial class TimelineControl : UserControl
         _dragOriginalTrack = null;
         _dragHoverTrack    = null;
         _dragInsertNewTrackDir = 0;
+        _trimKfSourceTimes = null;
     }
 
     private void ResetRazorState()
@@ -2108,7 +2175,7 @@ public sealed partial class TimelineControl : UserControl
                 if (data.Peaks[i] > peak) peak = data.Peaks[i];
 
             double timeRel = (x + 0.5) / width;
-            double vol = Math.Clamp(clip.GetVolumeAt(timeRel), 0, 1);
+            double vol = Math.Max(0, clip.GetVolumeAt(timeRel));
             peak = (float)(peak * vol);
 
             int peakH = (int)Math.Round(Math.Clamp(peak, 0f, 1f) * (mid - 1));
@@ -2181,8 +2248,10 @@ public sealed partial class TimelineControl : UserControl
     // Each video / audio / music clip carries a Canvas overlay with two polylines
     // (one wide-stroke transparent line for hit-testing, one thin visible line)
     // plus an Ellipse per VolumePoint. Y inside the canvas maps to volume:
-    // top = 1.0, bottom = 0.0, with EnvelopePad pixels of padding at each edge so
-    // the line and circles don't collide with the clip's rounded border.
+    // top = EnvelopeMaxVolume, middle = 1.0 (default/unity), bottom = 0.0, with
+    // EnvelopePad pixels of padding at each edge so the line and circles don't
+    // collide with the clip's rounded border. The default sits in the middle so
+    // the user can drag up to amplify or down to attenuate.
     //
     // Interactions:
     //   • Left-click + drag on the line  →  if no keyframes, drag adjusts clip.Volume
@@ -2195,6 +2264,7 @@ public sealed partial class TimelineControl : UserControl
     //   • Right-click on a circle        →  removes that keyframe.
 
     private const double EnvelopePad = 3.0;
+    private const double EnvelopeMaxVolume = 2.0;
 
     private TimelineClip?  _envDragClip;
     private Canvas?        _envDragCanvas;
@@ -2346,7 +2416,8 @@ public sealed partial class TimelineControl : UserControl
     private static double EnvelopeYForVolume(double volume, double clipH)
     {
         double range = Math.Max(1, clipH - 2 * EnvelopePad);
-        return EnvelopePad + (1 - Math.Clamp(volume, 0, 1)) * range;
+        double frac = Math.Clamp(volume, 0, EnvelopeMaxVolume) / EnvelopeMaxVolume;
+        return EnvelopePad + (1 - frac) * range;
     }
 
     private static double EnvelopeXForTime(double timeRel, double clipW) =>
@@ -2355,7 +2426,8 @@ public sealed partial class TimelineControl : UserControl
     private static double EnvelopeVolumeForY(double y, double clipH)
     {
         double range = Math.Max(1, clipH - 2 * EnvelopePad);
-        return Math.Clamp(1 - (y - EnvelopePad) / range, 0, 1);
+        double frac = Math.Clamp(1 - (y - EnvelopePad) / range, 0, 1);
+        return frac * EnvelopeMaxVolume;
     }
 
     /// <summary>Find the Border whose Tag references this clip, so we can refresh
@@ -2472,11 +2544,11 @@ public sealed partial class TimelineControl : UserControl
         double clipH = _envDragCanvas.Height;
         double range = Math.Max(1, clipH - 2 * EnvelopePad);
         double deltaY = pt.Position.Y - _envDragStartPointerY;
-        double deltaVol = -deltaY / range;
+        double deltaVol = -deltaY / range * EnvelopeMaxVolume;
 
         if (_envDragAffectedIdx is null)
         {
-            _envDragClip.Volume = Math.Clamp(_envDragStartClipVolume + deltaVol, 0, 1);
+            _envDragClip.Volume = Math.Clamp(_envDragStartClipVolume + deltaVol, 0, EnvelopeMaxVolume);
         }
         else
         {
@@ -2485,11 +2557,12 @@ public sealed partial class TimelineControl : UserControl
                 int idx = _envDragAffectedIdx[i];
                 if (idx < 0 || idx >= _envDragClip.VolumeEnvelope.Count) continue;
                 _envDragClip.VolumeEnvelope[idx].Volume = Math.Clamp(
-                    _envDragAffectedStartVols![i] + deltaVol, 0, 1);
+                    _envDragAffectedStartVols![i] + deltaVol, 0, EnvelopeMaxVolume);
             }
         }
 
         RefreshEnvelopeOverlay(_envDragCanvas, _envDragClip);
+        RefreshClipWaveform(_envDragClip);
         e.Handled = true;
     }
 
@@ -2565,9 +2638,10 @@ public sealed partial class TimelineControl : UserControl
         _envDragPoint.TimeRel = Math.Clamp(
             _envDragPointStartTimeRel + dx / Math.Max(1, clipW), 0, 1);
         _envDragPoint.Volume = Math.Clamp(
-            _envDragPointStartVolume - dy / range, 0, 1);
+            _envDragPointStartVolume - dy / range * EnvelopeMaxVolume, 0, EnvelopeMaxVolume);
 
         RefreshEnvelopeOverlay(_envDragCanvas, _envDragClip);
+        RefreshClipWaveform(_envDragClip);
         e.Handled = true;
     }
 
@@ -2618,5 +2692,175 @@ public sealed partial class TimelineControl : UserControl
         }
         ViewModel.Project.IsModified = true;
         return track;
+    }
+
+    // ── Keyframe diamond overlay & "Add keyframe" submenu ────────────────
+
+    /// <summary>Submenu inside the clip right-click flyout. Lists every enabled
+    /// effect's numeric parameters; picking one fires AddKeyframeRequested for
+    /// EditorPage to insert a keyframe at the current playhead.</summary>
+    private MenuFlyoutSubItem BuildAddKeyframeSubmenu(TimelineClip clip)
+    {
+        var sub = new MenuFlyoutSubItem { Text = "Add keyframe at playhead" };
+
+        var enabledEffects = clip.Effects.Where(fx => fx.Enabled).ToList();
+        if (enabledEffects.Count == 0)
+        {
+            var disabled = new MenuFlyoutItem
+            {
+                Text = "Enable an effect first",
+                IsEnabled = false,
+            };
+            sub.Items.Add(disabled);
+            return sub;
+        }
+
+        foreach (var fx in enabledEffects)
+        {
+            var paramList = ClipEffectsChain.NumberParams(fx.Name);
+            if (paramList.Count == 0) continue;
+            foreach (var p in paramList)
+            {
+                var item = new MenuFlyoutItem
+                {
+                    Text = $"{fx.Name} · {p.Label}",
+                };
+                var fxLocal = fx;
+                var keyLocal = p.Key;
+                item.Click += (_, _) => AddKeyframeRequested?.Invoke(this, (clip, fxLocal, keyLocal));
+                sub.Items.Add(item);
+            }
+        }
+
+        if (sub.Items.Count == 0)
+        {
+            sub.Items.Add(new MenuFlyoutItem { Text = "No parameters available", IsEnabled = false });
+        }
+        return sub;
+    }
+
+    /// <summary>Diamond markers along the top edge of a clip — one per automation
+    /// keyframe across every effect parameter. Clicks select (ctrl/shift for
+    /// multi); selected diamonds get a brighter outline. Returns null when the
+    /// clip has no keyframes, so we don't add an empty Canvas to the visual tree.</summary>
+    private Canvas? BuildKeyframeDiamondOverlay(TimelineClip clip, double clipW, double clipH)
+    {
+        int totalKfs = 0;
+        foreach (var fx in clip.Effects)
+            foreach (var kv in fx.Keyframes)
+                totalKfs += kv.Value.Count;
+        if (totalKfs == 0) return null;
+
+        var canvas = new Canvas
+        {
+            Width  = clipW,
+            Height = clipH,
+            Background = null,
+            IsHitTestVisible = true,
+        };
+        var sel = ViewModel?.SelectedKeyframes;
+
+        foreach (var fx in clip.Effects)
+        {
+            foreach (var kv in fx.Keyframes)
+            {
+                var hue = KeyframeColors.HueFor(fx.Name, kv.Key);
+                foreach (var kf in kv.Value)
+                {
+                    bool selected = sel?.Contains(kf) == true;
+                    var diamond = new Rectangle
+                    {
+                        Width  = 9,
+                        Height = 9,
+                        Fill   = new SolidColorBrush(hue),
+                        Stroke = new SolidColorBrush(selected ? Microsoft.UI.Colors.White : Color.FromArgb(220, 0, 0, 0)),
+                        StrokeThickness = selected ? 2 : 1,
+                        RenderTransformOrigin = new Point(0.5, 0.5),
+                        RenderTransform = new RotateTransform { Angle = 45 },
+                    };
+                    double cx = Math.Clamp(kf.TimeRel, 0, 1) * clipW;
+                    Canvas.SetLeft(diamond, cx - diamond.Width / 2);
+                    Canvas.SetTop(diamond, 2);
+                    ToolTipService.SetToolTip(diamond,
+                        $"{fx.Name} · {kv.Key} = {kf.Value:0.##}");
+
+                    var clipLocal = clip;
+                    var fxLocal = fx;
+                    var keyLocal = kv.Key;
+                    var kfLocal = kf;
+                    var canvasLocal = canvas;
+                    diamond.PointerPressed += (_, e) =>
+                    {
+                        // Don't immediately mutate selection — wait for release so a
+                        // drag past the threshold lands as "reposition" without also
+                        // changing selection (and so a no-move press still selects).
+                        _kfDragDiamond = diamond;
+                        _kfDragKf = kfLocal;
+                        _kfDragClip = clipLocal;
+                        _kfDragCanvas = canvasLocal;
+                        _kfDragStartPointerX = e.GetCurrentPoint(canvasLocal).Position.X;
+                        _kfDragMoved = false;
+                        diamond.CapturePointer(e.Pointer);
+                        e.Handled = true;
+                    };
+                    diamond.PointerMoved += (_, e) =>
+                    {
+                        if (!ReferenceEquals(_kfDragDiamond, diamond)) return;
+                        if (_kfDragKf is null || _kfDragClip is null || _kfDragCanvas is null) return;
+                        double curX = e.GetCurrentPoint(_kfDragCanvas).Position.X;
+                        if (!_kfDragMoved && Math.Abs(curX - _kfDragStartPointerX) < KfDragThresholdPx)
+                            return;
+                        _kfDragMoved = true;
+                        double newRel = Math.Clamp(curX / Math.Max(1, _kfDragCanvas.Width), 0, 1);
+                        _kfDragKf.TimeRel = newRel;
+                        Canvas.SetLeft(diamond, newRel * _kfDragCanvas.Width - diamond.Width / 2);
+                        e.Handled = true;
+                    };
+                    void Release(object _, PointerRoutedEventArgs e)
+                    {
+                        if (!ReferenceEquals(_kfDragDiamond, diamond)) return;
+                        try { diamond.ReleasePointerCapture(e.Pointer); } catch { }
+                        bool moved = _kfDragMoved;
+                        var kf2   = _kfDragKf;
+                        var clip2 = _kfDragClip;
+                        _kfDragDiamond = null;
+                        _kfDragKf = null;
+                        _kfDragClip = null;
+                        _kfDragCanvas = null;
+                        _kfDragMoved = false;
+
+                        var vm = ViewModel;
+                        if (vm is null || kf2 is null || clip2 is null) { e.Handled = true; return; }
+
+                        if (!moved)
+                        {
+                            // Pure click → select + jump playhead.
+                            var ctrl  = (InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.Control)
+                                            & Windows.UI.Core.CoreVirtualKeyStates.Down) != 0;
+                            var shift = (InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.Shift)
+                                            & Windows.UI.Core.CoreVirtualKeyStates.Down) != 0;
+                            vm.SetKeyframeSelection(kf2, ctrl || shift);
+                            vm.Project.Playhead = clip2.TimelineStart +
+                                TimeSpan.FromSeconds(kf2.TimeRel * clip2.Duration.TotalSeconds);
+                            PlayheadChanged?.Invoke(this, vm.Project.Playhead);
+                            KeyframeSelectionChanged?.Invoke(this, EventArgs.Empty);
+                            Rebuild();
+                        }
+                        else
+                        {
+                            // Drag committed → mark dirty + sync the Automations list
+                            // (the time column needs to re-render).
+                            vm.Project.IsModified = true;
+                            KeyframeSelectionChanged?.Invoke(this, EventArgs.Empty);
+                        }
+                        e.Handled = true;
+                    }
+                    diamond.PointerReleased    += Release;
+                    diamond.PointerCaptureLost += Release;
+                    canvas.Children.Add(diamond);
+                }
+            }
+        }
+        return canvas;
     }
 }
