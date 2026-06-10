@@ -18,11 +18,10 @@ namespace BTAP.Services;
 public sealed class ExportFrameCompositor : IDisposable
 {
     private readonly Project _project;
-    private readonly CanvasRenderTarget _canvas;  // canvas-sized intermediate (clip layout space)
-    private readonly CanvasRenderTarget _output;  // export-sized final (cropped + scaled)
+    private readonly CanvasRenderTarget _output;     // persistent export-sized RT, reused across frames
     private readonly int _canvasW;
     private readonly int _canvasH;
-    private readonly bool _needsCropPass;
+    private readonly Matrix3x2 _canvasToOutput;   // maps canvas-pixel space → output-pixel space
 
     public CanvasDevice Device { get; }
     public int Width  => _project.Width;
@@ -36,26 +35,48 @@ public sealed class ExportFrameCompositor : IDisposable
         _canvasW = Math.Max(1, cw);
         _canvasH = Math.Max(1, ch);
 
-        // When canvas dimensions match the export resolution exactly, the second
-        // pass is identity work — skip allocating a separate intermediate.
-        _needsCropPass = _canvasW != project.Width || _canvasH != project.Height;
-
+        // Persistent single RT, reused across frames. Earlier we briefly
+        // switched this to allocate-fresh-per-frame on the theory that
+        // cross-frame Win2D state on the reused RT was wedging DrawImage at
+        // 60 fps. That didn't help — the bug actually has nothing to do with
+        // RT state carryover. Reverting to persistent eliminates one of the
+        // per-frame GPU texture allocations (the other was in the sink), so
+        // the total alloc churn at 60 fps drops enough for the driver to
+        // keep up with VRAM release.
         _output = new CanvasRenderTarget(device, project.Width, project.Height, 96);
-        _canvas = _needsCropPass
-            ? new CanvasRenderTarget(device, _canvasW, _canvasH, 96)
-            : _output;
+
+        // Compose directly into _output. The whole scene lives in canvas-pixel
+        // space (clip PosX/PosY are canvas units, matching the preview), but the
+        // export only cares about pixels inside the export window. One transform
+        // — translate so the export window's top-left lands at (0,0), then scale
+        // it to the output rect — does both the crop and the resize in a single
+        // pass at output resolution rather than rasterizing the full canvas.
+        //
+        // Note: the SinkWriter pipeline hands the output texture directly to
+        // the H.264 encoder via an MF DXGI surface buffer, so the encoder reads
+        // the pixels in their native top-down GPU layout. No Y-flip needed —
+        // the earlier version of this transform negated Y to compensate for
+        // GetPixelBytes' top-down byte order vs MF's bottom-up CPU convention,
+        // but that whole readback path is gone now.
+        var (wx, wy, wW, wH) = project.GetExportWindow();
+        float sx = (float)(project.Width  / Math.Max(1, wW));
+        float sy = (float)(project.Height / Math.Max(1, wH));
+        _canvasToOutput = Matrix3x2.CreateTranslation((float)-wx, (float)-wy)
+                       * Matrix3x2.CreateScale(sx, sy);
     }
 
     /// <summary>Composes one frame at <paramref name="playhead"/>. Returns the
-    /// internal output render target — caller must not dispose it.</summary>
+    /// internal output render target — caller must not dispose it. The
+    /// SinkRenderer is expected to copy from this into a fresh per-frame
+    /// texture for the encoder.</summary>
     public CanvasRenderTarget RenderFrame(TimeSpan playhead,
-                                          IReadOnlyDictionary<TimelineClip, CanvasBitmap> layerFrames)
+                                          IReadOnlyDictionary<TimelineClip, CanvasBitmap> layerFrames,
+                                          ExportLogger? log = null)
     {
-        // Stage 1: render the scene onto the canvas (clip PosX/PosY are in
-        // canvas-pixel units, layout matches what the preview shows).
-        using (var ds = _canvas.CreateDrawingSession())
+        using (var ds = _output.CreateDrawingSession())
         {
             ds.Clear(Colors.Black);
+            ds.Transform = _canvasToOutput;
 
             for (int i = _project.Tracks.Count - 1; i >= 0; i--)
             {
@@ -80,18 +101,17 @@ public sealed class ExportFrameCompositor : IDisposable
             }
         }
 
-        // Stage 2: crop the export window out of the canvas and scale to the
-        // export resolution. Skipped when the canvas already matches the export
-        // (then _canvas IS _output and the scene drew straight into it).
-        if (_needsCropPass)
-        {
-            var (wx, wy, wW, wH) = _project.GetExportWindow();
-            using var ds2 = _output.CreateDrawingSession();
-            ds2.Clear(Colors.Black);
-            var srcRect = new Rect(wx, wy, Math.Max(1, wW), Math.Max(1, wH));
-            var dstRect = new Rect(0, 0, _project.Width, _project.Height);
-            ds2.DrawImage(_canvas, dstRect, srcRect);
-        }
+        // Diagnostic: dump the composited output for the first few frames so
+        // we can tell whether the compositor produced visible pixels. Plus a
+        // checkpoint dump on the orchestrator's checkpoint frames so we can
+        // distinguish "compositor went black" from "CopyResource into encoder
+        // texture broke" — three-stage triangulation (staging / composite /
+        // encoder-input) localises the failure to one stage.
+        int diagIdx = ExportDiag.NextIndex("compositor", 3);
+        if (diagIdx >= 0)
+            ExportDiag.DumpRT(_output, $"2-composite-{diagIdx}.png", log);
+        else if (ExportDiag.ShouldDumpAtCheckpoint(ExportDiag.CurrentFrame))
+            ExportDiag.DumpRT(_output, $"2-composite-checkpoint-{ExportDiag.CurrentFrame}.png", log);
 
         return _output;
     }
@@ -120,13 +140,28 @@ public sealed class ExportFrameCompositor : IDisposable
                                Math.Max(1, (1 - cl - cr) * srcW),
                                Math.Max(1, (1 - ct - cb) * srcH));
 
-        // Destination: canvas frame, per-clip scale, per-clip offset, then carve
-        // out the cropped sub-rect so cropped pixels keep their original on-screen
-        // size instead of stretching to fill the un-cropped dest. PosX/PosY are
-        // in canvas-pixel space (matches the preview).
+        // Destination: source fitted into the canvas at its native aspect
+        // (letterbox/pillarbox so portrait clips don't stretch into a landscape
+        // canvas, and vice versa), then per-clip Scale and PosX/PosY (canvas-
+        // pixel space, matches the preview). Then carve out the cropped sub-rect
+        // so cropped pixels keep their original on-screen size instead of
+        // stretching to fill the un-cropped dest.
         double scale = Math.Clamp(clip.Scale, 0.05, 10);
-        double fullW = _canvasW * scale;
-        double fullH = _canvasH * scale;
+        double srcAspect = srcW / srcH;
+        double canvasAspect = (double)_canvasW / _canvasH;
+        double fitW, fitH;
+        if (srcAspect >= canvasAspect)
+        {
+            fitW = _canvasW;
+            fitH = _canvasW / srcAspect;
+        }
+        else
+        {
+            fitH = _canvasH;
+            fitW = _canvasH * srcAspect;
+        }
+        double fullW = fitW * scale;
+        double fullH = fitH * scale;
         double fullX = (_canvasW - fullW) / 2 + clip.PosX;
         double fullY = (_canvasH - fullH) / 2 + clip.PosY;
         double dstX = fullX + cl * fullW;
@@ -230,10 +265,5 @@ public sealed class ExportFrameCompositor : IDisposable
     public void Dispose()
     {
         try { _output.Dispose(); } catch { }
-        // Only dispose _canvas when it's a distinct render target. When the canvas
-        // matches the export size we alias _canvas to _output above, so disposing
-        // both would double-dispose the same surface.
-        if (_needsCropPass)
-            try { _canvas.Dispose(); } catch { }
     }
 }

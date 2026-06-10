@@ -49,11 +49,88 @@ public static class ExportRenderer
         ExportLogger? log,
         CancellationToken ct)
     {
+        // Auto-retry wrapper: at ≥60 fps the Win2D/D2D/MF race occasionally
+        // collapses the output bitrate to a fraction of what was requested
+        // (compositor goes black around frame 600 in some runs). We can't
+        // deterministically prevent it, but we CAN detect a bad run by
+        // inspecting the output bitrate post-render and retry. Most runs
+        // succeed on the first try; the occasional bad one needs 1-2 retries.
+        // Sub-60-fps exports are deterministic so we only retry the high-FPS
+        // case.
+        const int MaxAttempts       = 5;
+        // 10 % of the target Avg bitrate. Empirically a clearly-broken run
+        // produces ~2-5 % of target (~400 Kbps); a usable run produces
+        // ≥ 25-40 % (5-8 Mbps). The 10 % cut separates them cleanly without
+        // retrying borderline-acceptable runs.
+        const double MinBitrateRatio = 0.10;
+        bool retryEligible          = project.FrameRate >= 60;
+        int  targetBitrate          = (int)Math.Max(2_000_000,
+                                            project.Width * project.Height *
+                                            Math.Max(1, project.FrameRate) * 0.16);
+        int  minAcceptableBitrate   = (int)(targetBitrate * MinBitrateRatio);
+
+        Result lastResult = null!;
+        for (int attempt = 1; attempt <= MaxAttempts; attempt++)
+        {
+            if (attempt > 1)
+            {
+                log?.Log($"=== RETRY {attempt}/{MaxAttempts} (previous attempt's bitrate was below {minAcceptableBitrate/1000} Kbps) ===");
+                // Between attempts: release any straggler managed objects from
+                // the failed run (CsWinRT wrappers especially) and give the GPU
+                // a moment to drain its command queue before kicking off a
+                // fresh pipeline. This is GC-during-idle, not GC-mid-pipeline,
+                // so it's safe (the dangerous case was forcing GC while the
+                // compositor was actively using bitmap wrappers).
+                GC.Collect(2, GCCollectionMode.Forced, blocking: true);
+                GC.WaitForPendingFinalizers();
+                GC.Collect(2, GCCollectionMode.Forced, blocking: true);
+                await Task.Delay(1500, ct).ConfigureAwait(false);
+            }
+
+            lastResult = await RenderOnceAsync(project, destination, progress, log, ct).ConfigureAwait(false);
+
+            if (!lastResult.Success || !retryEligible)
+                return lastResult;
+
+            try
+            {
+                var outProf = await MediaEncodingProfile.CreateFromFileAsync(destination);
+                int actual = (int)(outProf?.Video?.Bitrate ?? 0u);
+                log?.Log($"   [retry] attempt {attempt}: bitrate={actual/1000} Kbps (min={minAcceptableBitrate/1000} Kbps)");
+                if (actual >= minAcceptableBitrate)
+                {
+                    if (attempt > 1) log?.Log($"   [retry] SUCCESS on attempt {attempt}");
+                    return lastResult;
+                }
+            }
+            catch (Exception ex)
+            {
+                log?.Log($"   [retry] couldn't inspect output bitrate: {ex.Message} — accepting result");
+                return lastResult;
+            }
+        }
+
+        log?.Log($"   [retry] all {MaxAttempts} attempts produced low bitrate; returning last result anyway");
+        return lastResult;
+    }
+
+    private static async Task<Result> RenderOnceAsync(
+        Project project,
+        StorageFile destination,
+        IProgress<double>? progress,
+        ExportLogger? log,
+        CancellationToken ct)
+    {
         var result = new Result();
 
         log?.Log("");
         log?.Log("=== CUSTOM EXPORT PIPELINE ===");
         log?.Log($"Project: {project.Name} — {project.Width}x{project.Height} @ {project.FrameRate}fps");
+
+        // Initialise the diagnostic dump folder next to the log file. Each
+        // pipeline stage dumps the first few frames so we can see where the
+        // visible content goes missing.
+        if (log is not null) ExportDiag.Init(log.FilePath);
 
         var duration = ComputeDuration(project);
         result.Duration = duration;
@@ -93,9 +170,44 @@ public static class ExportRenderer
         }
         result.VideoClips = totalVideoClips;
 
-        var device = CanvasDevice.GetSharedDevice();
-        using var pool       = new ExportFrameSourcePool(device, log);
+        // Dedicated CanvasDevice for the export — NOT the app-wide shared one.
+        // Diagnostic dumps proved that at 60 fps with two simultaneous source
+        // layers, the compositor receives correct input bitmaps at every
+        // checkpoint (frame 60, 600, 1200, 1800, 2400) but DrawImage produces
+        // black output. Working theory: the shared CanvasDevice carries D2D
+        // bitmap/resource cache state from the preview UI's
+        // VideoCompositorControl, and under the throughput pressure of 60 fps
+        // export that cached state silently invalidates the per-frame draw.
+        // A dedicated CanvasDevice gives the export pipeline a clean D2D
+        // context with no preview-side cache to fight against.
+        using var device = new CanvasDevice();
         using var compositor = new ExportFrameCompositor(project, device);
+
+        // One D3D11 device, one DXGI device manager, shared by the
+        // SourceReader pool (decode), Win2D compositor (composite), and
+        // SinkWriter (encode). All three pipelines live on the same GPU
+        // device so frames stay GPU-resident end to end.
+        using var d3dDevice    = Win2DInterop.GetD3D11Device(device);
+        using var multithread  = d3dDevice.QueryInterface<Vortice.Direct3D11.ID3D11Multithread>();
+        multithread.SetMultithreadProtected(true);
+
+        // MFStartup is required before MFCreateDXGIDeviceManager.
+        Vortice.MediaFoundation.MediaFactory.MFStartup(false);
+        var deviceManager = Vortice.MediaFoundation.MediaFactory.MFCreateDXGIDeviceManager();
+        try
+        {
+            deviceManager.ResetDevice(d3dDevice).CheckError();
+        }
+        catch (Exception ex)
+        {
+            try { deviceManager.Dispose(); } catch { }
+            try { Vortice.MediaFoundation.MediaFactory.MFShutdown(); } catch { }
+            log?.Log($"FATAL: DXGI device manager bind failed: {ex.GetType().Name}: {ex.Message} HRESULT=0x{ex.HResult:X8}");
+            result.Error = $"{ex.GetType().Name}: {ex.Message}";
+            return result;
+        }
+
+        using var pool = new ExportSourceReaderPool(device, d3dDevice, deviceManager, log);
 
         foreach (var path in videoSources)
         {
@@ -115,7 +227,7 @@ public static class ExportRenderer
             tempVideo = await CreateTempFileAsync("btap_video_" + Guid.NewGuid().ToString("N")[..8] + ".mp4");
             log?.Log($"Stage 1: rendering video-only intermediate to {tempVideo.Path}");
 
-            await RenderCustomVideoAsync(project, duration, pool, compositor,
+            await RenderCustomVideoAsync(project, duration, pool, compositor, deviceManager, d3dDevice,
                 tempVideo, p => progress?.Report(p * 0.85), log, ct).ConfigureAwait(false);
 
             log?.Log("Stage 1 complete.");
@@ -154,6 +266,8 @@ public static class ExportRenderer
                 try { await tempVideo.DeleteAsync(StorageDeleteOption.PermanentDelete); }
                 catch { /* best-effort */ }
             }
+            try { deviceManager.Dispose(); } catch { }
+            try { Vortice.MediaFoundation.MediaFactory.MFShutdown(); } catch { }
         }
     }
 
@@ -161,75 +275,123 @@ public static class ExportRenderer
 
     private static async Task RenderCustomVideoAsync(
         Project project, TimeSpan duration,
-        ExportFrameSourcePool pool, ExportFrameCompositor compositor,
+        ExportSourceReaderPool pool, ExportFrameCompositor compositor,
+        Vortice.MediaFoundation.IMFDXGIDeviceManager deviceManager,
+        Vortice.Direct3D11.ID3D11Device d3dDevice,
         StorageFile output, Action<double>? progress, ExportLogger? log, CancellationToken ct)
     {
-        // Renderer delegate: for each composition time, ask the pool for each
-        // active video clip's source frame, then compose.
-        var streamSource = new ExportVideoStreamSource(project, duration, async (t, innerCt) =>
-        {
-            var frameMap = new Dictionary<TimelineClip, CanvasBitmap>(ReferenceEqualityComparer.Instance);
-            for (int i = project.Tracks.Count - 1; i >= 0; i--)
-            {
-                var track = project.Tracks[i];
-                if (track.Kind != TrackKind.Video || track.IsMuted) continue;
-                var clip = FirstClipAt(track, t);
-                if (clip is null || clip.Kind == ClipKind.Title) continue;
-                if (string.IsNullOrEmpty(clip.SourceId)) continue;
-                var media = project.MediaBin.FirstOrDefault(m => m.Id == clip.SourceId);
-                if (media is null || media.Type != MediaType.Video) continue;
-                var srcTime = clip.SourceStart + (t - clip.TimelineStart);
-                var bmp = await pool.GetFrameAsync(media.FilePath, srcTime, innerCt).ConfigureAwait(false);
-                if (bmp is not null) frameMap[clip] = bmp;
-            }
-            return compositor.RenderFrame(t, frameMap);
-        }, log);
+        // Drive the SinkWriter directly: for each output frame, gather the source
+        // bitmaps for every active clip (parallel per source so independent player
+        // awaits don't serialize), composite, and hand the rendered frame to the
+        // encoder. Compared to the MediaTranscoder + MediaStreamSource pipeline
+        // we used to use, this drops the SampleRequested callback indirection and
+        // the MediaTranscoder topology orchestration — both turned out to be a
+        // measurable per-frame tax on top of the unavoidable readback.
+        var frameDuration = TimeSpan.FromSeconds(1.0 / Math.Max(1, project.FrameRate));
+        long totalFrames  = Math.Max(1, (long)Math.Ceiling(duration.Ticks / (double)frameDuration.Ticks));
 
+        // At >30 fps output, compose at 30 fps internally and submit each
+        // composed frame multiple times to the encoder with stepped sample
+        // timestamps. This dodges the Win2D/D2D race that wedges DrawImage
+        // when the compositor is called at 60 Hz, while the encoder still
+        // gets the requested 60 fps stream (duplicated content becomes
+        // cheap skip-macroblock P-frames, costing almost nothing in the
+        // bitrate budget). Effectively trades 60 fps motion for reliability —
+        // visually identical to 30 fps content tagged as 60 fps, which is
+        // what most 30 fps source clips would have looked like anyway.
+        int composeStride = project.FrameRate > 30
+            ? Math.Max(1, (int)Math.Round(project.FrameRate / 30.0))
+            : 1;
+        if (composeStride > 1)
+            log?.Log($"   [stage 1] compose stride: {composeStride} (compose at " +
+                     $"{project.FrameRate / composeStride:F0}fps, output at {project.FrameRate}fps)");
+        log?.Log($"   [stage 1] total frames to encode: {totalFrames}");
+
+        using var sink = new ExportSinkRenderer(project, output.Path, deviceManager, d3dDevice, log);
         try
         {
-            var profile = BuildVideoOnlyProfile(project);
-            LogProfile(log, "Stage-1 encoding profile", profile);
+            sink.Begin();
+        }
+        catch (Exception ex)
+        {
+            log?.Log($"   [stage 1] SinkWriter Begin() threw {ex.GetType().Name}: {ex.Message} HRESULT=0x{ex.HResult:X8}");
+            throw;
+        }
 
-            var transcoder = new MediaTranscoder { HardwareAccelerationEnabled = true };
-            using var outStream = await output.OpenAsync(FileAccessMode.ReadWrite).AsTask(ct).ConfigureAwait(false);
-            PrepareTranscodeResult prep;
-            try
-            {
-                prep = await transcoder.PrepareMediaStreamSourceTranscodeAsync(
-                                            streamSource.StreamSource, outStream, profile)
-                                       .AsTask(ct).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                log?.Log($"   [stage 1] PrepareMediaStreamSourceTranscodeAsync threw {ex.GetType().Name}: " +
-                         $"{ex.Message} HRESULT=0x{ex.HResult:X8}");
-                throw;
-            }
-            if (!prep.CanTranscode)
-            {
-                throw new InvalidOperationException($"Stage-1 transcode preparation failed: {prep.FailureReason}");
-            }
+        DateTime lastLogTime  = DateTime.MinValue;
+        double   lastProgress = -10;
 
-            var op = prep.TranscodeAsync();
-            double lastLogged = -10;
-            op.Progress = (_, pct) =>
+        // Run the whole encode loop on a thread-pool thread so the UI thread
+        // stays responsive while the (synchronous) D3D11 / MF work runs. The
+        // entire loop runs on one thread so D3D11 immediate-context ordering
+        // is preserved — we just don't want that thread to be the UI thread.
+        await Task.Run(async () =>
+        {
+            CanvasRenderTarget? rendered = null;
+
+            for (long frameIndex = 0; ; frameIndex++)
             {
+                ct.ThrowIfCancellationRequested();
+
+                var t = TimeSpan.FromTicks(frameIndex * frameDuration.Ticks);
+                if (t >= duration) break;
+
+                // Publish the current output-frame index so the source pool
+                // and compositor can decide whether to fire their checkpoint
+                // diagnostic dumps without having to thread the index through
+                // every method signature.
+                ExportDiag.SetCurrentFrame((int)frameIndex);
+
+                // (Tried periodic forced GC here to release CsWinRT wrappers'
+                // COM refs on decoder textures — verified to actively break
+                // the pipeline, same failure mode as explicit Dispose: the
+                // finalizer releases the surface ref before Win2D / D2D's
+                // bitmap cache is done with it. Wrapper lifetime has to be
+                // managed by natural GC pressure or another mechanism, not
+                // forced collection.)
+
+                // Re-compose only every composeStride-th output frame. The
+                // other iterations re-encode the same composited RT with a
+                // fresh sample timestamp.
+                if (frameIndex % composeStride == 0)
+                {
+                    var frameMap = new Dictionary<TimelineClip, CanvasBitmap>(ReferenceEqualityComparer.Instance);
+                    for (int i = project.Tracks.Count - 1; i >= 0; i--)
+                    {
+                        var track = project.Tracks[i];
+                        if (track.Kind != TrackKind.Video || track.IsMuted) continue;
+                        var clip = FirstClipAt(track, t);
+                        if (clip is null || clip.Kind == ClipKind.Title) continue;
+                        if (string.IsNullOrEmpty(clip.SourceId)) continue;
+                        var media = project.MediaBin.FirstOrDefault(m => m.Id == clip.SourceId);
+                        if (media is null || media.Type != MediaType.Video) continue;
+                        var srcTime = clip.SourceStart + (t - clip.TimelineStart);
+                        var bmp = await pool.GetFrameAsync(media.FilePath, srcTime, ct).ConfigureAwait(false);
+                        if (bmp is not null) frameMap[clip] = bmp;
+                    }
+
+                    rendered = compositor.RenderFrame(t, frameMap, log);
+                }
+
+                if (rendered is not null) sink.WriteFrame(rendered);
+
+                double pct = 100.0 * frameIndex / totalFrames;
                 progress?.Invoke(pct / 100.0);
-                if (pct - lastLogged >= 10)
+                if (pct - lastProgress >= 10)
                 {
                     log?.Log($"   [stage 1] progress {pct:F0}%");
-                    lastLogged = pct;
+                    lastProgress = pct;
                 }
-            };
-            using (ct.Register(() => { try { op.Cancel(); } catch { } }))
-            {
-                await op.AsTask(ct).ConfigureAwait(false);
+                var now = DateTime.UtcNow;
+                if ((now - lastLogTime).TotalSeconds >= 1.0)
+                {
+                    log?.Log($"   [stage 1] frame {frameIndex} @ {t} / {duration}");
+                    lastLogTime = now;
+                }
             }
-        }
-        finally
-        {
-            streamSource.Dispose();
-        }
+        }, ct).ConfigureAwait(false);
+
+        sink.Finish();
     }
 
     // ── Stage 2: mux audio over the rendered video ───────────────────────────
@@ -363,28 +525,21 @@ public static class ExportRenderer
 
     /// <summary>
     /// Transcodes the audio stream of a source media file to a temp M4A. Returns
-    /// null if the source has no audio or can't be transcoded.
+    /// null if the source genuinely has no audio or the transcode can't be set up.
+    ///
+    /// Used to rely on <see cref="MediaEncodingProfile.CreateFromFileAsync"/> to
+    /// detect whether a source has audio at all — but that API returns a null
+    /// Audio descriptor for some valid .MOV variants (notably iPhone HEVC clips),
+    /// so .MOV audio silently went missing from exports. Now we skip the probe
+    /// and let <see cref="MediaTranscoder.PrepareFileTranscodeAsync"/> decide:
+    /// it inspects the container's actual streams and returns CanTranscode=false
+    /// if there's nothing to extract.
     /// </summary>
     private static async Task<StorageFile?> ExtractAudioToTempAsync(string sourcePath, ExportLogger? log, CancellationToken ct)
     {
         StorageFile src;
         try { src = await StorageFile.GetFileFromPathAsync(sourcePath); }
         catch { return null; }
-
-        try
-        {
-            var srcProfile = await MediaEncodingProfile.CreateFromFileAsync(src);
-            if (srcProfile?.Audio is null || srcProfile.Audio.SampleRate == 0)
-            {
-                log?.Log($"   [extract] {Path.GetFileName(sourcePath)} has no usable audio stream");
-                return null;
-            }
-        }
-        catch (Exception ex)
-        {
-            log?.Log($"   [extract] couldn't read source profile for {sourcePath}: {ex.Message}");
-            return null;
-        }
 
         StorageFile? outFile = null;
         try
@@ -395,11 +550,26 @@ public static class ExportRenderer
             var prep       = await transcoder.PrepareFileTranscodeAsync(src, outFile, profile).AsTask(ct).ConfigureAwait(false);
             if (!prep.CanTranscode)
             {
-                log?.Log($"   [extract] PrepareFileTranscodeAsync failed for {Path.GetFileName(sourcePath)}: {prep.FailureReason}");
+                log?.Log($"   [extract] {Path.GetFileName(sourcePath)}: no audio (PrepareFileTranscodeAsync → {prep.FailureReason})");
                 try { await outFile.DeleteAsync(StorageDeleteOption.PermanentDelete); } catch { }
                 return null;
             }
             await prep.TranscodeAsync().AsTask(ct).ConfigureAwait(false);
+
+            // Empty output means the container had a track that named itself
+            // audio but produced no samples — treat as silent.
+            try
+            {
+                var basic = await outFile.GetBasicPropertiesAsync();
+                if (basic.Size == 0)
+                {
+                    log?.Log($"   [extract] {Path.GetFileName(sourcePath)}: transcode produced 0 bytes — treating as silent");
+                    try { await outFile.DeleteAsync(StorageDeleteOption.PermanentDelete); } catch { }
+                    return null;
+                }
+            }
+            catch { /* size check best-effort */ }
+
             log?.Log($"   [extract] {Path.GetFileName(sourcePath)} → {outFile.Path}");
             return outFile;
         }

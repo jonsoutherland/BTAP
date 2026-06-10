@@ -32,6 +32,7 @@ public sealed partial class VideoCompositorControl : UserControl
         public string SourcePath = string.Empty;
         public bool MediaOpened;
         public bool Disposed;
+        public long FrameCount;       // diagnostic: per-layer frame arrivals
     }
 
     private EditorViewModel? _vm;
@@ -39,6 +40,8 @@ public sealed partial class VideoCompositorControl : UserControl
     private readonly List<Layer> _layers = [];   // deepest first → drawn first → on back
     private readonly object _layersLock = new(); // guards _layers across UI / worker / render threads
     private bool _isPlaying;
+    private DateTime _lastSyncHeartbeatUtc = DateTime.MinValue;
+
 
     // The preview canvas size — derived from the first imported video clip's
     // native resolution, with a fallback to the project's export dimensions when
@@ -75,6 +78,15 @@ public sealed partial class VideoCompositorControl : UserControl
     private void OnCreateResources(CanvasAnimatedControl sender, CanvasCreateResourcesEventArgs args)
     {
         _device = sender.Device;
+        PlaybackLogger.Log($"OnCreateResources device={(_device is null ? "null" : "ok")} reason={args.Reason}");
+        try
+        {
+            _device.DeviceLost += (d, _) =>
+            {
+                PlaybackLogger.Log("!!! CanvasDevice.DeviceLost fired");
+            };
+        }
+        catch (Exception ex) { PlaybackLogger.Log($"DeviceLost hook THREW {ex.GetType().Name}: {ex.Message}"); }
     }
 
     // ── Public playback API (called by EditorPage) ────────────────────────
@@ -84,10 +96,11 @@ public sealed partial class VideoCompositorControl : UserControl
         _isPlaying = true;
         Layer[] snapshot;
         lock (_layersLock) snapshot = _layers.ToArray();
+        PlaybackLogger.Log($"Play layers={snapshot.Length}");
         foreach (var l in snapshot)
         {
             if (l.Disposed) continue;
-            try { l.Player.Play(); } catch { }
+            try { l.Player.Play(); } catch (Exception ex) { PlaybackLogger.Log($"Play clip={l.Clip.Id} THREW {ex.GetType().Name}: {ex.Message}"); }
         }
     }
 
@@ -96,10 +109,11 @@ public sealed partial class VideoCompositorControl : UserControl
         _isPlaying = false;
         Layer[] snapshot;
         lock (_layersLock) snapshot = _layers.ToArray();
+        PlaybackLogger.Log($"Pause layers={snapshot.Length}");
         foreach (var l in snapshot)
         {
             if (l.Disposed) continue;
-            try { l.Player.Pause(); } catch { }
+            try { l.Player.Pause(); } catch (Exception ex) { PlaybackLogger.Log($"Pause clip={l.Clip.Id} THREW {ex.GetType().Name}: {ex.Message}"); }
         }
     }
 
@@ -182,8 +196,20 @@ public sealed partial class VideoCompositorControl : UserControl
         }
 
         // Dispose & spin up new layers outside the lock
+        if (toDispose.Count > 0 || toAdd.Count > 0)
+            PlaybackLogger.Log($"Sync RECONCILE playhead={playhead.TotalSeconds:F3}s remove={toDispose.Count} add={toAdd.Count} desired={desired.Count}");
         foreach (var l in toDispose) DisposeLayer(l);
         foreach (var (t, c) in toAdd) _ = AddLayerAsync(t, c, playhead);
+
+        // 1Hz heartbeat — without this a long no-reconcile stretch leaves no
+        // markers and we can't tell from the log how close to clip-end the
+        // crash happened.
+        var now = DateTime.UtcNow;
+        if ((now - _lastSyncHeartbeatUtc).TotalSeconds >= 1.0)
+        {
+            _lastSyncHeartbeatUtc = now;
+            PlaybackLogger.Log($"SyncHB playhead={playhead.TotalSeconds:F3}s layers={_layers.Count} desired={desired.Count}");
+        }
     }
 
     private static TimelineClip? FirstClipAt(Track t, TimeSpan p)
@@ -197,9 +223,11 @@ public sealed partial class VideoCompositorControl : UserControl
     {
         if (_vm is null) return;
         var media = _vm.MediaBin.FirstOrDefault(m => m.Id == clip.SourceId);
-        if (media is null) return;
-        if (media.Type != MediaType.Video && media.Type != MediaType.Audio) return;
-        if (!System.IO.File.Exists(media.FilePath)) return;
+        if (media is null) { PlaybackLogger.Log($"AddLayer SKIP clip={clip.Id} reason=media-missing"); return; }
+        if (media.Type != MediaType.Video && media.Type != MediaType.Audio) { PlaybackLogger.Log($"AddLayer SKIP clip={clip.Id} reason=type={media.Type}"); return; }
+        if (!System.IO.File.Exists(media.FilePath)) { PlaybackLogger.Log($"AddLayer SKIP clip={clip.Id} reason=file-missing path={media.FilePath}"); return; }
+
+        PlaybackLogger.Log($"AddLayer ENTER clip={clip.Id} src={System.IO.Path.GetFileName(media.FilePath)} isVideo={media.Type == MediaType.Video}");
 
         // Video-frame-server only matters for video media — audio-only sources have
         // no frames and turning it on for them is wasted work.
@@ -236,23 +264,50 @@ public sealed partial class VideoCompositorControl : UserControl
 
         player.MediaOpened += (s, _) =>
         {
+            try
+            {
+                double natDur = 0;
+                try { natDur = s.PlaybackSession.NaturalDuration.TotalSeconds; } catch { }
+                var srcEnd = (layer.Clip.SourceStart + layer.Clip.Duration).TotalSeconds;
+                PlaybackLogger.Log($"MediaOpened clip={layer.Clip.Id} disposed={layer.Disposed} natDur={natDur:F3}s clipDur={layer.Clip.Duration.TotalSeconds:F3}s srcStart={layer.Clip.SourceStart.TotalSeconds:F3}s srcEnd={srcEnd:F3}s tlStart={layer.Clip.TimelineStart.TotalSeconds:F3}s tlEnd={layer.Clip.TimelineEnd.TotalSeconds:F3}s");
+            } catch { }
             if (layer.Disposed) return;
             layer.MediaOpened = true;
             SeekLayer(layer, _vm?.Project.Playhead ?? playhead);
-            if (_isPlaying && !layer.Disposed) try { s.Play(); } catch { }
+            if (_isPlaying && !layer.Disposed) try { s.Play(); } catch (Exception ex) { PlaybackLogger.Log($"MediaOpened Play() THREW clip={layer.Clip.Id} {ex.GetType().Name}: {ex.Message}"); }
         };
+        player.MediaFailed += (s, args) =>
+        {
+            PlaybackLogger.Log($"MediaFailed clip={layer.Clip.Id} error={args.Error} extError=0x{args.ExtendedErrorCode?.HResult:X8} msg={args.ErrorMessage}");
+        };
+        player.MediaEnded += (s, _) =>
+        {
+            double pos = 0; try { pos = s.PlaybackSession.Position.TotalSeconds; } catch { }
+            PlaybackLogger.Log($"MediaEnded clip={layer.Clip.Id} pos={pos:F3}s disposed={layer.Disposed}");
+        };
+        try
+        {
+            player.PlaybackSession.PlaybackStateChanged += (sess, _) =>
+            {
+                double pos = 0; try { pos = sess.Position.TotalSeconds; } catch { }
+                PlaybackLogger.Log($"PlaybackState clip={layer.Clip.Id} state={sess.PlaybackState} pos={pos:F3}s");
+            };
+        }
+        catch (Exception ex) { PlaybackLogger.Log($"PlaybackSession hook THREW clip={layer.Clip.Id} {ex.GetType().Name}: {ex.Message}"); }
         player.VideoFrameAvailable += OnVideoFrameAvailable;
 
         try
         {
             var file = await StorageFile.GetFileFromPathAsync(media.FilePath);
             // The user (or a tick) may have removed us in the meantime — bail if so.
-            if (layer.Disposed) return;
+            if (layer.Disposed) { PlaybackLogger.Log($"AddLayer ABORT clip={clip.Id} reason=disposed-before-source-assign"); return; }
             var src = MediaSource.CreateFromStorageFile(file);
             player.Source = new MediaPlaybackItem(src);
+            PlaybackLogger.Log($"AddLayer SOURCE-SET clip={clip.Id}");
         }
-        catch
+        catch (Exception ex)
         {
+            PlaybackLogger.Log($"AddLayer THREW clip={clip.Id} {ex.GetType().Name}: {ex.Message}");
             DisposeLayer(layer);
             lock (_layersLock) _layers.Remove(layer);
         }
@@ -274,31 +329,61 @@ public sealed partial class VideoCompositorControl : UserControl
                     }
                 }
             }
-            if (layer is null || layer.Disposed) return;
+            if (layer is null) { PlaybackLogger.Log("OnVideoFrame ORPHAN no-layer-for-sender"); return; }
 
             var device = _device;
             if (device is null) return;
 
-            int w = (int)sender.PlaybackSession.NaturalVideoWidth;
-            int h = (int)sender.PlaybackSession.NaturalVideoHeight;
-            if (w <= 0 || h <= 0) return;
-
+            // ALL access to sender (the MediaPlayer) and its surface happens under
+            // FrameLock. DisposeLayer takes this same lock to flip Disposed before
+            // it tears the player down, so observing Disposed=false here means the
+            // PlaybackSession + CopyFrameToVideoSurface calls below are safe.
+            // Without this gate, an in-flight invocation can read PlaybackSession
+            // on a player that's mid-Dispose() and AV the process — the symptom
+            // when two clips overlap and one of them leaves the playhead.
             lock (layer.FrameLock)
             {
-                if (layer.Disposed) return;
+                if (layer.Disposed) { PlaybackLogger.Log($"OnVideoFrame DISPOSED-RACE clip={layer.Clip.Id}"); return; }
+
+                int w, h;
+                double posSec = -1;
+                try
+                {
+                    w = (int)sender.PlaybackSession.NaturalVideoWidth;
+                    h = (int)sender.PlaybackSession.NaturalVideoHeight;
+                    posSec = sender.PlaybackSession.Position.TotalSeconds;
+                }
+                catch (Exception ex) { PlaybackLogger.Log($"OnVideoFrame PlaybackSession THREW clip={layer.Clip.Id} {ex.GetType().Name}: {ex.Message}"); return; }
+                if (w <= 0 || h <= 0) return;
+
+                // Per-layer heartbeat. Tight cadence (every 5 frames, ~6/sec at
+                // 30fps) so the last log line sits within ~80ms of the crash and
+                // we can tell which player's worker thread died.
+                long n = ++layer.FrameCount;
+                if (n == 1 || n % 5 == 0)
+                    PlaybackLogger.Log($"FrameHB clip={layer.Clip.Id} n={n} pos={posSec:F3}s {w}x{h}");
+
                 if (layer.Frame is null
                     || (int)layer.Frame.SizeInPixels.Width  != w
                     || (int)layer.Frame.SizeInPixels.Height != h)
                 {
                     try { layer.Frame?.Dispose(); } catch { }
                     try { layer.Frame = new CanvasRenderTarget(device, w, h, 96); }
-                    catch { layer.Frame = null; return; }
+                    catch (Exception ex) { PlaybackLogger.Log($"OnVideoFrame RT-alloc THREW clip={layer.Clip.Id} {ex.GetType().Name}: {ex.Message}"); layer.Frame = null; return; }
                 }
-                try { sender.CopyFrameToVideoSurface(layer.Frame); }
-                catch { /* device lost or transitional state — drop the frame */ }
+                // Serialize the native MF copy across every player. Without
+                // this, two FrameServer pipelines racing into CopyFrameToVideoSurface
+                // from worker threads AV the process intermittently (no managed
+                // exception, no device-lost — just dead). Shared with the export
+                // source pool via NativeFrameCopyGate.
+                lock (NativeFrameCopyGate.Lock)
+                {
+                    try { sender.CopyFrameToVideoSurface(layer.Frame); }
+                    catch (Exception ex) { PlaybackLogger.Log($"OnVideoFrame CopyFrame THREW clip={layer.Clip.Id} {ex.GetType().Name}: {ex.Message}\n{ex}"); }
+                }
             }
         }
-        catch { /* never let this handler throw — it'd kill the media pipeline */ }
+        catch (Exception ex) { PlaybackLogger.Log($"OnVideoFrame OUTER THREW {ex.GetType().Name}: {ex.Message}\n{ex}"); }
     }
 
     private void SeekLayer(Layer l, TimeSpan playhead)
@@ -311,23 +396,36 @@ public sealed partial class VideoCompositorControl : UserControl
 
     private void DisposeLayer(Layer l)
     {
-        if (l.Disposed) return;
-        l.Disposed = true;
+        if (l.Disposed) { PlaybackLogger.Log($"DisposeLayer SKIP clip={l.Clip.Id} already-disposed"); return; }
 
-        // Unhook the frame callback FIRST so no further worker-thread invocations
-        // race with disposal.
-        try { l.Player.VideoFrameAvailable -= OnVideoFrameAvailable; } catch { }
+        PlaybackLogger.Log($"DisposeLayer ENTER clip={l.Clip.Id} mediaOpened={l.MediaOpened}");
 
-        try { l.Player.Pause(); } catch { }
+        // Unhook FIRST so no NEW worker-thread invocations are queued after this
+        // point. One invocation may already be in flight; the FrameLock below
+        // makes its access to sender.PlaybackSession + the surface cooperative
+        // with the teardown sequence.
+        try { l.Player.VideoFrameAvailable -= OnVideoFrameAvailable; } catch (Exception ex) { PlaybackLogger.Log($"DisposeLayer unhook THREW clip={l.Clip.Id} {ex.GetType().Name}: {ex.Message}"); }
+        PlaybackLogger.Log($"DisposeLayer UNHOOKED clip={l.Clip.Id}");
 
+        // Flip Disposed and release the frame under FrameLock. OnVideoFrameAvailable
+        // takes the same lock around its sender access — once we exit this block,
+        // any in-flight invocation that subsequently enters the lock will observe
+        // Disposed=true and return without touching the MediaPlayer. That makes
+        // the player.Dispose() below safe even if a worker thread was about to
+        // call CopyFrameToVideoSurface a moment ago.
         lock (l.FrameLock)
         {
-            try { l.Frame?.Dispose(); } catch { }
+            l.Disposed = true;
+            try { l.Frame?.Dispose(); } catch (Exception ex) { PlaybackLogger.Log($"DisposeLayer Frame.Dispose THREW clip={l.Clip.Id} {ex.GetType().Name}: {ex.Message}"); }
             l.Frame = null;
         }
+        PlaybackLogger.Log($"DisposeLayer FRAME-FREED clip={l.Clip.Id}");
 
-        try { l.Player.Source = null; } catch { }
+        try { l.Player.Pause();       } catch (Exception ex) { PlaybackLogger.Log($"DisposeLayer Pause THREW clip={l.Clip.Id} {ex.GetType().Name}: {ex.Message}"); }
+        try { l.Player.Source = null; } catch (Exception ex) { PlaybackLogger.Log($"DisposeLayer Source=null THREW clip={l.Clip.Id} {ex.GetType().Name}: {ex.Message}"); }
+        PlaybackLogger.Log($"DisposeLayer PRE-PLAYER-DISPOSE clip={l.Clip.Id}");
         TryDisposePlayer(l.Player);
+        PlaybackLogger.Log($"DisposeLayer DONE clip={l.Clip.Id}");
     }
 
     private static void TryDisposePlayer(MediaPlayer p)
@@ -389,7 +487,7 @@ public sealed partial class VideoCompositorControl : UserControl
             {
                 if (layer.Disposed || layer.Frame is null) continue;
                 try { DrawLayer(ds, layer.Frame, layer.Clip, frameRect); }
-                catch { /* defensive — disposed frame, device loss, etc */ }
+                catch (Exception ex) { PlaybackLogger.Log($"DrawLayer THREW clip={layer.Clip.Id} {ex.GetType().Name}: {ex.Message}\n{ex}"); }
             }
         }
     }
@@ -446,13 +544,28 @@ public sealed partial class VideoCompositorControl : UserControl
                                Math.Max(1, (1 - cl - cr) * srcW),
                                Math.Max(1, (1 - ct - cb) * srcH));
 
-        // Destination rect: project frame fitted into frameRect, then per-clip
-        // Scale and PosX/Y (PosX/Y are in project-pixel units, e.g. -1920..1920).
-        // Then carve out the cropped sub-rect so cropped pixels keep their original
+        // Destination rect: source frame fitted into frameRect at its native
+        // aspect (letterbox/pillarbox so portrait clips don't stretch into a
+        // landscape canvas, and vice versa), then per-clip Scale and PosX/Y
+        // (PosX/Y are in project-pixel units, e.g. -1920..1920). Then carve
+        // out the cropped sub-rect so cropped pixels keep their original
         // on-screen size instead of stretching to fill the un-cropped dest.
         double scale = Math.Clamp(clip.Scale, 0.05, 10);
-        double fullW = frameRect.Width  * scale;
-        double fullH = frameRect.Height * scale;
+        double srcAspect = srcW / srcH;
+        double canvasAspect = frameRect.Width / frameRect.Height;
+        double fitW, fitH;
+        if (srcAspect >= canvasAspect)
+        {
+            fitW = frameRect.Width;
+            fitH = frameRect.Width / srcAspect;
+        }
+        else
+        {
+            fitH = frameRect.Height;
+            fitW = frameRect.Height * srcAspect;
+        }
+        double fullW = fitW * scale;
+        double fullH = fitH * scale;
         double offX  = clip.PosX / Math.Max(1, OutputWidth)  * frameRect.Width;
         double offY  = clip.PosY / Math.Max(1, OutputHeight) * frameRect.Height;
         double fullX = frameRect.X + (frameRect.Width  - fullW) / 2 + offX;

@@ -23,6 +23,16 @@ public sealed class ExportVideoStreamSource : IDisposable
     private readonly CancellationTokenSource _cts = new();
     private long _frameIndex;
 
+    // Per-frame the encoder needs a Width*Height*4 byte buffer (Bgra8). At
+    // 1080×1920 that's 8 MB, which is on the Large Object Heap — every frame
+    // freshly allocated triggers Gen-2 GCs every few seconds and was a major
+    // contributor to the slow export. Rotate through a small fixed set of
+    // buffers; the MediaTranscoder's pipeline depth is bounded so by the time
+    // we're back at buffer index N, sample N has been consumed.
+    private const int  PixelBufferCount = 4;
+    private readonly byte[]?[] _pixelBuffers = new byte[PixelBufferCount][];
+    private int _pixelBufferIdx;
+
     public MediaStreamSource StreamSource { get; }
 
     public ExportVideoStreamSource(Project project, TimeSpan duration, FrameRenderer renderer, ExportLogger? log = null)
@@ -88,19 +98,29 @@ public sealed class ExportVideoStreamSource : IDisposable
                     return;
                 }
 
-                // CanvasRenderTarget hands us BGRA top-down (Y=0 at the top of the
-                // image). MediaFoundation's BGRA8 uncompressed-video convention is
-                // bottom-up — feeding top-down bytes makes the encoder flip the frame
-                // vertically. Reverse the rows so the output reads as expected.
-                var bytes  = frame.GetPixelBytes();
-                int w      = (int)frame.SizeInPixels.Width;
-                int h      = (int)frame.SizeInPixels.Height;
-                int stride = w * 4;
-                var flipped = new byte[bytes.Length];
-                for (int y = 0; y < h; y++)
-                    Buffer.BlockCopy(bytes, y * stride, flipped, (h - 1 - y) * stride, stride);
-
-                var buffer = flipped.AsBuffer();
+                // ExportFrameCompositor renders the scene upside-down on the GPU
+                // (Y-axis negated in its output transform), so reading the RT
+                // top-down already produces the bottom-up byte order MF's BGRA8
+                // uncompressed-video convention expects.
+                //
+                // Buffer reuse: rotate through PixelBufferCount fixed buffers so
+                // we don't allocate 8 MB per frame on the LOH. The transcoder
+                // pipeline holds onto a few samples at a time before consuming,
+                // so a small ring is enough; by the time we revisit a slot the
+                // encoder has long since released that sample's buffer.
+                int w        = (int)frame.SizeInPixels.Width;
+                int h        = (int)frame.SizeInPixels.Height;
+                int required = w * h * 4;
+                int idx      = _pixelBufferIdx;
+                _pixelBufferIdx = (idx + 1) % PixelBufferCount;
+                var buf = _pixelBuffers[idx];
+                if (buf is null || buf.Length != required)
+                {
+                    buf = new byte[required];
+                    _pixelBuffers[idx] = buf;
+                }
+                var buffer = buf.AsBuffer();
+                frame.GetPixelBytes(buffer);
                 var sample = MediaStreamSample.CreateFromBuffer(buffer, time);
                 sample.Duration = _frameDuration;
                 sample.KeyFrame = true;

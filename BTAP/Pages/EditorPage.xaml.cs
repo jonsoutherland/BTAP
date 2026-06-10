@@ -63,6 +63,16 @@ public sealed partial class EditorPage : Page
         _vm = new EditorViewModel(project);
         VideoCompositor.Attach(_vm);
 
+        // TEMPORARY: open a playback diagnostic log next to the project file
+        // (or in temp when unsaved). Re-init whenever the path changes so a
+        // Save-As writes the log alongside the new file.
+        BTAP.Services.PlaybackLogger.Initialize(project.FilePath);
+        project.PropertyChanged += (s, ev) =>
+        {
+            if (ev.PropertyName == nameof(Project.FilePath))
+                BTAP.Services.PlaybackLogger.Initialize(project.FilePath);
+        };
+
         TbFilename.Text = project.Name;
 
         SetActiveModeBtn(BtnModeEdit);
@@ -174,6 +184,7 @@ public sealed partial class EditorPage : Page
         StopPlayback();
         _statusTimer?.Stop();
         _statusTimer = null;
+        BTAP.Services.PlaybackLogger.Shutdown();
         if (_vm is not null)
         {
             _vm.History.Changed -= OnHistoryChangedForPreview;
@@ -4210,10 +4221,15 @@ public sealed partial class EditorPage : Page
     }
 
     /// <summary>Compact slider with no surrounding label — used as the inner
-    /// editor inside MakeEffectNumberSlider and the Automations details rows.</summary>
+    /// editor inside MakeEffectNumberSlider and the Automations details rows.
+    /// StepFrequency is set to ~500 steps across the range so dragging the thumb
+    /// fires ValueChanged on every visible pixel of movement (without it the
+    /// slider snaps in big jumps and feels click-only). The thumb tooltip is
+    /// disabled because it can interrupt rapid drags.</summary>
     private Slider MakeBareSlider(double min, double max, double value, Action<double> onChange)
     {
         double range = max - min;
+        double step  = Math.Max(range / 500.0, 1e-4);
         var slider = new Slider
         {
             Minimum = min,
@@ -4221,9 +4237,10 @@ public sealed partial class EditorPage : Page
             Value   = value,
             Foreground = (Brush)Application.Current.Resources["AccentBrush"],
             HorizontalAlignment = HorizontalAlignment.Stretch,
-            StepFrequency = range > 20 ? 1 : 0.01,
-            SmallChange   = range > 20 ? 1 : 0.01,
-            Margin = new Thickness(0, -4, 0, -8),
+            StepFrequency = step,
+            SmallChange   = step,
+            LargeChange   = range / 10.0,
+            IsThumbToolTipEnabled = false,
         };
         slider.ValueChanged += (_, ev) => onChange(ev.NewValue);
         return slider;
