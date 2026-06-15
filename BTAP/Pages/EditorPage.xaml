@@ -138,6 +138,8 @@
                                 <MenuFlyoutItem Text="Delete"            Click="OnEditDelete"    KeyboardAcceleratorTextOverride="Del" />
                                 <MenuFlyoutSeparator />
                                 <MenuFlyoutItem Text="Ripple delete"     Click="OnClipRippleDelete" KeyboardAcceleratorTextOverride="Shift+Del" />
+                                <MenuFlyoutSeparator />
+                                <MenuFlyoutItem Text="Generate captions…" Click="OnGenerateCaptions" />
                             </MenuFlyout>
                         </Button.Flyout>
                     </Button>
@@ -311,7 +313,7 @@
             </Grid>
 
             <!-- ── Center: preview + timeline ─────────────────────── -->
-            <Grid Grid.Column="1" RowDefinitions="*,Auto,Auto,240"
+            <Grid x:Name="CenterPanel" Grid.Column="1" RowDefinitions="*,Auto,Auto,240"
                   BorderBrush="{StaticResource HairlineBrush}"
                   BorderThickness="0,0,1,0">
 
@@ -619,6 +621,12 @@
                                         <Grid.RenderTransform>
                                             <CompositeTransform x:Name="TitleClipTransform" />
                                         </Grid.RenderTransform>
+                                        <!-- Background fill driven by clip.TextBackground. Sits behind
+                                             the text + editor so a non-transparent color paints a card
+                                             around the title. Transparent by default. -->
+                                        <Rectangle x:Name="TitleClipBackground"
+                                                   Fill="Transparent"
+                                                   IsHitTestVisible="False" />
                                         <!-- Selection affordance: same dashed accent border that video
                                              clips show via TransformBox. Stretches to the text bounds. -->
                                         <Rectangle x:Name="TitleClipBorder"
@@ -861,6 +869,10 @@
                                     Style="{StaticResource GhostButtonStyle}" Padding="7,4"
                                     Foreground="{StaticResource AccentInkBrush}"
                                     ToolTipService.ToolTip="Snapping (S)" />
+                            <Button x:Name="BtnTrackSelectForward" Content="⇥"
+                                    Click="OnTrackSelectForward"
+                                    Style="{StaticResource GhostButtonStyle}" Padding="7,4"
+                                    ToolTipService.ToolTip="Select clips forward (all clips at or after playhead)" />
                             <Button Content="⋯" Style="{StaticResource GhostButtonStyle}" Padding="7,4"
                                     Click="OnClipRippleDelete"
                                     ToolTipService.ToolTip="Ripple delete (Shift+Del)" />
@@ -931,6 +943,7 @@
 
                         <!-- Inspector tabs -->
                         <StackPanel Orientation="Horizontal" Spacing="2">
+                            <Button x:Name="BtnInspText"   Content="Text"        Tag="text"        Click="OnInspTabClick" Style="{StaticResource GhostButtonStyle}" FontSize="10.5" Padding="7,3" Visibility="Collapsed" />
                             <Button x:Name="BtnInspVideo"  Content="Video"       Tag="video"       Click="OnInspTabClick" Style="{StaticResource GhostButtonStyle}" FontSize="10.5" Padding="7,3" Background="{StaticResource BgElevatedBrush}" Foreground="{StaticResource TextPrimaryBrush}" />
                             <Button x:Name="BtnInspAudio"  Content="Audio"       Tag="audio"       Click="OnInspTabClick" Style="{StaticResource GhostButtonStyle}" FontSize="10.5" Padding="7,3" />
                             <Button x:Name="BtnInspFX"     Content="Effects"     Tag="effects"     Click="OnInspTabClick" Style="{StaticResource GhostButtonStyle}" FontSize="10.5" Padding="7,3" />

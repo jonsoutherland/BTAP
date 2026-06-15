@@ -39,6 +39,7 @@ public sealed class ExportSinkRenderer : IDisposable
     private readonly ExportLogger? _log;
     private readonly TimeSpan _frameDuration;
     private readonly int _bitrate;
+    private readonly double _frameRate;
 
     private IMFSinkWriter? _sinkWriter;
     private int _streamIndex;
@@ -65,18 +66,22 @@ public sealed class ExportSinkRenderer : IDisposable
     public ExportSinkRenderer(Project project, string outputPath,
                               IMFDXGIDeviceManager deviceManager,
                               ID3D11Device d3dDevice,
-                              ExportLogger? log)
+                              ExportLogger? log,
+                              int? bitrateOverride = null,
+                              double? frameRateOverride = null)
     {
         _project       = project;
         _outputPath    = outputPath;
         _deviceManager = deviceManager;
         _d3dDevice     = d3dDevice;
         _log           = log;
-        var fps        = Math.Max(1, project.FrameRate);
-        _frameDuration = TimeSpan.FromSeconds(1.0 / fps);
+        _frameRate     = Math.Max(1, frameRateOverride ?? project.FrameRate);
+        _frameDuration = TimeSpan.FromSeconds(1.0 / _frameRate);
         // Was 0.1 (≈12 Mbps for 1080p60); 0.16 lands at ≈20 Mbps which is
         // closer to what other editors default to for "high quality" 1080p.
-        _bitrate       = (int)Math.Max(2_000_000, project.Width * project.Height * fps * 0.16);
+        _bitrate       = bitrateOverride
+                         ?? (int)Math.Max(2_000_000,
+                                          project.Width * project.Height * _frameRate * 0.16);
     }
 
     private static void EnsureMFStarted()
@@ -130,7 +135,7 @@ public sealed class ExportSinkRenderer : IDisposable
         outputType.Set(MediaTypeAttributeKeys.AvgBitrate,       (uint)_bitrate);
         outputType.Set(MediaTypeAttributeKeys.InterlaceMode,    (uint)VideoInterlaceMode.Progressive);
         outputType.Set(MediaTypeAttributeKeys.FrameSize,        PackUint32Pair((uint)_project.Width, (uint)_project.Height));
-        outputType.Set(MediaTypeAttributeKeys.FrameRate,        PackUint32Pair((uint)Math.Round(_project.FrameRate), 1));
+        outputType.Set(MediaTypeAttributeKeys.FrameRate,        PackUint32Pair((uint)Math.Round(_frameRate), 1));
         outputType.Set(MediaTypeAttributeKeys.PixelAspectRatio, PackUint32Pair(1, 1));
 
         // H.264 Profile + Level: critical at 60 fps. Without an explicit
@@ -166,7 +171,7 @@ public sealed class ExportSinkRenderer : IDisposable
         inputType.Set(MediaTypeAttributeKeys.Subtype,          VideoFormatGuids.Argb32);
         inputType.Set(MediaTypeAttributeKeys.InterlaceMode,    (uint)VideoInterlaceMode.Progressive);
         inputType.Set(MediaTypeAttributeKeys.FrameSize,        PackUint32Pair((uint)_project.Width, (uint)_project.Height));
-        inputType.Set(MediaTypeAttributeKeys.FrameRate,        PackUint32Pair((uint)Math.Round(_project.FrameRate), 1));
+        inputType.Set(MediaTypeAttributeKeys.FrameRate,        PackUint32Pair((uint)Math.Round(_frameRate), 1));
         inputType.Set(MediaTypeAttributeKeys.PixelAspectRatio, PackUint32Pair(1, 1));
         inputType.Set(MediaTypeAttributeKeys.DefaultStride,    (uint)(_project.Width * 4));
 
@@ -176,7 +181,7 @@ public sealed class ExportSinkRenderer : IDisposable
         _sinkWriter.BeginWriting();
         _sampleTime = 0;
 
-        _log?.Log($"   [sink] writer started — H.264 {_project.Width}x{_project.Height} @ {_project.FrameRate}fps, " +
+        _log?.Log($"   [sink] writer started — H.264 {_project.Width}x{_project.Height} @ {_frameRate}fps, " +
                   $"bitrate={_bitrate}, GPU-direct (no CPU readback), retention={PendingFrameDepth}");
     }
 

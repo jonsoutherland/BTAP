@@ -33,6 +33,13 @@ public sealed partial class VideoCompositorControl : UserControl
         public bool MediaOpened;
         public bool Disposed;
         public long FrameCount;       // diagnostic: per-layer frame arrivals
+
+        // Animated GIF: pre-decoded frames + per-frame delays (ms). When set,
+        // Frame is rebound at draw time to GifFrames[i] based on the playhead's
+        // offset into the clip (mod GifTotalDurationMs). Owning the frames here
+        // means DisposeLayer releases every frame, not just the active one.
+        public List<(CanvasRenderTarget Rt, int DelayMs)>? GifFrames;
+        public int GifTotalDurationMs;
     }
 
     private EditorViewModel? _vm;
@@ -40,7 +47,15 @@ public sealed partial class VideoCompositorControl : UserControl
     private readonly List<Layer> _layers = [];   // deepest first → drawn first → on back
     private readonly object _layersLock = new(); // guards _layers across UI / worker / render threads
     private bool _isPlaying;
+    private bool _pendingInitialSync;            // Attach defers Sync until Canvas device is ready
     private DateTime _lastSyncHeartbeatUtc = DateTime.MinValue;
+
+    // Audio engine: AudioGraph-based pipeline that applies per-clip effects from
+    // ClipEffectsChain's audio list. When this initializes successfully the
+    // MediaPlayer's audio is muted (audio plays exclusively through the engine);
+    // otherwise we fall back to MediaPlayer audio so users still hear sound.
+    private readonly AudioEngine _audioEngine = new();
+    private bool _audioEngineReady;
 
 
     // The preview canvas size — derived from the first imported video clip's
@@ -59,20 +74,129 @@ public sealed partial class VideoCompositorControl : UserControl
     public VideoCompositorControl()
     {
         InitializeComponent();
-        Unloaded += (_, _) => DisposeAllLayers();
+        Unloaded += (_, _) =>
+        {
+            // ContentDialog (and ScrollViewer) reparent their content during
+            // layout, which fires Unloaded → Loaded transitions even when the
+            // control is logically still in use. Externally-managed instances
+            // (the export-preview dialog) handle their own teardown, so suppress
+            // the auto-dispose to avoid losing the layer pool mid-show.
+            if (ExternallyManaged) return;
+            DisposeAllLayers();
+            try { _audioEngine.Dispose(); } catch { }
+        };
     }
+
+    /// <summary>When true, the Unloaded handler will NOT dispose layers or the
+    /// audio engine — the host is responsible for explicit teardown via
+    /// <see cref="Detach"/>. Used by the export-preview dialog so transient
+    /// dialog-layout reparenting doesn't drop frames mid-playback.</summary>
+    public bool ExternallyManaged { get; set; }
+
+    /// <summary>When true, only the project's export window is rendered (zoomed
+    /// to fill the canvas), instead of the full work canvas with letterbox.
+    /// This makes the preview match exactly what comes out of the exporter,
+    /// rather than the editor's wider working view. Bounds should be sized to
+    /// the project's export aspect (project.Width:project.Height).</summary>
+    public bool RenderExportWindowOnly { get; set; }
 
     public void Attach(EditorViewModel vm)
     {
         if (ReferenceEquals(_vm, vm)) return;
         DisposeAllLayers();
         _vm = vm;
+        // Kick off engine init eagerly so the first Play doesn't pay the latency.
+        _ = InitAudioEngineAsync();
+        // Materialise the layers at the project's current playhead so the preview
+        // shows the first frame of any clip under it on load — without this the
+        // viewport stays blank until the user hits Play. Device may not be ready
+        // yet when Attach runs (Canvas creates it on first paint), so flag it and
+        // let OnCreateResources finish the job.
+        _pendingInitialSync = true;
+        RunPendingInitialSync();
     }
+
+    private void RunPendingInitialSync()
+    {
+        if (!_pendingInitialSync || _vm is null || _device is null) return;
+        _pendingInitialSync = false;
+        var p = _vm.Project.Playhead;
+        Sync(p);
+        Seek(p);
+    }
+
+    private async Task InitAudioEngineAsync()
+    {
+        if (SuppressAudio) return;
+        _audioEngineReady = await _audioEngine.EnsureInitializedAsync();
+        PlaybackLogger.Log($"AudioEngine ready={_audioEngineReady}");
+    }
+
+    /// <summary>Exposed so the EditorPage inspector can ask the engine to re-build
+    /// effect chains after the user moves a slider that changed clip.Effects or
+    /// clip.EqLow/Mid/High.</summary>
+    public void NotifyAudioParamsChanged()
+    {
+        if (_audioEngineReady) _audioEngine.UpdateAllEffects();
+    }
+
+    /// <summary>When true, audio is suppressed for this instance: MediaPlayer audio
+    /// is muted, the AudioEngine is never initialized, and per-clip gain is left
+    /// at zero. Used by the export-preview dialog so its mini-compositor doesn't
+    /// double-play the soundtrack on top of the editor's audio.</summary>
+    public bool SuppressAudio { get; set; }
+
+    /// <summary>Set MediaPlayer.PlaybackRate on every active layer. The preview
+    /// dialog drives this to 10× to speed-scrub through the timeline; export and
+    /// the editor's main playback both leave it at 1×.</summary>
+    public void SetPlaybackRate(double rate)
+    {
+        Layer[] snapshot;
+        lock (_layersLock) snapshot = _layers.ToArray();
+        foreach (var l in snapshot)
+        {
+            if (l.Disposed) continue;
+            try { l.Player.PlaybackSession.PlaybackRate = rate; } catch { }
+        }
+        _playbackRate = rate;
+    }
+
+    private double _playbackRate = 1.0;
 
     public void Detach()
     {
         DisposeAllLayers();
         _vm = null;
+        _pendingInitialSync = false;
+    }
+
+    /// <summary>Fires (on the UI thread) when a layer's source frame is first
+    /// allocated or its pixel dimensions change. The editor uses this to
+    /// recompute the TransformOverlay box now that the real source dims are
+    /// known — without it, the box stays stuck at the canvas-fallback size
+    /// for clips whose MediaItem metadata wasn't probed/persisted.</summary>
+    public event EventHandler<string>? LayerFrameSizeChanged;
+
+    /// <summary>Returns the pixel dimensions of the most recently decoded frame
+    /// for <paramref name="clipId"/>, or null if no frame has been received yet
+    /// (compositor still warming up, or the clip has no layer). The editor's
+    /// TransformOverlay uses this to size the selection box from the same
+    /// source dimensions DrawLayer uses — staying correct even when the
+    /// MediaItem metadata wasn't probed/persisted (e.g. old project format).</summary>
+    public (double Width, double Height)? GetSourceFrameSize(string clipId)
+    {
+        Layer[] snapshot;
+        lock (_layersLock) snapshot = _layers.ToArray();
+        foreach (var l in snapshot)
+        {
+            if (l.Clip?.Id != clipId) continue;
+            lock (l.FrameLock)
+            {
+                if (l.Disposed || l.Frame is null) return null;
+                return (l.Frame.SizeInPixels.Width, l.Frame.SizeInPixels.Height);
+            }
+        }
+        return null;
     }
 
     private void OnCreateResources(CanvasAnimatedControl sender, CanvasCreateResourcesEventArgs args)
@@ -87,6 +211,7 @@ public sealed partial class VideoCompositorControl : UserControl
             };
         }
         catch (Exception ex) { PlaybackLogger.Log($"DeviceLost hook THREW {ex.GetType().Name}: {ex.Message}"); }
+        RunPendingInitialSync();
     }
 
     // ── Public playback API (called by EditorPage) ────────────────────────
@@ -102,6 +227,7 @@ public sealed partial class VideoCompositorControl : UserControl
             if (l.Disposed) continue;
             try { l.Player.Play(); } catch (Exception ex) { PlaybackLogger.Log($"Play clip={l.Clip.Id} THREW {ex.GetType().Name}: {ex.Message}"); }
         }
+        if (_audioEngineReady) _audioEngine.Play();
     }
 
     public void Pause()
@@ -115,6 +241,7 @@ public sealed partial class VideoCompositorControl : UserControl
             if (l.Disposed) continue;
             try { l.Player.Pause(); } catch (Exception ex) { PlaybackLogger.Log($"Pause clip={l.Clip.Id} THREW {ex.GetType().Name}: {ex.Message}"); }
         }
+        if (_audioEngineReady) _audioEngine.Pause();
     }
 
     public void Seek(TimeSpan playhead)
@@ -122,6 +249,7 @@ public sealed partial class VideoCompositorControl : UserControl
         Layer[] snapshot;
         lock (_layersLock) snapshot = _layers.ToArray();
         foreach (var l in snapshot) SeekLayer(l, playhead);
+        if (_audioEngineReady) _audioEngine.SeekAll(playhead);
     }
 
     /// <summary>Reconcile the active layer set with the clips currently under the playhead.</summary>
@@ -174,10 +302,11 @@ public sealed partial class VideoCompositorControl : UserControl
                 return ia.CompareTo(ib);
             });
 
-            // Every active video layer plays its audio — the OS mixer sums them at the
-            // output. Per-clip Volume from the inspector is honored via Player.Volume,
-            // sampled from the clip's volume envelope at the current playhead so
-            // automation keyframes drive the audible level (not just the waveform).
+            // Per-clip gain at the current playhead — sampled from the clip's volume
+            // envelope so automation keyframes drive the audible level. When the
+            // AudioEngine is ready, audio plays through it (MediaPlayer is muted);
+            // otherwise we fall back to MediaPlayer.Volume so the user still gets
+            // sound on hardware where AudioGraph couldn't init.
             for (int i = 0; i < _layers.Count; i++)
             {
                 if (_layers[i].Disposed) continue;
@@ -188,8 +317,20 @@ public sealed partial class VideoCompositorControl : UserControl
                 double vol = clip.GetVolumeAt(Math.Clamp(timeRel, 0, 1));
                 try
                 {
-                    _layers[i].Player.IsMuted = false;
-                    _layers[i].Player.Volume  = Math.Clamp(vol, 0, 1);
+                    if (SuppressAudio)
+                    {
+                        _layers[i].Player.IsMuted = true;
+                    }
+                    else if (_audioEngineReady)
+                    {
+                        _layers[i].Player.IsMuted = true;
+                        _audioEngine.SetClipGain(clip.Id, vol);
+                    }
+                    else
+                    {
+                        _layers[i].Player.IsMuted = false;
+                        _layers[i].Player.Volume  = Math.Clamp(vol, 0, 1);
+                    }
                 }
                 catch { }
             }
@@ -219,19 +360,304 @@ public sealed partial class VideoCompositorControl : UserControl
         return null;
     }
 
+    /// <summary>Loads a still-image clip into a CanvasRenderTarget so the regular
+    /// draw loop renders it the same way it renders a video frame. A dummy muted
+    /// MediaPlayer is attached so all the Player.* calls in the layer-management
+    /// code paths (Pause/SetPlaybackRate/Volume) stay no-op-safe.</summary>
+    private async Task AddImageLayerAsync(Track track, TimelineClip clip, MediaItem media)
+    {
+        if (_vm is null) return;
+        var device = _device;
+        if (device is null) { PlaybackLogger.Log($"AddLayer SKIP image clip={clip.Id} reason=device-null"); return; }
+
+        MediaPlayer dummy;
+        try
+        {
+            dummy = new MediaPlayer
+            {
+                AutoPlay                  = false,
+                IsMuted                   = true,
+                IsVideoFrameServerEnabled = false,
+            };
+        }
+        catch { return; }
+
+        var layer = new Layer
+        {
+            Track      = track,
+            Clip       = clip,
+            SourcePath = media.FilePath,
+            Player     = dummy,
+        };
+
+        lock (_layersLock)
+        {
+            if (!_vm.Tracks.SelectMany(t => t.Clips).Any(c => ReferenceEquals(c, clip)))
+            { TryDisposePlayer(dummy); return; }
+            _layers.Add(layer);
+        }
+
+        try
+        {
+            var bitmap = await Microsoft.Graphics.Canvas.CanvasBitmap.LoadAsync(device, media.FilePath);
+            if (layer.Disposed) { try { bitmap.Dispose(); } catch { } return; }
+
+            // Bake the bitmap into a render target so Layer.Frame's type
+            // (CanvasRenderTarget) matches the video path, and so the bitmap's
+            // resources are owned by the layer (not by the load result).
+            var w = (int)Math.Max(1, bitmap.SizeInPixels.Width);
+            var h = (int)Math.Max(1, bitmap.SizeInPixels.Height);
+            var rt = new Microsoft.Graphics.Canvas.CanvasRenderTarget(device, w, h, 96);
+            using (var ds = rt.CreateDrawingSession())
+            {
+                ds.Clear(Windows.UI.Color.FromArgb(0, 0, 0, 0));
+                ds.DrawImage(bitmap);
+            }
+            try { bitmap.Dispose(); } catch { }
+
+            lock (layer.FrameLock)
+            {
+                if (!layer.Disposed) layer.Frame = rt;
+                else try { rt.Dispose(); } catch { }
+            }
+            layer.MediaOpened = true;
+            PlaybackLogger.Log($"AddLayer IMAGE clip={clip.Id} src={System.IO.Path.GetFileName(media.FilePath)} {w}x{h}");
+        }
+        catch (Exception ex)
+        {
+            PlaybackLogger.Log($"AddLayer image-load THREW clip={clip.Id} {ex.GetType().Name}: {ex.Message}");
+            DisposeLayer(layer);
+            lock (_layersLock) _layers.Remove(layer);
+        }
+    }
+
+    /// <summary>Loads every frame of an animated GIF into its own CanvasRenderTarget
+    /// along with the per-frame delay metadata, so DrawScene can pick the frame
+    /// matching the current playhead. Composites each frame against an accumulator
+    /// to honour the GIF disposal model (most optimized GIFs paint only the rect
+    /// that changed each frame).</summary>
+    private async Task AddGifLayerAsync(Track track, TimelineClip clip, MediaItem media)
+    {
+        if (_vm is null) return;
+        var device = _device;
+        if (device is null) { PlaybackLogger.Log($"AddLayer SKIP gif clip={clip.Id} reason=device-null"); return; }
+
+        MediaPlayer dummy;
+        try
+        {
+            dummy = new MediaPlayer
+            {
+                AutoPlay                  = false,
+                IsMuted                   = true,
+                IsVideoFrameServerEnabled = false,
+            };
+        }
+        catch { return; }
+
+        var layer = new Layer
+        {
+            Track      = track,
+            Clip       = clip,
+            SourcePath = media.FilePath,
+            Player     = dummy,
+        };
+
+        lock (_layersLock)
+        {
+            if (!_vm.Tracks.SelectMany(t => t.Clips).Any(c => ReferenceEquals(c, clip)))
+            { TryDisposePlayer(dummy); return; }
+            _layers.Add(layer);
+        }
+
+        try
+        {
+            var file = await StorageFile.GetFileFromPathAsync(media.FilePath);
+            using var stream = await file.OpenAsync(FileAccessMode.Read);
+            var decoder = await Windows.Graphics.Imaging.BitmapDecoder.CreateAsync(
+                Windows.Graphics.Imaging.BitmapDecoder.GifDecoderId, stream);
+            int canvasW = (int)Math.Max(1, decoder.PixelWidth);
+            int canvasH = (int)Math.Max(1, decoder.PixelHeight);
+            int count   = (int)decoder.FrameCount;
+            if (count <= 0) { PlaybackLogger.Log($"AddLayer GIF clip={clip.Id} frameCount=0 — falling back to still image"); }
+
+            // Single-frame GIF: nothing animated to do; route through the still-image path.
+            if (count <= 1)
+            {
+                lock (_layersLock) _layers.Remove(layer);
+                TryDisposePlayer(dummy);
+                await AddImageLayerAsync(track, clip, media);
+                return;
+            }
+
+            var frames = new List<(CanvasRenderTarget Rt, int DelayMs)>(count);
+            int total = 0;
+
+            // Accumulator holds the composited result so far. Each frame's local
+            // patch is drawn into it; the snapshot taken before applying the next
+            // frame's disposal becomes the frame the user sees.
+            var accum = new Microsoft.Graphics.Canvas.CanvasRenderTarget(device, canvasW, canvasH, 96);
+            using (var ds = accum.CreateDrawingSession())
+                ds.Clear(Windows.UI.Color.FromArgb(0, 0, 0, 0));
+
+            Microsoft.Graphics.Canvas.CanvasRenderTarget? prevSnapshot = null;
+
+            try
+            {
+                for (uint i = 0; i < count; i++)
+                {
+                    if (layer.Disposed) break;
+
+                    var frame = await decoder.GetFrameAsync(i);
+
+                    int left = 0, top = 0;
+                    int fw = (int)frame.PixelWidth;
+                    int fh = (int)frame.PixelHeight;
+                    int disposal = 0;
+                    int delayMs  = 0;
+                    try
+                    {
+                        var props = await frame.BitmapProperties.GetPropertiesAsync(new[]
+                        {
+                            "/imgdesc/Left", "/imgdesc/Top",
+                            "/imgdesc/Width", "/imgdesc/Height",
+                            "/grctlext/Disposal", "/grctlext/Delay",
+                        });
+                        if (props.TryGetValue("/imgdesc/Left",     out var v) && v.Value is ushort ul) left = ul;
+                        if (props.TryGetValue("/imgdesc/Top",      out v) && v.Value is ushort ut) top  = ut;
+                        if (props.TryGetValue("/imgdesc/Width",    out v) && v.Value is ushort uw) fw   = uw;
+                        if (props.TryGetValue("/imgdesc/Height",   out v) && v.Value is ushort uh) fh   = uh;
+                        if (props.TryGetValue("/grctlext/Disposal",out v) && v.Value is byte   ud) disposal = ud;
+                        if (props.TryGetValue("/grctlext/Delay",   out v) && v.Value is ushort ud2) delayMs = ud2 * 10;
+                    }
+                    catch (Exception ex) { PlaybackLogger.Log($"AddLayer GIF clip={clip.Id} meta-read THREW frame={i} {ex.GetType().Name}: {ex.Message}"); }
+
+                    // Browsers floor very small delays (most treat 0/10/20ms as 100ms)
+                    // to keep tiny-delay GIFs from pinning the CPU. Match that so a
+                    // 10ms delay doesn't render as a 100Hz strobe in the preview.
+                    if (delayMs <= 20) delayMs = 100;
+
+                    var pix = await frame.GetPixelDataAsync(
+                        Windows.Graphics.Imaging.BitmapPixelFormat.Bgra8,
+                        Windows.Graphics.Imaging.BitmapAlphaMode.Premultiplied,
+                        new Windows.Graphics.Imaging.BitmapTransform(),
+                        Windows.Graphics.Imaging.ExifOrientationMode.IgnoreExifOrientation,
+                        Windows.Graphics.Imaging.ColorManagementMode.DoNotColorManage);
+                    var bytes = pix.DetachPixelData();
+
+                    // Save accumulator BEFORE patching so disposal=3 (restore-to-previous)
+                    // can roll back after we snapshot this frame.
+                    if (disposal == 3)
+                    {
+                        try { prevSnapshot?.Dispose(); } catch { }
+                        prevSnapshot = new Microsoft.Graphics.Canvas.CanvasRenderTarget(device, canvasW, canvasH, 96);
+                        using var ds = prevSnapshot.CreateDrawingSession();
+                        ds.DrawImage(accum);
+                    }
+
+                    using (var patch = Microsoft.Graphics.Canvas.CanvasBitmap.CreateFromBytes(
+                        device, bytes, fw, fh,
+                        Windows.Graphics.DirectX.DirectXPixelFormat.B8G8R8A8UIntNormalized))
+                    {
+                        using var ds = accum.CreateDrawingSession();
+                        ds.Blend = Microsoft.Graphics.Canvas.CanvasBlend.SourceOver;
+                        ds.DrawImage(patch, new Rect(left, top, fw, fh));
+                    }
+
+                    // Snapshot the composited result — this is what the draw loop binds to.
+                    var snap = new Microsoft.Graphics.Canvas.CanvasRenderTarget(device, canvasW, canvasH, 96);
+                    using (var ds = snap.CreateDrawingSession())
+                    {
+                        ds.Clear(Windows.UI.Color.FromArgb(0, 0, 0, 0));
+                        ds.DrawImage(accum);
+                    }
+                    frames.Add((snap, delayMs));
+                    total += delayMs;
+
+                    // Apply disposal AFTER snapshotting so this frame's pixels still appear.
+                    if (disposal == 2)
+                    {
+                        using var ds = accum.CreateDrawingSession();
+                        ds.Blend = Microsoft.Graphics.Canvas.CanvasBlend.Copy;
+                        ds.FillRectangle(new Rect(left, top, fw, fh), Windows.UI.Color.FromArgb(0, 0, 0, 0));
+                    }
+                    else if (disposal == 3 && prevSnapshot is not null)
+                    {
+                        using var ds = accum.CreateDrawingSession();
+                        ds.Blend = Microsoft.Graphics.Canvas.CanvasBlend.Copy;
+                        ds.DrawImage(prevSnapshot);
+                    }
+                }
+            }
+            finally
+            {
+                try { accum.Dispose(); } catch { }
+                try { prevSnapshot?.Dispose(); } catch { }
+            }
+
+            if (frames.Count == 0)
+            {
+                PlaybackLogger.Log($"AddLayer GIF clip={clip.Id} decoded 0 frames — bailing");
+                DisposeLayer(layer);
+                lock (_layersLock) _layers.Remove(layer);
+                return;
+            }
+
+            lock (layer.FrameLock)
+            {
+                if (layer.Disposed)
+                {
+                    foreach (var (rt, _) in frames) try { rt.Dispose(); } catch { }
+                    return;
+                }
+                layer.GifFrames         = frames;
+                layer.GifTotalDurationMs = Math.Max(1, total);
+                layer.Frame             = frames[0].Rt;
+            }
+            layer.MediaOpened = true;
+            PlaybackLogger.Log($"AddLayer GIF clip={clip.Id} src={System.IO.Path.GetFileName(media.FilePath)} frames={frames.Count} totalMs={total} {canvasW}x{canvasH}");
+        }
+        catch (Exception ex)
+        {
+            PlaybackLogger.Log($"AddLayer GIF clip={clip.Id} THREW {ex.GetType().Name}: {ex.Message}");
+            DisposeLayer(layer);
+            lock (_layersLock) _layers.Remove(layer);
+        }
+    }
+
     private async Task AddLayerAsync(Track track, TimelineClip clip, TimeSpan playhead)
     {
         if (_vm is null) return;
         var media = _vm.MediaBin.FirstOrDefault(m => m.Id == clip.SourceId);
         if (media is null) { PlaybackLogger.Log($"AddLayer SKIP clip={clip.Id} reason=media-missing"); return; }
-        if (media.Type != MediaType.Video && media.Type != MediaType.Audio) { PlaybackLogger.Log($"AddLayer SKIP clip={clip.Id} reason=type={media.Type}"); return; }
+        if (media.Type != MediaType.Video && media.Type != MediaType.Audio && media.Type != MediaType.Image) { PlaybackLogger.Log($"AddLayer SKIP clip={clip.Id} reason=type={media.Type}"); return; }
         if (!System.IO.File.Exists(media.FilePath)) { PlaybackLogger.Log($"AddLayer SKIP clip={clip.Id} reason=file-missing path={media.FilePath}"); return; }
+
+        // Image layers have no audio and no time-varying video stream — we just
+        // load the file into a static CanvasRenderTarget that the regular draw
+        // path picks up. MediaPlayer doesn't decode still images, so we route
+        // around it entirely instead of dragging a useless player along.
+        if (media.Type == MediaType.Image)
+        {
+            var ext = System.IO.Path.GetExtension(media.FilePath);
+            if (string.Equals(ext, ".gif", StringComparison.OrdinalIgnoreCase))
+                await AddGifLayerAsync(track, clip, media);
+            else
+                await AddImageLayerAsync(track, clip, media);
+            return;
+        }
 
         PlaybackLogger.Log($"AddLayer ENTER clip={clip.Id} src={System.IO.Path.GetFileName(media.FilePath)} isVideo={media.Type == MediaType.Video}");
 
-        // Video-frame-server only matters for video media — audio-only sources have
-        // no frames and turning it on for them is wasted work.
-        bool isVideo = media.Type == MediaType.Video;
+        // Frame server only when this layer should actually contribute video to the
+        // compositor. Three independent flags must all be true:
+        //   • the source file has a video stream
+        //   • the clip's role is Video (Audio-kind clips on an Audio track that
+        //     happen to point at a video file — e.g. the result of "Separate
+        //     Audio" — must NOT paint a duplicate frame)
+        //   • the track is a Video track (an audio track never draws video)
+        bool isVideo = media.Type == MediaType.Video
+                    && clip.Kind == ClipKind.Video
+                    && track.Kind == TrackKind.Video;
 
         MediaPlayer player;
         try
@@ -239,7 +665,7 @@ public sealed partial class VideoCompositorControl : UserControl
             player = new MediaPlayer
             {
                 AutoPlay                  = false,
-                IsMuted                   = false,
+                IsMuted                   = SuppressAudio,
                 IsVideoFrameServerEnabled = isVideo,
             };
         }
@@ -274,7 +700,23 @@ public sealed partial class VideoCompositorControl : UserControl
             if (layer.Disposed) return;
             layer.MediaOpened = true;
             SeekLayer(layer, _vm?.Project.Playhead ?? playhead);
-            if (_isPlaying && !layer.Disposed) try { s.Play(); } catch (Exception ex) { PlaybackLogger.Log($"MediaOpened Play() THREW clip={layer.Clip.Id} {ex.GetType().Name}: {ex.Message}"); }
+            // Apply the compositor's current playback rate (preview dialog runs at 10×).
+            try { s.PlaybackSession.PlaybackRate = _playbackRate; } catch { }
+            if (_isPlaying && !layer.Disposed)
+            {
+                try { s.Play(); } catch (Exception ex) { PlaybackLogger.Log($"MediaOpened Play() THREW clip={layer.Clip.Id} {ex.GetType().Name}: {ex.Message}"); }
+            }
+            else if (!layer.Disposed)
+            {
+                // MediaPlayer's frame-server doesn't push a frame while paused, so
+                // after the initial Seek the canvas stays blank until playback
+                // starts. A brief muted Play→Pause forces the decoder to emit one
+                // frame at the seeked position, so the preview shows the right
+                // content on project load and after any paused seek. Sync()
+                // overwrites IsMuted on its next pass.
+                try { s.IsMuted = true; s.Play(); s.Pause(); }
+                catch (Exception ex) { PlaybackLogger.Log($"MediaOpened prime THREW clip={layer.Clip.Id} {ex.GetType().Name}: {ex.Message}"); }
+            }
         };
         player.MediaFailed += (s, args) =>
         {
@@ -310,6 +752,33 @@ public sealed partial class VideoCompositorControl : UserControl
             PlaybackLogger.Log($"AddLayer THREW clip={clip.Id} {ex.GetType().Name}: {ex.Message}");
             DisposeLayer(layer);
             lock (_layersLock) _layers.Remove(layer);
+            return;
+        }
+
+        // Mirror the layer in the audio engine so effects apply to its audio.
+        // If init failed we leave MediaPlayer audio unmuted (Sync handles the
+        // gain). Errors here don't affect the video layer. SuppressAudio (e.g.
+        // export-preview) skips this path entirely so the preview compositor
+        // doesn't double up on the editor's sound.
+        if (SuppressAudio) return;
+        if (_audioEngineReady)
+        {
+            _ = _audioEngine.AddClipAsync(clip, media.FilePath);
+        }
+        else
+        {
+            // Init may still be in-flight when the first layer is added. Try again
+            // shortly so the first clip's audio routes through effects too.
+            _ = Task.Run(async () =>
+            {
+                bool ready = await _audioEngine.EnsureInitializedAsync();
+                if (ready && !layer.Disposed)
+                {
+                    _audioEngineReady = true;
+                    await _audioEngine.AddClipAsync(clip, media.FilePath);
+                    if (_isPlaying) _audioEngine.Play();
+                }
+            });
         }
     }
 
@@ -370,6 +839,15 @@ public sealed partial class VideoCompositorControl : UserControl
                     try { layer.Frame?.Dispose(); } catch { }
                     try { layer.Frame = new CanvasRenderTarget(device, w, h, 96); }
                     catch (Exception ex) { PlaybackLogger.Log($"OnVideoFrame RT-alloc THREW clip={layer.Clip.Id} {ex.GetType().Name}: {ex.Message}"); layer.Frame = null; return; }
+
+                    // Notify the editor (TransformOverlay sizing) on the UI
+                    // thread that this clip's real source dims are now known.
+                    var clipId = layer.Clip.Id;
+                    try
+                    {
+                        DispatcherQueue?.TryEnqueue(() => LayerFrameSizeChanged?.Invoke(this, clipId));
+                    }
+                    catch { /* event is best-effort */ }
                 }
                 // Serialize the native MF copy across every player. Without
                 // this, two FrameServer pipelines racing into CopyFrameToVideoSurface
@@ -398,6 +876,12 @@ public sealed partial class VideoCompositorControl : UserControl
     {
         if (l.Disposed) { PlaybackLogger.Log($"DisposeLayer SKIP clip={l.Clip.Id} already-disposed"); return; }
 
+        // Tell the audio engine this layer's audio node can go away.
+        if (_audioEngineReady)
+        {
+            try { _audioEngine.RemoveClip(l.Clip.Id); } catch { }
+        }
+
         PlaybackLogger.Log($"DisposeLayer ENTER clip={l.Clip.Id} mediaOpened={l.MediaOpened}");
 
         // Unhook FIRST so no NEW worker-thread invocations are queued after this
@@ -416,8 +900,21 @@ public sealed partial class VideoCompositorControl : UserControl
         lock (l.FrameLock)
         {
             l.Disposed = true;
-            try { l.Frame?.Dispose(); } catch (Exception ex) { PlaybackLogger.Log($"DisposeLayer Frame.Dispose THREW clip={l.Clip.Id} {ex.GetType().Name}: {ex.Message}"); }
-            l.Frame = null;
+            // GIF frames own the actual render targets; l.Frame is just whichever
+            // one was last picked for drawing, so dispose the list and null Frame
+            // without double-disposing it.
+            if (l.GifFrames is { } gfs)
+            {
+                foreach (var (rt, _) in gfs)
+                    try { rt?.Dispose(); } catch (Exception ex) { PlaybackLogger.Log($"DisposeLayer GifFrame.Dispose THREW clip={l.Clip.Id} {ex.GetType().Name}: {ex.Message}"); }
+                l.GifFrames = null;
+                l.Frame     = null;
+            }
+            else
+            {
+                try { l.Frame?.Dispose(); } catch (Exception ex) { PlaybackLogger.Log($"DisposeLayer Frame.Dispose THREW clip={l.Clip.Id} {ex.GetType().Name}: {ex.Message}"); }
+                l.Frame = null;
+            }
         }
         PlaybackLogger.Log($"DisposeLayer FRAME-FREED clip={l.Clip.Id}");
 
@@ -476,6 +973,27 @@ public sealed partial class VideoCompositorControl : UserControl
             frameRect = new Rect(0, (bounds.Height - h) / 2, w, h);
         }
 
+        // Export-window mode: instead of fitting the full canvas, zoom into the
+        // export window so that ONLY the region the exporter actually outputs is
+        // visible. Anything outside the export window draws past the control's
+        // bounds and gets clipped by Win2D's swap chain — matching the export's
+        // crop exactly.
+        if (RenderExportWindowOnly && _vm is not null)
+        {
+            var (ew_x, ew_y, ew_w, ew_h) = _vm.Project.GetExportWindow();
+            var (canvasW, canvasH)       = _vm.Project.GetCanvasSize();
+            if (ew_w > 0 && ew_h > 0 && canvasW > 0 && canvasH > 0)
+            {
+                double scaleX = bounds.Width  / ew_w;
+                double scaleY = bounds.Height / ew_h;
+                frameRect = new Rect(
+                    -ew_x * scaleX,
+                    -ew_y * scaleY,
+                    canvasW * scaleX,
+                    canvasH * scaleY);
+            }
+        }
+
         Layer[] snapshot;
         lock (_layersLock) snapshot = _layers.ToArray();
 
@@ -485,7 +1003,25 @@ public sealed partial class VideoCompositorControl : UserControl
             // can't be disposed mid-DrawImage.
             lock (layer.FrameLock)
             {
-                if (layer.Disposed || layer.Frame is null) continue;
+                if (layer.Disposed) continue;
+                if (layer.GifFrames is { Count: > 0 } gifs && layer.GifTotalDurationMs > 0)
+                {
+                    var ph = _vm?.Project.Playhead ?? TimeSpan.Zero;
+                    // SourceStart lets a trimmed-from-start GIF clip begin mid-loop;
+                    // the modulo then keeps it looping for the clip's whole duration.
+                    long ms = (long)Math.Max(0, (layer.Clip.SourceStart + (ph - layer.Clip.TimelineStart)).TotalMilliseconds);
+                    ms %= layer.GifTotalDurationMs;
+                    long acc = 0;
+                    var pick = gifs[0].Rt;
+                    for (int i = 0; i < gifs.Count; i++)
+                    {
+                        acc += gifs[i].DelayMs;
+                        if (ms < acc) { pick = gifs[i].Rt; break; }
+                        pick = gifs[i].Rt;
+                    }
+                    layer.Frame = pick;
+                }
+                if (layer.Frame is null) continue;
                 try { DrawLayer(ds, layer.Frame, layer.Clip, frameRect); }
                 catch (Exception ex) { PlaybackLogger.Log($"DrawLayer THREW clip={layer.Clip.Id} {ex.GetType().Name}: {ex.Message}\n{ex}"); }
             }

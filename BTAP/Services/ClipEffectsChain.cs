@@ -30,6 +30,22 @@ public static class ClipEffectsChain
         "Emboss", "Hue Rotate",
     };
 
+    /// <summary>Available audio effects, shown in the inspector when an audio clip
+    /// is selected. Their parameters are stored on ClipEffect.Numbers but the live
+    /// audio pipeline (Tier-2 AudioGraph work) isn't wired yet — same situation as
+    /// the per-clip EQ/Pan/Fade properties, which are also saved but not applied
+    /// to playback today.</summary>
+    public static readonly string[] AvailableAudioEffects =
+    {
+        "Distortion", "Reverb", "Delay", "Compressor",
+        "Low Pass", "High Pass", "Chorus", "Tremolo", "Flanger",
+    };
+
+    /// <summary>True for effect names that target audio (vs video) — used by the
+    /// inspector to pick the right effect list for a given clip kind.</summary>
+    public static bool IsAudioEffect(string name) =>
+        Array.IndexOf(AvailableAudioEffects, name) >= 0;
+
     /// <summary>Schema for an effect parameter, used by the inspector to lay out
     /// sliders/color swatches and by the chain to read defaults consistently.</summary>
     public readonly record struct NumberParam(string Key, string Label, double Min, double Max, double Default);
@@ -58,6 +74,62 @@ public static class ClipEffectsChain
         "Posterize"     => new NumberParam[] { new("Levels", "Levels", 2, 8, 4) },
         "Emboss"        => new NumberParam[] { new("Amount", "Amount", 0, 10, 5), new("Angle", "Angle", 0, 360, 45) },
         "Hue Rotate"    => new NumberParam[] { new("Angle", "Angle", 0, 360, 180) },
+
+        // ── Audio effect parameter schemas ──────────────────────────────────
+        "Distortion"    => new NumberParam[]
+        {
+            new("Drive", "Drive",   0, 100, 30),
+            new("Tone",  "Tone",    0, 100, 50),
+            new("Mix",   "Mix",     0, 100, 100),
+        },
+        "Reverb"        => new NumberParam[]
+        {
+            new("Mix",       "Wet mix",       0, 100, 25),
+            new("Decay",     "Decay (s)",     0.1, 10, 2),
+            new("Predelay",  "Pre-delay (ms)", 0, 200, 20),
+        },
+        "Delay"         => new NumberParam[]
+        {
+            new("Time",     "Time (ms)",     1, 2000, 350),
+            new("Feedback", "Feedback",      0, 95,   40),
+            new("Mix",      "Mix",           0, 100,  35),
+        },
+        "Compressor"    => new NumberParam[]
+        {
+            new("Threshold", "Threshold (dB)", -60, 0,  -18),
+            new("Ratio",     "Ratio",          1,   20, 4),
+            new("Attack",    "Attack (ms)",    1,   200, 10),
+            new("Release",   "Release (ms)",   10,  1000, 120),
+            new("Makeup",    "Makeup (dB)",    0,   24,   3),
+        },
+        "Low Pass"      => new NumberParam[]
+        {
+            new("Cutoff",    "Cutoff (Hz)",   20, 20000, 8000),
+            new("Resonance", "Resonance",     0,   100,  10),
+        },
+        "High Pass"     => new NumberParam[]
+        {
+            new("Cutoff",    "Cutoff (Hz)",   20, 20000, 200),
+            new("Resonance", "Resonance",     0,   100,  10),
+        },
+        "Chorus"        => new NumberParam[]
+        {
+            new("Rate",  "Rate (Hz)", 0.1, 10,   1.5),
+            new("Depth", "Depth",     0,   100,  35),
+            new("Mix",   "Mix",       0,   100,  40),
+        },
+        "Tremolo"       => new NumberParam[]
+        {
+            new("Rate",  "Rate (Hz)", 0.1, 20,   5),
+            new("Depth", "Depth",     0,   100,  60),
+        },
+        "Flanger"       => new NumberParam[]
+        {
+            new("Rate",     "Rate (Hz)", 0.05, 5,   0.5),
+            new("Depth",    "Depth",     0,    100, 50),
+            new("Feedback", "Feedback",  0,    95,  30),
+        },
+
         _               => Array.Empty<NumberParam>(),
     };
 
@@ -104,6 +176,66 @@ public static class ClipEffectsChain
                 Source = src,
                 Temperature = Clamp((float)clip.Temperature / 100f, -1f, 1f),
                 Tint        = Clamp((float)clip.Tint        / 100f, -1f, 1f),
+            };
+            disposables.Add(e); src = e;
+        }
+
+        // Lift + Gain combined into a single LinearTransferEffect (output = source * slope + offset).
+        // Lift slider (-50..+50) → offset in [-0.5, +0.5]; Gain slider (-50..+50) → slope in [0.5, 1.5].
+        if (Math.Abs(clip.Lift) > 0.0001 || Math.Abs(clip.ColorGain) > 0.0001)
+        {
+            float offset = Clamp((float)clip.Lift      / 100f, -0.5f, 0.5f);
+            float slope  = Clamp(1f + (float)clip.ColorGain / 100f, 0.5f, 1.5f);
+            var e = new LinearTransferEffect
+            {
+                Source = src,
+                RedSlope    = slope, RedOffset    = offset,
+                GreenSlope  = slope, GreenOffset  = offset,
+                BlueSlope   = slope, BlueOffset   = offset,
+            };
+            disposables.Add(e); src = e;
+        }
+
+        // Gamma slider (-50..+50): exponent = 2^(-gamma/50). 0 → 1.0 (no change),
+        // +50 → 0.5 (brighter midtones), -50 → 2.0 (darker midtones).
+        if (Math.Abs(clip.Gamma) > 0.0001)
+        {
+            float exponent = Clamp((float)Math.Pow(2.0, -clip.Gamma / 50.0), 0.1f, 10f);
+            var e = new GammaTransferEffect
+            {
+                Source = src,
+                RedAmplitude   = 1f, RedExponent   = exponent, RedOffset   = 0f,
+                GreenAmplitude = 1f, GreenExponent = exponent, GreenOffset = 0f,
+                BlueAmplitude  = 1f, BlueExponent  = exponent, BlueOffset  = 0f,
+            };
+            disposables.Add(e); src = e;
+        }
+
+        // Color overlay: alpha-blend the source with a flat color. The overlay's
+        // alpha channel (0..255) drives how strongly the tint replaces the image
+        // (#00000000 = no-op, #FFRRGGBB = fully replaced). Implemented as a
+        // ColorMatrixEffect so the result keeps the source's bounds (a
+        // ColorSourceEffect would be infinite and spill outside transformed clips).
+        //   R' = R*(1-a) + (R_overlay/255)*a   (and same for G, B; A passed through)
+        var overlay = ParseColor(clip.ColorOverlay, Colors.Transparent);
+        if (overlay.A > 0)
+        {
+            float a = overlay.A / 255f;
+            float inv = 1f - a;
+            float r = (overlay.R / 255f) * a;
+            float g = (overlay.G / 255f) * a;
+            float b = (overlay.B / 255f) * a;
+            var e = new ColorMatrixEffect
+            {
+                Source = src,
+                ColorMatrix = new Matrix5x4
+                {
+                    M11 = inv, M12 = 0,   M13 = 0,   M14 = 0,
+                    M21 = 0,   M22 = inv, M23 = 0,   M24 = 0,
+                    M31 = 0,   M32 = 0,   M33 = inv, M34 = 0,
+                    M41 = 0,   M42 = 0,   M43 = 0,   M44 = 1,
+                    M51 = r,   M52 = g,   M53 = b,   M54 = 0,
+                },
             };
             disposables.Add(e); src = e;
         }

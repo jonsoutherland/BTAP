@@ -1,7 +1,9 @@
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Windows.ApplicationModel.DataTransfer;
+using BTAP.Models;
 using BTAP.Pages;
+using BTAP.Services;
 
 namespace BTAP.Controls;
 
@@ -33,6 +35,19 @@ public sealed partial class MediaTileControl : UserControl
         NameText.Text = data.Name;
         DurationText.Text = data.Duration;
         TypeText.Text = data.TypeLabel;
+
+        ThumbImage.Source = null;
+        ThumbImage.Visibility = Visibility.Collapsed;
+        if (data.Type is MediaType.Video or MediaType.Image)
+            _ = LoadThumbnailAsync(data);
+    }
+
+    private async Task LoadThumbnailAsync(MediaTileData data)
+    {
+        var image = await ThumbnailService.GetAsync(data.FilePath);
+        if (image is null || Data != data) return;
+        ThumbImage.Source = image;
+        ThumbImage.Visibility = Visibility.Visible;
     }
 
     private void OnDragStarting(UIElement sender, DragStartingEventArgs args)

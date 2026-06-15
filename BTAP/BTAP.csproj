@@ -25,6 +25,8 @@
     <PackageReference Include="Vortice.MediaFoundation" Version="3.6.2" />
     <PackageReference Include="Vortice.Direct3D11" Version="3.6.2" />
     <PackageReference Include="Vortice.DXGI" Version="3.6.2" />
+    <PackageReference Include="Whisper.net" Version="1.7.4" />
+    <PackageReference Include="Whisper.net.Runtime" Version="1.7.4" />
     <Manifest Include="$(ApplicationManifest)" />
   </ItemGroup>
 

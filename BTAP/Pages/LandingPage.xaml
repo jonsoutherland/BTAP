@@ -5,6 +5,7 @@
     xmlns:local="using:BTAP.Pages"
     xmlns:vm="using:BTAP.ViewModels"
     xmlns:models="using:BTAP.Models"
+    xmlns:controls="using:BTAP.Controls"
     Background="{StaticResource BgPageBrush}">
 
     <Page.Resources>
@@ -93,7 +94,11 @@
                         Padding="10,7" Click="OnNavTabClick"
                         Background="{StaticResource BgElevatedBrush}"
                         Foreground="{StaticResource TextPrimaryBrush}" />
-                <Button Content="New from template" Tag="templates"
+                <Button x:Name="BtnTemplates" Content="New from template" Tag="templates"
+                        Style="{StaticResource GhostButtonStyle}"
+                        HorizontalAlignment="Stretch" HorizontalContentAlignment="Left"
+                        Padding="10,7" Click="OnNavTabClick" />
+                <Button x:Name="BtnSettings" Content="Settings" Tag="settings"
                         Style="{StaticResource GhostButtonStyle}"
                         HorizontalAlignment="Stretch" HorizontalContentAlignment="Left"
                         Padding="10,7" Click="OnNavTabClick" />
@@ -110,7 +115,8 @@
         </Border>
 
         <!-- ── Main area ────────────────────────────────────────────── -->
-        <ScrollViewer Grid.Column="1" Padding="56,40,56,60"
+        <Grid Grid.Column="1">
+        <ScrollViewer x:Name="RecentScroll" Padding="56,40,56,60"
                       VerticalScrollBarVisibility="Auto">
             <StackPanel MaxWidth="1000" Spacing="40">
 
@@ -250,21 +256,28 @@
                                             CornerRadius="{StaticResource RadiusLg}"
                                            >
                                         <Grid RowDefinitions="Auto,Auto">
-                                            <Border Grid.Row="0" Height="120">
+                                            <Border Grid.Row="0" Height="120"
+                                                    CornerRadius="6,6,0,0">
                                                 <Border.Background>
                                                     <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
                                                         <GradientStop Color="#4D1A3040" Offset="0"/>
                                                         <GradientStop Color="#4D0A1218" Offset="1"/>
                                                     </LinearGradientBrush>
                                                 </Border.Background>
-                                                <Border HorizontalAlignment="Left" VerticalAlignment="Bottom"
-                                                        Margin="8" Padding="4,2"
-                                                        Background="#CC0A1218"
-                                                        CornerRadius="3">
-                                                    <TextBlock Text="{x:Bind Duration}"
-                                                               FontFamily="{StaticResource MonoFont}"
-                                                               FontSize="10" Foreground="{StaticResource TextDimBrush}" />
-                                                </Border>
+                                                <Grid>
+                                                    <Image Source="{x:Bind Thumbnail, Mode=OneWay}"
+                                                           Stretch="UniformToFill"
+                                                           HorizontalAlignment="Stretch"
+                                                           VerticalAlignment="Stretch" />
+                                                    <Border HorizontalAlignment="Left" VerticalAlignment="Bottom"
+                                                            Margin="8" Padding="4,2"
+                                                            Background="#CC0A1218"
+                                                            CornerRadius="3">
+                                                        <TextBlock Text="{x:Bind Duration}"
+                                                                   FontFamily="{StaticResource MonoFont}"
+                                                                   FontSize="10" Foreground="{StaticResource TextDimBrush}" />
+                                                    </Border>
+                                                </Grid>
                                             </Border>
                                             <StackPanel Grid.Row="1" Padding="12,10,12,12" Spacing="4">
                                                 <TextBlock Text="{x:Bind Name}" FontSize="13"
@@ -312,5 +325,15 @@
 
             </StackPanel>
         </ScrollViewer>
+
+        <ScrollViewer x:Name="SettingsScroll" Padding="56,40,56,60"
+                      Visibility="Collapsed"
+                      VerticalScrollBarVisibility="Auto"
+                      HorizontalScrollBarVisibility="Auto"
+                      HorizontalScrollMode="Auto">
+            <controls:SettingsView x:Name="SettingsViewControl"
+                                   HorizontalAlignment="Stretch" />
+        </ScrollViewer>
+        </Grid>
     </Grid>
 </Page>

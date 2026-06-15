@@ -20,6 +20,9 @@
                     </LinearGradientBrush>
                 </Border.Background>
                 <Grid>
+                    <Image x:Name="ThumbImage" Stretch="UniformToFill"
+                           HorizontalAlignment="Stretch" VerticalAlignment="Stretch"
+                           Visibility="Collapsed" />
                     <TextBlock x:Name="TypeIconText" FontFamily="Segoe MDL2 Assets" FontSize="20"
                                HorizontalAlignment="Center" VerticalAlignment="Center"
                                Foreground="{StaticResource TextMutedBrush}" Opacity="0.5" />

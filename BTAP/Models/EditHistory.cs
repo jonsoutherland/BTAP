@@ -235,6 +235,78 @@ public sealed class ClipDuplicateAction : IEditAction
     }
 }
 
+/// <summary>Pulls the audio out of a video clip onto its own audio track:
+/// silences the source video clip and creates a matching audio clip on an audio
+/// track positioned just below the video track. If no audio track exists at the
+/// right spot, one is created and inserted as part of the action so undo can
+/// remove it again.</summary>
+public sealed class SeparateAudioAction : IEditAction
+{
+    private readonly Project        _project;
+    private readonly TimelineClip   _videoClip;
+    private readonly Track          _targetAudioTrack;   // may be a brand-new track
+    private readonly TimelineClip   _audioClip;
+    private readonly bool           _trackIsNew;
+    private readonly int            _trackInsertIndex;
+    private readonly double         _originalVolume;
+
+    public SeparateAudioAction(Project project, Track videoTrack, TimelineClip videoClip,
+                               Track? existingAudioTrack, int newTrackInsertIndex)
+    {
+        _project = project;
+        _videoClip = videoClip;
+        _originalVolume = videoClip.Volume;
+
+        if (existingAudioTrack is not null)
+        {
+            _targetAudioTrack = existingAudioTrack;
+            _trackIsNew = false;
+            _trackInsertIndex = -1;
+        }
+        else
+        {
+            int n = project.Tracks.Count(t => t.Kind == TrackKind.Audio) + 1;
+            _targetAudioTrack = new Track { Label = $"A{n}", Kind = TrackKind.Audio };
+            _trackIsNew = true;
+            _trackInsertIndex = newTrackInsertIndex;
+        }
+
+        _audioClip = new TimelineClip
+        {
+            Label         = videoClip.Label,
+            Kind          = ClipKind.Audio,
+            TimelineStart = videoClip.TimelineStart,
+            Duration      = videoClip.Duration,
+            SourceStart   = videoClip.SourceStart,
+            Volume        = _originalVolume,   // carry the original level over to the new audio clip
+            Speed         = videoClip.Speed,
+            SourceId      = videoClip.SourceId,
+            ColorHue      = 100,               // green-ish, matches the audio palette
+        };
+    }
+
+    public string Description => $"Separate audio from \"{_videoClip.Label}\"";
+
+    public void Do()
+    {
+        if (_trackIsNew && !_project.Tracks.Contains(_targetAudioTrack))
+        {
+            int idx = Math.Clamp(_trackInsertIndex, 0, _project.Tracks.Count);
+            _project.Tracks.Insert(idx, _targetAudioTrack);
+        }
+        if (!_targetAudioTrack.Clips.Contains(_audioClip))
+            _targetAudioTrack.Clips.Add(_audioClip);
+        _videoClip.Volume = 0;
+    }
+
+    public void Undo()
+    {
+        _videoClip.Volume = _originalVolume;
+        _targetAudioTrack.Clips.Remove(_audioClip);
+        if (_trackIsNew) _project.Tracks.Remove(_targetAudioTrack);
+    }
+}
+
 /// <summary>Deletes a clip and shifts every clip on the same track that started after it backward by the deleted clip's duration.</summary>
 public sealed class ClipRippleDeleteAction : IEditAction
 {

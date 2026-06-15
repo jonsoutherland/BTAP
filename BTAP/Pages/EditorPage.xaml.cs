@@ -42,8 +42,17 @@ public sealed partial class EditorPage : Page
     private DateTime _lastSaved = DateTime.Now;
     private readonly PreviewEffectsService _previewEffects = new();
     private readonly KeyBindingsService _keyBindings = new();
+    private readonly AppSettingsService _appSettings = AppSettingsService.Instance;
     private Border? _eyedropOverlay;
     private Action<Color>? _eyedropCallback;
+
+    // Internal clip clipboard. Populated by Ctrl+C, drained by Ctrl+V. Holds
+    // deep-cloned templates plus a snapshot of the source track so paste can put
+    // them back on the same row when it still exists. Templates retain their
+    // ORIGINAL TimelineStart values so paste can preserve relative spacing —
+    // _clipClipboardOrigin captures the earliest of those starts as the anchor.
+    private readonly List<(TimelineClip Template, Track? OriginalTrack)> _clipClipboard = new();
+    private TimeSpan _clipClipboardOrigin;
 
     public EditorPage()
     {
@@ -116,6 +125,18 @@ public sealed partial class EditorPage : Page
         _keyBindings.Changed += OnKeyBindingsChanged;
         RebuildKeyboardAccelerators();
 
+        // Apply layout preferences from app settings + react to live edits.
+        _appSettings.Changed -= OnAppSettingsChanged;
+        _appSettings.Changed += OnAppSettingsChanged;
+        ApplyLayoutFromSettings();
+
+        // Re-size the TransformOverlay box once the compositor knows each
+        // clip's real source dims (fires on first frame decode). Without
+        // this, projects whose MediaItem W/H weren't persisted in the file
+        // show the box at the canvas size until the user interacts.
+        VideoCompositor.LayerFrameSizeChanged -= OnLayerFrameSizeChanged;
+        VideoCompositor.LayerFrameSizeChanged += OnLayerFrameSizeChanged;
+
         // Take keyboard focus so Space / J / K / etc. work immediately
         Loaded += OnPageLoaded;
     }
@@ -154,6 +175,11 @@ public sealed partial class EditorPage : Page
         {
             SeekPreviewToPlayhead(_vm.Project.Playhead);
         }
+        // Force the timeline to re-render. Undo/redo and history-recorded actions
+        // mutate the underlying collections, but TimelineControl rebuilds on its
+        // own only when the user interacts with it — without this nudge, a delete
+        // or undo "looks like nothing happened" until the next click.
+        Timeline.Refresh();
         // Reflect any structural change (clip count, duration, etc.) in the status bar immediately
         UpdateStatusBar();
         // Keep playback bar duration in sync if RecomputeDuration changed it
@@ -191,6 +217,8 @@ public sealed partial class EditorPage : Page
             _vm.Project.MediaBin.CollectionChanged -= OnMediaBinChangedForCanvas;
         }
         _keyBindings.Changed -= OnKeyBindingsChanged;
+        _appSettings.Changed -= OnAppSettingsChanged;
+        VideoCompositor.LayerFrameSizeChanged -= OnLayerFrameSizeChanged;
         if (_mediaPlayer is not null)
         {
             _mediaPlayer.MediaOpened -= OnPreviewMediaOpened;
@@ -226,6 +254,67 @@ public sealed partial class EditorPage : Page
     private void OnKeyBindingsChanged(object? sender, EventArgs e) =>
         RebuildKeyboardAccelerators();
 
+    private void OnAppSettingsChanged(object? sender, EventArgs e)
+    {
+        // Settings page can fire many times in a row while the user drags a
+        // slider — keep this cheap and idempotent.
+        ApplyLayoutFromSettings();
+    }
+
+    private void OnLayerFrameSizeChanged(object? sender, string clipId)
+    {
+        // Only the presented clip drives the TransformOverlay; ignore frame-
+        // arrivals for other layers (background tracks etc).
+        if (_presentedClip?.Id != clipId) return;
+        UpdateTransformHandles();
+        if (_inCropMode) UpdateCropOverlay();
+    }
+
+    /// <summary>Push panel widths / visibility / library side from
+    /// <see cref="AppSettingsService"/> into the editor body grid. Honors
+    /// fullscreen and Cut-mode overrides — they collapse panels by setting
+    /// column width to 0; this method only applies when those overrides
+    /// aren't active.</summary>
+    private void ApplyLayoutFromSettings()
+    {
+        if (BodyGrid is null) return;
+
+        // Don't fight the fullscreen / cut-mode overrides — they manage
+        // visibility explicitly and would flicker if we rewrote widths here.
+        if (_isFullscreen) return;
+        if (_vm?.Mode == EditorMode.Cut) return;
+
+        double libW = _appSettings.LibraryPanelVisible   ? _appSettings.LibraryPanelWidth   : 0;
+        double insW = _appSettings.InspectorPanelVisible ? _appSettings.InspectorPanelWidth : 0;
+
+        // Re-order columns when the library is mirrored to the right.
+        if (_appSettings.LibrarySide == PanelSide.Left)
+        {
+            Grid.SetColumn(LibraryPanel,   0);
+            Grid.SetColumn(InspectorPanel, 2);
+            LibraryPanel.BorderThickness   = new Thickness(0, 0, 1, 0);
+            InspectorPanel.BorderThickness = new Thickness(1, 0, 0, 0);
+            BodyGrid.ColumnDefinitions[0].Width = new GridLength(libW);
+            BodyGrid.ColumnDefinitions[2].Width = new GridLength(insW);
+        }
+        else
+        {
+            Grid.SetColumn(LibraryPanel,   2);
+            Grid.SetColumn(InspectorPanel, 0);
+            LibraryPanel.BorderThickness   = new Thickness(1, 0, 0, 0);
+            InspectorPanel.BorderThickness = new Thickness(0, 0, 1, 0);
+            BodyGrid.ColumnDefinitions[0].Width = new GridLength(insW);
+            BodyGrid.ColumnDefinitions[2].Width = new GridLength(libW);
+        }
+
+        LibraryPanel.Visibility   = _appSettings.LibraryPanelVisible   ? Visibility.Visible : Visibility.Collapsed;
+        InspectorPanel.Visibility = _appSettings.InspectorPanelVisible ? Visibility.Visible : Visibility.Collapsed;
+
+        // Row 3 of the center grid is the timeline track area.
+        if (CenterPanel is not null && CenterPanel.RowDefinitions.Count >= 4)
+            CenterPanel.RowDefinitions[3].Height = new GridLength(_appSettings.TimelinePanelHeight);
+    }
+
     private void RebuildKeyboardAccelerators()
     {
         KeyboardAccelerators.Clear();
@@ -237,9 +326,21 @@ public sealed partial class EditorPage : Page
                 Modifiers = binding.Modifiers,
             };
             var cmd = binding.Command;
+            var key = binding.Key;
+            var mods = binding.Modifiers;
             acc.Invoked += (_, args) =>
             {
                 if (FocusManager.GetFocusedElement(XamlRoot) is TextBox) return;
+                // Space falls through to the focused control as a synthetic Click
+                // (WinUI ButtonBase fires Click on Space-up), so a previously-clicked
+                // button re-activates every time the user hits Space to play/pause.
+                // Defocus the button before the keyup arrives — Space is always
+                // play/pause, never a re-click of whatever was last clicked.
+                if (key == VirtualKey.Space && mods == VirtualKeyModifiers.None
+                    && FocusManager.GetFocusedElement(XamlRoot) is ButtonBase)
+                {
+                    Focus(FocusState.Programmatic);
+                }
                 InvokeCommand(cmd);
                 args.Handled = true;
             };
@@ -286,6 +387,9 @@ public sealed partial class EditorPage : Page
                 if (Timeline.MoveSelectedClipsByTrack(1) > 0)  _vm.Project.IsModified = true; break;
 
             case EditorCommand.AddTitleAtPlayhead: AddTitleAtPlayheadAndEdit(); break;
+
+            case EditorCommand.CopyClip:           CopySelectedClipsToClipboard(); break;
+            case EditorCommand.PasteFromClipboard: _ = PasteFromClipboardAsync(); break;
         }
     }
 
@@ -513,7 +617,8 @@ public sealed partial class EditorPage : Page
                            or nameof(TimelineClip.IsItalic)
                            or nameof(TimelineClip.IsUnderline)
                            or nameof(TimelineClip.TextColor)
-                           or nameof(TimelineClip.TextAlign))
+                           or nameof(TimelineClip.TextAlign)
+                           or nameof(TimelineClip.TextBackground))
         {
             ApplyTitleOverlay();
         }
@@ -712,6 +817,13 @@ public sealed partial class EditorPage : Page
         };
         TitleClipText.TextAlignment   = align;
         TitleClipEditor.TextAlignment = align;
+
+        // Background fill behind the text. Treat null/empty/8-digit-with-A=00 as
+        // "no fill" so we don't paint a 1-px translucent layer for the default.
+        var bgBrush = ParseColorBrush(clip.TextBackground);
+        TitleClipBackground.Fill = bgBrush is null || bgBrush.Color.A == 0
+            ? new SolidColorBrush(Microsoft.UI.Colors.Transparent)
+            : bgBrush;
     }
 
     private static SolidColorBrush? ParseColorBrush(string? hex)
@@ -820,6 +932,30 @@ public sealed partial class EditorPage : Page
     private double _titleDragStartPosX;
     private double _titleDragStartPosY;
 
+    /// <summary>Per-clip starting Pos/Scale/Rotation snapshots for the currently-active
+    /// preview-area gesture (title drag, transform body drag, scale/rotate handles).
+    /// Populated on pointer-press if the gesture's primary clip is part of a multi-
+    /// selection, so each move tick can apply the same delta (move) or ratio (scale)
+    /// to every selected clip. Null when only the primary is being edited.</summary>
+    private List<(TimelineClip Clip, double PosX, double PosY, double Scale, double Rotation)>? _multiGestureSnapshots;
+
+    /// <summary>Snapshot every IsSelected clip (other than <paramref name="primary"/>) so
+    /// the in-progress preview gesture can apply the same delta/ratio to all of them.
+    /// Call from each gesture's PointerPressed; clear it from PointerReleased / capture-lost.</summary>
+    private void BeginMultiGesture(TimelineClip primary)
+    {
+        _multiGestureSnapshots = null;
+        if (_vm is null) return;
+        var list = new List<(TimelineClip, double, double, double, double)>();
+        foreach (var t in _vm.Tracks)
+            foreach (var c in t.Clips)
+                if (c.IsSelected && !ReferenceEquals(c, primary))
+                    list.Add((c, c.PosX, c.PosY, c.Scale, c.Rotation));
+        if (list.Count > 0) _multiGestureSnapshots = list;
+    }
+
+    private void EndMultiGesture() => _multiGestureSnapshots = null;
+
     private void OnTitlePositionerPointerPressed(object sender, PointerRoutedEventArgs e)
     {
         if (_isEditingTitle) return;
@@ -829,6 +965,7 @@ public sealed partial class EditorPage : Page
         _titleDragStartPosX    = _titleClipAtPlayhead.PosX;
         _titleDragStartPosY    = _titleClipAtPlayhead.PosY;
         _isDraggingTitle       = true;
+        BeginMultiGesture(_titleClipAtPlayhead);
         fe.CapturePointer(e.Pointer);
         e.Handled = true;
     }
@@ -900,6 +1037,19 @@ public sealed partial class EditorPage : Page
 
         UpdateSnapGuides(guideX, guideY);
 
+        // Apply the same translation delta to every other selected clip so a
+        // multi-selection drags as a group instead of stacking on the primary.
+        if (_multiGestureSnapshots is not null)
+        {
+            double dxCanvas = newX - _titleDragStartPosX;
+            double dyCanvas = newY - _titleDragStartPosY;
+            foreach (var snap in _multiGestureSnapshots)
+            {
+                snap.Clip.PosX = snap.PosX + dxCanvas;
+                snap.Clip.PosY = snap.PosY + dyCanvas;
+            }
+        }
+
         _titleClipAtPlayhead.PosX = newX;
         _titleClipAtPlayhead.PosY = newY;
         _vm.Project.IsModified = true;
@@ -910,6 +1060,7 @@ public sealed partial class EditorPage : Page
     {
         if (!_isDraggingTitle) return;
         _isDraggingTitle = false;
+        EndMultiGesture();
         ((FrameworkElement)sender).ReleasePointerCapture(e.Pointer);
         HideSnapGuides();
         e.Handled = true;
@@ -918,6 +1069,7 @@ public sealed partial class EditorPage : Page
     private void OnTitlePositionerPointerCaptureLost(object sender, PointerRoutedEventArgs e)
     {
         _isDraggingTitle = false;
+        EndMultiGesture();
         HideSnapGuides();
     }
 
@@ -1072,10 +1224,35 @@ public sealed partial class EditorPage : Page
             frY = (ch - frH) / 2;
         }
 
-        // Mirror the compositor's crop-shrink so handles bound the visible content.
+        // Mirror the compositor's source-aspect fit step (DrawLayer) so the
+        // handles bound the visible clip rect, not the full canvas rect. A
+        // portrait clip on a landscape canvas (or vice versa) renders pillar-
+        // or letter-boxed inside frameRect — without this fit, the dashed
+        // overlay would cover the whole canvas instead of just the video.
+        // Source dims: prefer the compositor's actual decoded frame size
+        // (always correct, even when MediaItem metadata is 0 because the
+        // project was saved before W/H persistence), fall back to MediaItem
+        // for the brief window before the first frame is decoded.
+        double srcW = 0, srcH = 0;
+        var liveDims = VideoCompositor.GetSourceFrameSize(clip.Id);
+        if (liveDims is { } d) { srcW = d.Width; srcH = d.Height; }
+        else if (!string.IsNullOrEmpty(clip.SourceId))
+        {
+            var media = _vm.MediaBin.FirstOrDefault(m => m.Id == clip.SourceId);
+            if (media is not null) { srcW = media.Width; srcH = media.Height; }
+        }
+        double fitW = frW, fitH = frH;
+        if (srcW > 0 && srcH > 0)
+        {
+            double srcAspect    = srcW / srcH;
+            double canvasAspect = frW / frH;
+            if (srcAspect >= canvasAspect) { fitW = frW; fitH = frW / srcAspect; }
+            else                           { fitH = frH; fitW = frH * srcAspect; }
+        }
+
         double scale = Math.Clamp(clip.Scale, 0.05, 10);
-        double fullW = frW * scale;
-        double fullH = frH * scale;
+        double fullW = fitW * scale;
+        double fullH = fitH * scale;
         double offX  = clip.PosX / (double)outW * frW;
         double offY  = clip.PosY / (double)outH * frH;
         double fullX = frX + (frW - fullW) / 2 + offX;
@@ -1398,6 +1575,7 @@ public sealed partial class EditorPage : Page
         _gestureStart    = e.GetCurrentPoint(TransformOverlay).Position;
         _gestureStartPosX = _presentedClip.PosX;
         _gestureStartPosY = _presentedClip.PosY;
+        BeginMultiGesture(_presentedClip);
         (sender as UIElement)?.CapturePointer(e.Pointer);
         e.Handled = true;
     }
@@ -1470,6 +1648,19 @@ public sealed partial class EditorPage : Page
         }
 
         UpdateSnapGuides(guideX, guideY);
+
+        // Apply the same translation delta to every other selected clip so a
+        // multi-selection moves as a group instead of converging on the primary.
+        if (_multiGestureSnapshots is not null)
+        {
+            double dx = newX - _gestureStartPosX;
+            double dy = newY - _gestureStartPosY;
+            foreach (var snap in _multiGestureSnapshots)
+            {
+                snap.Clip.PosX = snap.PosX + dx;
+                snap.Clip.PosY = snap.PosY + dy;
+            }
+        }
 
         _presentedClip.PosX = newX;
         _presentedClip.PosY = newY;
@@ -1560,6 +1751,7 @@ public sealed partial class EditorPage : Page
         (sender as UIElement)?.ReleasePointerCapture(e.Pointer);
         if (_vm is not null) _vm.Project.IsModified = true;
         _gesture = TransformGesture.None;
+        EndMultiGesture();
         HideSnapGuides();
         e.Handled = true;
     }
@@ -1567,6 +1759,7 @@ public sealed partial class EditorPage : Page
     private void OnTransformBodyCaptureLost(object sender, PointerRoutedEventArgs e)
     {
         _gesture = TransformGesture.None;
+        EndMultiGesture();
         HideSnapGuides();
     }
 
@@ -1604,6 +1797,8 @@ public sealed partial class EditorPage : Page
         _gestureStartDistFromCenter = Math.Sqrt(dx * dx + dy * dy);
         _gestureStartAngleRad       = Math.Atan2(dy, dx);
 
+        BeginMultiGesture(_presentedClip);
+
         s.CapturePointer(e.Pointer);
         e.Handled = true;
     }
@@ -1629,6 +1824,20 @@ public sealed partial class EditorPage : Page
             if (IsCtrlHeld())
                 newRot = Math.Round(newRot / 15.0) * 15.0;  // 15° increments
             _presentedClip.Rotation = newRot;
+
+            // Apply the same rotation delta to every other selected clip so a
+            // multi-selection rotates as a group instead of pivoting only the primary.
+            if (_multiGestureSnapshots is not null)
+            {
+                double rotDelta = newRot - _gestureStartRotation;
+                foreach (var snap in _multiGestureSnapshots)
+                {
+                    double r = snap.Rotation + rotDelta;
+                    while (r >  180) r -= 360;
+                    while (r < -180) r += 360;
+                    snap.Clip.Rotation = r;
+                }
+            }
         }
         else
         {
@@ -1640,6 +1849,17 @@ public sealed partial class EditorPage : Page
             if (IsCtrlHeld())
                 newScale = Math.Round(newScale * 4.0) / 4.0;  // 25% increments
             _presentedClip.Scale = newScale;
+
+            // Apply the same scale ratio to every other selected clip so the group
+            // grows/shrinks proportionally rather than snapping each to one value.
+            if (_multiGestureSnapshots is not null)
+            {
+                double effectiveRatio = _gestureStartScale > 0
+                    ? newScale / _gestureStartScale
+                    : 1.0;
+                foreach (var snap in _multiGestureSnapshots)
+                    snap.Clip.Scale = Math.Clamp(snap.Scale * effectiveRatio, 0.1, 3.0);
+            }
         }
         e.Handled = true;
     }
@@ -1651,6 +1871,7 @@ public sealed partial class EditorPage : Page
         if (_vm is not null) _vm.Project.IsModified = true;
         _gesture = TransformGesture.None;
         _activeHandle = null;
+        EndMultiGesture();
         e.Handled = true;
     }
 
@@ -1658,6 +1879,7 @@ public sealed partial class EditorPage : Page
     {
         _gesture = TransformGesture.None;
         _activeHandle = null;
+        EndMultiGesture();
     }
 
     // ── Crop mode (right-click → Crop) ────────────────────────────────────
@@ -1733,9 +1955,29 @@ public sealed partial class EditorPage : Page
 
         // BypassCropClipId makes the compositor draw the FULL source frame into
         // the dest rect, so the dest rect maps 1:1 to the un-cropped source.
+        // Mirror DrawLayer's source-aspect fit so the crop rectangle hugs the
+        // actual rendered video (not the wider canvas) when clip aspect ≠
+        // canvas aspect. Same dual lookup as UpdateTransformHandles.
+        double srcW = 0, srcH = 0;
+        var liveDims = VideoCompositor.GetSourceFrameSize(clip.Id);
+        if (liveDims is { } d) { srcW = d.Width; srcH = d.Height; }
+        else if (!string.IsNullOrEmpty(clip.SourceId))
+        {
+            var media = _vm.MediaBin.FirstOrDefault(m => m.Id == clip.SourceId);
+            if (media is not null) { srcW = media.Width; srcH = media.Height; }
+        }
+        double fitW = frW, fitH = frH;
+        if (srcW > 0 && srcH > 0)
+        {
+            double srcAspect    = srcW / srcH;
+            double canvasAspect = frW / frH;
+            if (srcAspect >= canvasAspect) { fitW = frW; fitH = frW / srcAspect; }
+            else                           { fitH = frH; fitW = frH * srcAspect; }
+        }
+
         double scale = Math.Clamp(clip.Scale, 0.05, 10);
-        double dstW = frW * scale;
-        double dstH = frH * scale;
+        double dstW = fitW * scale;
+        double dstH = fitH * scale;
         double offX = clip.PosX / (double)outW * frW;
         double offY = clip.PosY / (double)outH * frH;
         double dstX = frX + (frW - dstW) / 2 + offX;
@@ -2158,6 +2400,423 @@ public sealed partial class EditorPage : Page
         UpdateClipHeader(clip);
         UpdatePreviewOverlay(clip);
         LoadPreviewFromPath(media.FilePath, media.Type);
+    }
+
+    /// <summary>Mint a new Track at the conventional position for its kind: video
+    /// tracks insert on top (below any title tracks so titles stay above), audio
+    /// tracks append to the bottom. Mirrors the TimelineControl's drag-to-new-track
+    /// behavior so paste matches that mental model.</summary>
+    private Track CreateAndInsertNewTrack(MediaType mediaType)
+    {
+        var vm = _vm!;
+        var kind = mediaType == MediaType.Audio ? TrackKind.Audio : TrackKind.Video;
+        var prefix = kind == TrackKind.Audio ? "A" : "V";
+        var n = vm.Tracks.Count(t => t.Kind == kind) + 1;
+        var track = new Track { Label = $"{prefix}{n}", Kind = kind };
+
+        if (kind == TrackKind.Audio)
+        {
+            vm.Tracks.Add(track);
+        }
+        else
+        {
+            int idx = 0;
+            while (idx < vm.Tracks.Count && vm.Tracks[idx].Kind == TrackKind.Title)
+                idx++;
+            vm.Tracks.Insert(idx, track);
+        }
+        vm.Project.IsModified = true;
+        return track;
+    }
+
+    /// <summary>Snapshot the current multi-selection into the internal clip clipboard.
+    /// Each clip is deep-cloned via the project DTO round-trip so subsequent edits to
+    /// the originals don't reach back into the clipboard contents.</summary>
+    private void CopySelectedClipsToClipboard()
+    {
+        if (_vm is null) return;
+        var selected = new List<(TimelineClip Clip, Track Track)>();
+        foreach (var t in _vm.Tracks)
+            foreach (var c in t.Clips)
+                if (c.IsSelected) selected.Add((c, t));
+        if (selected.Count == 0) return;
+
+        _clipClipboard.Clear();
+        _clipClipboardOrigin = selected.Min(s => s.Clip.TimelineStart);
+        foreach (var (clip, track) in selected)
+        {
+            var template = BTAP.Services.ClipDto.From(clip).ToModel();
+            template.IsSelected = false;
+            _clipClipboard.Add((template, track));
+        }
+    }
+
+    /// <summary>Drop the internal clipboard contents at the playhead, preserving the
+    /// relative spacing the clips had when copied. Each pasted clip lands on its
+    /// original track if it still exists, otherwise on the first unlocked track of
+    /// the matching kind. Returns true when at least one clip was added.</summary>
+    private bool TryPasteInternalClips()
+    {
+        if (_vm is null || _clipClipboard.Count == 0) return false;
+
+        TimelineClip? lastAdded = null;
+        foreach (var (template, originalTrack) in _clipClipboard)
+        {
+            var copy = BTAP.Services.ClipDto.From(template).ToModel();
+            copy.Id = Guid.NewGuid().ToString("N")[..8];
+            var relOffset = template.TimelineStart - _clipClipboardOrigin;
+            copy.TimelineStart = _vm.Project.Playhead + relOffset;
+
+            Track? dest = null;
+            if (originalTrack is not null
+                && _vm.Tracks.Contains(originalTrack) && !originalTrack.IsLocked)
+            {
+                dest = originalTrack;
+            }
+            else
+            {
+                var targetKind = copy.Kind switch
+                {
+                    ClipKind.Audio => TrackKind.Audio,
+                    ClipKind.Title => TrackKind.Title,
+                    _              => TrackKind.Video,
+                };
+                dest = _vm.Tracks.FirstOrDefault(t => !t.IsLocked && t.Kind == targetKind);
+            }
+            if (dest is null) continue;
+
+            _vm.History.Record(new ClipAddAction(dest, copy));
+            lastAdded = copy;
+        }
+
+        if (lastAdded is null) return false;
+
+        Timeline.ViewModel = _vm;
+        foreach (var tr in _vm.Tracks)
+            foreach (var c in tr.Clips)
+                c.IsSelected = false;
+        lastAdded.IsSelected = true;
+        _vm.SelectedClip = lastAdded;
+        UpdateInspector(lastAdded);
+        UpdateClipHeader(lastAdded);
+        UpdatePreviewOverlay(lastAdded);
+        return true;
+    }
+
+    /// <summary>Paste whatever media is on the system clipboard onto the timeline at
+    /// the current playhead. Handles files copied from Explorer (gif, image, video,
+    /// audio, etc.) and raw bitmap data (e.g. from screenshot tools / browser image
+    /// copy) — the bitmap path saves to %TEMP%\BTAP-pasted\ first so the rest of the
+    /// pipeline (MediaBin, preview, export) can treat it like any other file source.
+    /// Silently no-ops if the clipboard has nothing usable.</summary>
+    private async Task PasteFromClipboardAsync()
+    {
+        if (_vm is null) return;
+
+        // Precedence: the OS clipboard wins whenever it actually has media (files
+        // or a bitmap). Otherwise (it's empty or contains only text) we fall back
+        // to the internal clip clipboard so timeline copy/paste still works after
+        // a Ctrl+C. This avoids the trap where a stale internal clip clipboard
+        // keeps intercepting Ctrl+V for the rest of the session, blocking image
+        // pastes from the OS clipboard.
+        DataPackageView? pkg = null;
+        try { pkg = Clipboard.GetContent(); }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[paste] Clipboard.GetContent failed: {ex.GetType().Name}: {ex.Message}");
+        }
+
+        bool osHasMedia = pkg is not null
+            && (pkg.Contains(StandardDataFormats.StorageItems)
+                || pkg.Contains(StandardDataFormats.Bitmap)
+                || pkg.Contains(StandardDataFormats.WebLink));
+
+        if (!osHasMedia)
+        {
+            // OS clipboard has nothing relevant — try the internal clip clipboard.
+            TryPasteInternalClips();
+            return;
+        }
+
+        List<StorageFile> files;
+        try
+        {
+            files = await ResolveClipboardFilesAsync(pkg!);
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[paste] ResolveClipboardFilesAsync failed: {ex.GetType().Name}: {ex.Message}");
+            return;
+        }
+        if (files.Count == 0)
+        {
+            // OS clipboard claimed to have media but we couldn't materialize it
+            // (decode failed, etc.) — fall back to the internal clip clipboard.
+            TryPasteInternalClips();
+            return;
+        }
+
+        // Every paste batch creates fresh tracks for its contents rather than
+        // stacking onto existing rows: a video/image paste lands on a new track
+        // on top, an audio paste lands on a new track on the bottom. Lazily
+        // initialised so a mixed batch (e.g. video + audio) creates one of each
+        // and a single-kind batch creates just one.
+        Track? newVideoTrack = null;
+        Track? newAudioTrack = null;
+        TimelineClip? lastAdded = null;
+        Track?        lastTrack = null;
+        foreach (var file in files)
+        {
+            MediaItem? media = _vm.MediaBin.FirstOrDefault(
+                m => string.Equals(m.FilePath, file.Path, StringComparison.OrdinalIgnoreCase));
+            if (media is null)
+            {
+                media = await MediaItem.FromStorageFileAsync(file);
+                _vm.MediaBin.Add(media);
+                _mediaTiles.Add(MediaTileData.FromMediaItem(media));
+            }
+
+            bool isAudio = media.Type == MediaType.Audio;
+            Track track = isAudio
+                ? (newAudioTrack ??= CreateAndInsertNewTrack(MediaType.Audio))
+                : (newVideoTrack ??= CreateAndInsertNewTrack(MediaType.Video));
+
+            var clip = new TimelineClip
+            {
+                Label         = System.IO.Path.GetFileNameWithoutExtension(media.Name),
+                Kind          = isAudio ? ClipKind.Audio : ClipKind.Video,
+                TimelineStart = _vm.Project.Playhead,
+                Duration      = media.Duration > TimeSpan.Zero
+                                ? media.Duration
+                                : TimeSpan.FromSeconds(5),
+                SourceId      = media.Id,
+                ColorHue      = isAudio ? 100 : 168,
+            };
+            _vm.History.Record(new ClipAddAction(track, clip));
+            lastAdded = clip;
+            lastTrack = track;
+        }
+
+        TbBinCount.Text = $"· {_mediaTiles.Count}";
+        UpdateEmptyMediaHint();
+
+        if (lastAdded is null) return;
+
+        Timeline.ViewModel = _vm;
+        foreach (var tr in _vm.Tracks)
+            foreach (var c in tr.Clips)
+                c.IsSelected = false;
+        lastAdded.IsSelected = true;
+        _vm.SelectedClip = lastAdded;
+        UpdateInspector(lastAdded);
+        UpdateClipHeader(lastAdded);
+        UpdatePreviewOverlay(lastAdded);
+
+        var lastMedia = _vm.MediaBin.FirstOrDefault(m => m.Id == lastAdded.SourceId);
+        if (lastMedia is not null)
+            LoadPreviewFromPath(lastMedia.FilePath, lastMedia.Type);
+    }
+
+    /// <summary>Pulls usable media out of a clipboard payload. Tries StorageItems
+    /// (Explorer file copies) first; then tries to download the original bytes
+    /// when a source URL is on the clipboard (browser image-copy keeps animation
+    /// for GIFs this way); finally falls back to raw bitmap data, which gets
+    /// re-encoded as PNG into %TEMP%\BTAP-pasted\.</summary>
+    private static async Task<List<StorageFile>> ResolveClipboardFilesAsync(DataPackageView pkg)
+    {
+        var result = new List<StorageFile>();
+
+        if (pkg.Contains(StandardDataFormats.StorageItems))
+        {
+            try
+            {
+                var items = await pkg.GetStorageItemsAsync();
+                foreach (var it in items)
+                    if (it is StorageFile sf) result.Add(sf);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[paste] GetStorageItemsAsync failed: {ex.GetType().Name}: {ex.Message}");
+            }
+            if (result.Count > 0) return result;
+        }
+
+        // Browser "copy image" puts the rendered bitmap on the clipboard AND the
+        // source URL (via WebLink / HTML / Text). Going through Bitmap drops
+        // animation for GIFs because the bitmap channel only carries one frame.
+        // If we can find the URL, download the original bytes — keeps GIF
+        // animation, WEBP transparency, and source-quality JPEGs.
+        var sourceUrl = await TryFindImageUrlAsync(pkg);
+        if (sourceUrl is not null)
+        {
+            try
+            {
+                var downloaded = await DownloadClipboardUrlAsync(sourceUrl);
+                if (downloaded is not null) { result.Add(downloaded); return result; }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[paste] download from {sourceUrl} failed: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        if (pkg.Contains(StandardDataFormats.Bitmap))
+        {
+            try
+            {
+                var streamRef = await pkg.GetBitmapAsync();
+                using var input = await streamRef.OpenReadAsync();
+
+                var dir = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "BTAP-pasted");
+                System.IO.Directory.CreateDirectory(dir);
+                var folder = await StorageFolder.GetFolderFromPathAsync(dir);
+                var name   = $"clipboard_{DateTime.Now:yyyyMMdd_HHmmss}_{Guid.NewGuid():N}.png";
+                var outFile = await folder.CreateFileAsync(name, CreationCollisionOption.GenerateUniqueName);
+
+                // Decode to a normalized BGRA8/Premultiplied SoftwareBitmap before
+                // handing it to the PNG encoder. SetPixelData (the previous path)
+                // only accepts the encoder's native input format and silently fails
+                // on most clipboard sources because their decoders return Rgba8,
+                // unpremultiplied alpha, or 32bppBGR. SoftwareBitmap conversion
+                // happens inside WIC and handles every common clipboard format
+                // (PNG, DIB, BMP, JPEG, …) uniformly.
+                var decoder = await Windows.Graphics.Imaging.BitmapDecoder.CreateAsync(input);
+                using var bitmap = await decoder.GetSoftwareBitmapAsync(
+                    Windows.Graphics.Imaging.BitmapPixelFormat.Bgra8,
+                    Windows.Graphics.Imaging.BitmapAlphaMode.Premultiplied);
+                using (var output = await outFile.OpenAsync(FileAccessMode.ReadWrite))
+                {
+                    var encoder = await Windows.Graphics.Imaging.BitmapEncoder.CreateAsync(
+                        Windows.Graphics.Imaging.BitmapEncoder.PngEncoderId, output);
+                    encoder.SetSoftwareBitmap(bitmap);
+                    await encoder.FlushAsync();
+                }
+                result.Add(outFile);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[paste] Bitmap decode failed: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>Looks for an http(s) image URL on the clipboard. Checks WebLink
+    /// first (the cleanest source), then the HTML format's first &lt;img src&gt;,
+    /// then a plain-text URL. Returns null if nothing usable is on the clipboard.</summary>
+    private static async Task<string?> TryFindImageUrlAsync(DataPackageView pkg)
+    {
+        try
+        {
+            if (pkg.Contains(StandardDataFormats.WebLink))
+            {
+                var uri = await pkg.GetWebLinkAsync();
+                if (uri is not null && (uri.Scheme == "http" || uri.Scheme == "https"))
+                    return uri.AbsoluteUri;
+            }
+        }
+        catch (Exception ex) { Debug.WriteLine($"[paste] GetWebLinkAsync failed: {ex.Message}"); }
+
+        try
+        {
+            if (pkg.Contains(StandardDataFormats.Html))
+            {
+                var html = await pkg.GetHtmlFormatAsync();
+                if (!string.IsNullOrEmpty(html))
+                {
+                    var m = System.Text.RegularExpressions.Regex.Match(html,
+                        @"<img\b[^>]*\bsrc\s*=\s*(['""])(?<url>https?://[^'""]+)\1",
+                        System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                    if (m.Success) return m.Groups["url"].Value;
+                }
+            }
+        }
+        catch (Exception ex) { Debug.WriteLine($"[paste] GetHtmlFormatAsync failed: {ex.Message}"); }
+
+        try
+        {
+            if (pkg.Contains(StandardDataFormats.Text))
+            {
+                var t = (await pkg.GetTextAsync())?.Trim();
+                if (!string.IsNullOrEmpty(t)
+                    && Uri.TryCreate(t, UriKind.Absolute, out var u)
+                    && (u.Scheme == "http" || u.Scheme == "https"))
+                    return t;
+            }
+        }
+        catch (Exception ex) { Debug.WriteLine($"[paste] GetTextAsync failed: {ex.Message}"); }
+
+        return null;
+    }
+
+    private static readonly System.Net.Http.HttpClient _pasteHttp = new()
+    {
+        Timeout = TimeSpan.FromSeconds(30),
+    };
+
+    /// <summary>Downloads a URL into %TEMP%\BTAP-pasted\ and returns the resulting
+    /// StorageFile. Picks the file extension from the URL path first, falling back
+    /// to Content-Type so the rest of the pipeline classifies the file correctly
+    /// (a .gif extension is what kicks the compositor onto the animation path).
+    /// Returns null if the response isn't an image/video or the body is empty.</summary>
+    private static async Task<StorageFile?> DownloadClipboardUrlAsync(string url)
+    {
+        using var resp = await _pasteHttp.GetAsync(url, System.Net.Http.HttpCompletionOption.ResponseHeadersRead);
+        if (!resp.IsSuccessStatusCode) return null;
+
+        string ext = ".bin";
+        try
+        {
+            var u = new Uri(url);
+            var pathExt = System.IO.Path.GetExtension(u.AbsolutePath);
+            if (!string.IsNullOrEmpty(pathExt) && pathExt.Length is >= 2 and <= 6)
+                ext = pathExt.ToLowerInvariant();
+        }
+        catch { }
+        if (ext == ".bin")
+        {
+            var mime = resp.Content.Headers.ContentType?.MediaType?.ToLowerInvariant();
+            ext = mime switch
+            {
+                "image/gif"   => ".gif",
+                "image/png"   => ".png",
+                "image/jpeg"  => ".jpg",
+                "image/webp"  => ".webp",
+                "image/bmp"   => ".bmp",
+                "video/mp4"   => ".mp4",
+                "video/webm"  => ".webm",
+                "video/quicktime" => ".mov",
+                _ => ".bin",
+            };
+        }
+
+        // Only keep formats the rest of the importer can classify. .bin would
+        // get treated as a video and confuse the user — better to fall through
+        // to the bitmap path.
+        bool known = MediaItem.VideoExtensions.Contains(ext)
+                  || MediaItem.AudioExtensions.Contains(ext)
+                  || MediaItem.ImageExtensions.Contains(ext);
+        if (!known) return null;
+
+        var dir = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "BTAP-pasted");
+        System.IO.Directory.CreateDirectory(dir);
+        var folder = await StorageFolder.GetFolderFromPathAsync(dir);
+        var name   = $"clipboard_{DateTime.Now:yyyyMMdd_HHmmss}_{Guid.NewGuid():N}{ext}";
+        var outFile = await folder.CreateFileAsync(name, CreationCollisionOption.GenerateUniqueName);
+        using (var os = await outFile.OpenStreamForWriteAsync())
+        using (var src = await resp.Content.ReadAsStreamAsync())
+        {
+            await src.CopyToAsync(os);
+        }
+
+        var info = new System.IO.FileInfo(outFile.Path);
+        if (info.Length <= 0)
+        {
+            try { System.IO.File.Delete(outFile.Path); } catch { }
+            return null;
+        }
+        return outFile;
     }
 
     private async void OnImportMedia(object sender, RoutedEventArgs e)
@@ -2735,9 +3394,9 @@ public sealed partial class EditorPage : Page
                 break;
         }
 
-        // Restore inspector for any non-cut mode
-        InspectorPanel.Visibility = Visibility.Visible;
-        BodyGrid.ColumnDefinitions[2].Width = new GridLength(296);
+        // Restore inspector for any non-cut mode — pull widths from the
+        // user's layout settings rather than the hardcoded defaults.
+        ApplyLayoutFromSettings();
     }
 
     private void OnToolChange(object sender, RoutedEventArgs e)
@@ -2760,6 +3419,42 @@ public sealed partial class EditorPage : Page
         BtnSnap.Foreground = _vm.SnapEnabled
             ? (Brush)Application.Current.Resources["AccentInkBrush"]
             : (Brush)Application.Current.Resources["TextMutedBrush"];
+    }
+
+    /// <summary>Select every clip whose start sits at or after the playhead, across
+    /// every track. Mirrors DaVinci Resolve's "Select Clips Forward on All Tracks"
+    /// — useful for grabbing the tail of an edit to slide / delete / nudge as a
+    /// group. The primary SelectedClip is set to the earliest forward clip so the
+    /// inspector has something to bind to.</summary>
+    private void OnTrackSelectForward(object sender, RoutedEventArgs e)
+    {
+        if (_vm is null) return;
+        var playhead = _vm.Project.Playhead;
+        TimelineClip? earliest = null;
+
+        foreach (var t in _vm.Tracks)
+            foreach (var c in t.Clips)
+            {
+                bool forward = c.TimelineStart >= playhead;
+                c.IsSelected = forward;
+                if (forward && (earliest is null || c.TimelineStart < earliest.TimelineStart))
+                    earliest = c;
+            }
+
+        _vm.SelectedClip = earliest;
+        if (earliest is not null)
+        {
+            UpdateInspector(earliest);
+            UpdateClipHeader(earliest);
+            UpdatePreviewOverlay(earliest);
+            LoadPreviewForClip(earliest);
+        }
+        else
+        {
+            UpdateInspector(null);
+        }
+        Timeline.Refresh();
+        RefreshPresentation();
     }
 
     private void OnZoomIn(object sender, RoutedEventArgs e)
@@ -2824,11 +3519,63 @@ public sealed partial class EditorPage : Page
         AutomationsLayout.Visibility     = automations ? Visibility.Visible   : Visibility.Collapsed;
     }
 
+    private static bool IsAudioOnlyClip(TimelineClip clip) =>
+        clip.Kind is ClipKind.Audio or ClipKind.Music;
+
+    /// <summary>Apply <paramref name="set"/> to the primary clip and every other
+    /// clip that's currently part of the multi-selection. Lets inspector sliders,
+    /// toggles, swatches, etc. edit a whole batch of clips at once.</summary>
+    private void ApplyMulti(TimelineClip primary, Action<TimelineClip> set)
+    {
+        set(primary);
+        if (_vm is null) return;
+        foreach (var t in _vm.Tracks)
+            foreach (var c in t.Clips)
+                if (c.IsSelected && !ReferenceEquals(c, primary))
+                    set(c);
+    }
+
+    /// <summary>Show the Text tab only for Title clips; hide Video/Color for audio
+    /// clips (they don't apply); hide Video/Audio/Effects/Color for Title clips
+    /// (everything text-related is consolidated in the Text tab). Also auto-switches
+    /// the active tab to a visible one if the user was on a tab that just got hidden.</summary>
+    private void UpdateInspectorTabsVisibility(TimelineClip? clip)
+    {
+        bool isTitle = clip is not null && clip.Kind == ClipKind.Title;
+        bool isAudio = clip is not null && IsAudioOnlyClip(clip);
+
+        BtnInspText.Visibility  = isTitle ? Visibility.Visible : Visibility.Collapsed;
+        BtnInspVideo.Visibility = isTitle || isAudio ? Visibility.Collapsed : Visibility.Visible;
+        BtnInspAudio.Visibility = isTitle ? Visibility.Collapsed : Visibility.Visible;
+        BtnInspFX.Visibility    = isTitle ? Visibility.Collapsed : Visibility.Visible;
+        BtnInspColor.Visibility = isTitle || isAudio ? Visibility.Collapsed : Visibility.Visible;
+
+        if (_vm is null) return;
+
+        if (isTitle && _vm.InspectorTab is not ("text" or "automations"))
+        {
+            _vm.InspectorTab = "text";
+            SetActiveInspBtn(BtnInspText);
+        }
+        else if (isAudio && _vm.InspectorTab is "video" or "color")
+        {
+            _vm.InspectorTab = "audio";
+            SetActiveInspBtn(BtnInspAudio);
+        }
+        else if (!isTitle && _vm.InspectorTab == "text")
+        {
+            // Going from a title clip to a non-title — Text tab vanishes; fall back to Video.
+            _vm.InspectorTab = "video";
+            SetActiveInspBtn(BtnInspVideo);
+        }
+    }
+
     private void UpdateInspector(TimelineClip? clip)
     {
         InspectorContent.Children.Clear();
         AutomationsListPanel.Children.Clear();
         AutomationsEditorPanel.Children.Clear();
+        UpdateInspectorTabsVisibility(clip);
         if (clip is null || _vm is null)
         {
             ShowInspectorLayout(automations: false);
@@ -2839,11 +3586,17 @@ public sealed partial class EditorPage : Page
 
         switch (_vm.InspectorTab)
         {
+            case "text":        BuildInspectorText(clip);        break;
             case "audio":       BuildInspectorAudio(clip);       break;
             case "effects":     BuildInspectorEffects(clip);     break;
             case "color":       BuildInspectorColor(clip);       break;
             case "automations": BuildInspectorAutomations(clip); break;
-            default:        BuildInspectorVideo(clip);   break;
+            default:
+                // Title clips never end up with a non-text/non-automation tab
+                // (UpdateInspectorTabsVisibility forces it), but be safe.
+                if (clip.Kind == ClipKind.Title) BuildInspectorText(clip);
+                else                              BuildInspectorVideo(clip);
+                break;
         }
     }
 
@@ -2854,31 +3607,28 @@ public sealed partial class EditorPage : Page
         AddInspField("Source In", FormatHms(clip.SourceStart));
 
         InspectorContent.Children.Add(MakeInspSectionHeader("CLIP"));
-        AddInspSlider("Volume", clip.Volume * 100,  0,  100, v => clip.Volume = v / 100.0);
-        AddInspSlider("Speed",  clip.Speed  * 100, 10,  400, v => clip.Speed  = v / 100.0);
+        AddInspSlider("Volume", clip.Volume * 100,  0,  100, v => ApplyMulti(clip, c => c.Volume = v / 100.0));
+        AddInspSlider("Speed",  clip.Speed  * 100, 10,  400, v => ApplyMulti(clip, c => c.Speed  = v / 100.0));
 
-        if (clip.Kind == ClipKind.Title)
-        {
-            BuildInspectorTitleText(clip);
-        }
-
-        if (clip.Kind is ClipKind.Video or ClipKind.Title)
+        // Title clips are handled by BuildInspectorText (their own tab now); only
+        // video clips end up here, so we don't gate the Transform block by Kind.
+        if (clip.Kind == ClipKind.Video)
         {
             InspectorContent.Children.Add(MakeInspSectionHeader("TRANSFORM"));
             // PosX/PosY are in canvas-pixel units. Range to ±canvas dimensions so the
             // slider covers the full movable area regardless of project export size.
             var (canvasW, canvasH) = _vm.Project.GetCanvasSize();
-            AddInspSlider("Scale",    clip.Scale    * 100,   10,  300, v => clip.Scale    = v / 100.0);
-            AddInspSlider("Pos X",    clip.PosX,        -canvasW, canvasW, v => clip.PosX     = v);
-            AddInspSlider("Pos Y",    clip.PosY,        -canvasH, canvasH, v => clip.PosY     = v);
-            AddInspSlider("Rotation", clip.Rotation,        -180,  180, v => clip.Rotation = v);
-            AddInspSlider("Opacity",  clip.Opacity  * 100,    0,  100, v => clip.Opacity  = v / 100.0);
+            AddInspSlider("Scale",    clip.Scale    * 100,   10,  300, v => ApplyMulti(clip, c => c.Scale    = v / 100.0));
+            AddInspSlider("Pos X",    clip.PosX,        -canvasW, canvasW, v => ApplyMulti(clip, c => c.PosX     = v));
+            AddInspSlider("Pos Y",    clip.PosY,        -canvasH, canvasH, v => ApplyMulti(clip, c => c.PosY     = v));
+            AddInspSlider("Rotation", clip.Rotation,        -180,  180, v => ApplyMulti(clip, c => c.Rotation = v));
+            AddInspSlider("Opacity",  clip.Opacity  * 100,    0,  100, v => ApplyMulti(clip, c => c.Opacity  = v / 100.0));
 
             InspectorContent.Children.Add(MakeInspSectionHeader("CROP"));
-            AddInspSlider("Left",   clip.CropLeft   * 100, 0, 95, v => clip.CropLeft   = v / 100.0);
-            AddInspSlider("Top",    clip.CropTop    * 100, 0, 95, v => clip.CropTop    = v / 100.0);
-            AddInspSlider("Right",  clip.CropRight  * 100, 0, 95, v => clip.CropRight  = v / 100.0);
-            AddInspSlider("Bottom", clip.CropBottom * 100, 0, 95, v => clip.CropBottom = v / 100.0);
+            AddInspSlider("Left",   clip.CropLeft   * 100, 0, 95, v => ApplyMulti(clip, c => c.CropLeft   = v / 100.0));
+            AddInspSlider("Top",    clip.CropTop    * 100, 0, 95, v => ApplyMulti(clip, c => c.CropTop    = v / 100.0));
+            AddInspSlider("Right",  clip.CropRight  * 100, 0, 95, v => ApplyMulti(clip, c => c.CropRight  = v / 100.0));
+            AddInspSlider("Bottom", clip.CropBottom * 100, 0, 95, v => ApplyMulti(clip, c => c.CropBottom = v / 100.0));
         }
     }
 
@@ -2898,28 +3648,46 @@ public sealed partial class EditorPage : Page
         ("Cyan",   "#FF6EC1E4"),
     };
 
-    private void BuildInspectorTitleText(TimelineClip clip)
+    /// <summary>Consolidated inspector for Title (text) clips. The Text tab replaces
+    /// Video / Audio / Effects / Color for these clips, so this panel includes
+    /// timing, transform, font, alignment, color, and background controls all in
+    /// one place.</summary>
+    private void BuildInspectorText(TimelineClip clip)
     {
+        AddInspField("Position", FormatHms(clip.TimelineStart));
+        AddInspField("Duration", FormatHms(clip.Duration));
+
         InspectorContent.Children.Add(MakeInspSectionHeader("TEXT"));
 
-        // Text content
+        // Text content. Label intentionally only writes to the primary clip — copying
+        // the same text into every selected clip would overwrite distinct captions.
         InspectorContent.Children.Add(MakeTextBoxRow(
             "Text", clip.Label, v => { clip.Label = v; Timeline.Refresh(); UpdateClipHeader(clip); }));
 
-        // Font family
         InspectorContent.Children.Add(MakeFontFamilyRow(clip));
-
-        // Font size
-        AddInspSlider("Size", clip.FontSize, 8, 240, v => clip.FontSize = v);
-
-        // Bold / Italic / Underline toggles + alignment
+        AddInspSlider("Size", clip.FontSize, 8, 240, v => ApplyMulti(clip, c => c.FontSize = v));
         InspectorContent.Children.Add(MakeFontStyleRow(clip));
-
-        // Alignment
         InspectorContent.Children.Add(MakeTextAlignRow(clip));
 
-        // Color swatches
-        InspectorContent.Children.Add(MakeColorSwatchRow(clip));
+        InspectorContent.Children.Add(MakeInspSectionHeader("COLOR"));
+        InspectorContent.Children.Add(MakeColorPickerRow(
+            "Text color", clip.TextColor,
+            hex => { ApplyMulti(clip, c => c.TextColor = hex); UpdateInspector(clip); }));
+        InspectorContent.Children.Add(MakeColorPickerRow(
+            "Background", clip.TextBackground,
+            hex => { ApplyMulti(clip, c => c.TextBackground = hex); UpdateInspector(clip); },
+            allowTransparent: true));
+
+        InspectorContent.Children.Add(MakeInspSectionHeader("TRANSFORM"));
+        if (_vm is not null)
+        {
+            var (canvasW, canvasH) = _vm.Project.GetCanvasSize();
+            AddInspSlider("Scale",    clip.Scale    * 100, 10, 300, v => ApplyMulti(clip, c => c.Scale    = v / 100.0));
+            AddInspSlider("Pos X",    clip.PosX,        -canvasW, canvasW, v => ApplyMulti(clip, c => c.PosX     = v));
+            AddInspSlider("Pos Y",    clip.PosY,        -canvasH, canvasH, v => ApplyMulti(clip, c => c.PosY     = v));
+            AddInspSlider("Rotation", clip.Rotation,        -180,  180,    v => ApplyMulti(clip, c => c.Rotation = v));
+            AddInspSlider("Opacity",  clip.Opacity  * 100,    0,  100,    v => ApplyMulti(clip, c => c.Opacity  = v / 100.0));
+        }
     }
 
     private UIElement MakeTextBoxRow(string label, string value, Action<string> onChange)
@@ -2961,7 +3729,7 @@ public sealed partial class EditorPage : Page
         };
         combo.SelectionChanged += (_, _) =>
         {
-            if (combo.SelectedItem is string s) clip.FontFamily = s;
+            if (combo.SelectedItem is string s) ApplyMulti(clip, c => c.FontFamily = s);
         };
         panel.Children.Add(combo);
         return panel;
@@ -2978,11 +3746,11 @@ public sealed partial class EditorPage : Page
         });
         var row = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 4 };
 
-        var boldBtn = MakeToggle("B", clip.IsBold, v => clip.IsBold = v);
+        var boldBtn = MakeToggle("B", clip.IsBold, v => ApplyMulti(clip, c => c.IsBold = v));
         boldBtn.FontWeight = Microsoft.UI.Text.FontWeights.Bold;
-        var italicBtn = MakeToggle("I", clip.IsItalic, v => clip.IsItalic = v);
+        var italicBtn = MakeToggle("I", clip.IsItalic, v => ApplyMulti(clip, c => c.IsItalic = v));
         italicBtn.FontStyle = Windows.UI.Text.FontStyle.Italic;
-        var underlineBtn = MakeToggle("U", clip.IsUnderline, v => clip.IsUnderline = v);
+        var underlineBtn = MakeToggle("U", clip.IsUnderline, v => ApplyMulti(clip, c => c.IsUnderline = v));
 
         row.Children.Add(boldBtn);
         row.Children.Add(italicBtn);
@@ -3031,7 +3799,7 @@ public sealed partial class EditorPage : Page
             if (t.IsChecked == true) activeBtn = t;
             t.Click += (_, _) =>
             {
-                clip.TextAlign = value;
+                ApplyMulti(clip, c => c.TextAlign = value);
                 t.IsChecked = true;
                 if (activeBtn is not null && activeBtn != t) activeBtn.IsChecked = false;
                 activeBtn = t;
@@ -3046,40 +3814,161 @@ public sealed partial class EditorPage : Page
         return panel;
     }
 
-    private UIElement MakeColorSwatchRow(TimelineClip clip)
+    /// <summary>Extended color picker row. Shows the preset swatches, a "Custom"
+    /// chip that opens a full <see cref="ColorPicker"/> dialog, and (when
+    /// <paramref name="allowTransparent"/> is true) an explicit "None" chip for
+    /// no fill — used for backgrounds where transparent is the default.</summary>
+    private UIElement MakeColorPickerRow(string label, string currentHex,
+                                         Action<string> onChange,
+                                         bool allowTransparent = false)
     {
-        var panel = new StackPanel { Padding = new Thickness(14, 4, 14, 4), Spacing = 2 };
+        var panel = new StackPanel { Padding = new Thickness(14, 4, 14, 4), Spacing = 4 };
         panel.Children.Add(new TextBlock
         {
-            Text = "Color",
+            Text = label,
             FontSize = 10,
             Foreground = (Brush)Application.Current.Resources["TextMutedBrush"],
         });
+
         var row = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
+
+        if (allowTransparent)
+        {
+            row.Children.Add(MakeSwatch(
+                fill: null, // checkerboard, indicates transparent
+                isActive: IsTransparent(currentHex),
+                tooltip: "None (transparent)",
+                onTap: () => onChange("#00000000")));
+        }
+
         foreach (var (lbl, hex) in TextColorSwatches)
         {
             var fill = ParseColorBrush(hex) ?? new SolidColorBrush(Microsoft.UI.Colors.White);
-            var swatchBorder = new Border
-            {
-                Width = 22,
-                Height = 22,
-                CornerRadius = new CornerRadius(3),
-                Background = fill,
-                BorderBrush = string.Equals(clip.TextColor, hex, StringComparison.OrdinalIgnoreCase)
-                    ? (Brush)Application.Current.Resources["AccentBrush"]
-                    : (Brush)Application.Current.Resources["HairlineBrush"],
-                BorderThickness = new Thickness(string.Equals(clip.TextColor, hex, StringComparison.OrdinalIgnoreCase) ? 2 : 1),
-            };
-            ToolTipService.SetToolTip(swatchBorder, lbl);
-            swatchBorder.Tapped += (_, _) =>
-            {
-                clip.TextColor = hex;
-                UpdateInspector(clip);
-            };
-            row.Children.Add(swatchBorder);
+            row.Children.Add(MakeSwatch(
+                fill: fill,
+                isActive: ColorHexEquals(currentHex, hex),
+                tooltip: lbl,
+                onTap: () => onChange(hex)));
         }
+
+        // "+" chip → open the full picker. Shows the current color so the user can
+        // see what they're tweaking even if it doesn't match any preset.
+        var current = ParseColorBrush(currentHex) ?? new SolidColorBrush(Microsoft.UI.Colors.White);
+        var customSwatch = MakeSwatch(
+            fill: current,
+            isActive: !IsKnownSwatch(currentHex) && !IsTransparent(currentHex),
+            tooltip: "Custom color…",
+            onTap: () => OpenCustomColorPickerAsync(currentHex, onChange, allowTransparent));
+        // Mark with a "+" overlay so it's visually distinct from the presets.
+        if (customSwatch.Child is Grid g)
+        {
+            g.Children.Add(new TextBlock
+            {
+                Text = "+",
+                FontSize = 12,
+                FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+                Foreground = new SolidColorBrush(Color.FromArgb(220, 0, 0, 0)),
+                HorizontalAlignment = HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Center,
+                IsHitTestVisible = false,
+            });
+        }
+        row.Children.Add(customSwatch);
+
         panel.Children.Add(row);
         return panel;
+    }
+
+    private Border MakeSwatch(Brush? fill, bool isActive, string tooltip, Action onTap)
+    {
+        var inner = new Grid { Width = 22, Height = 22 };
+
+        // Background: solid color if fill provided, otherwise a checkerboard hint
+        // so the swatch reads as "transparent" / "no fill".
+        if (fill is not null)
+        {
+            inner.Background = fill;
+        }
+        else
+        {
+            inner.Background = new SolidColorBrush(Color.FromArgb(255, 220, 220, 220));
+            var diag = new Microsoft.UI.Xaml.Shapes.Line
+            {
+                X1 = 0, Y1 = 22, X2 = 22, Y2 = 0,
+                Stroke = new SolidColorBrush(Color.FromArgb(255, 224, 88, 88)),
+                StrokeThickness = 2,
+            };
+            inner.Children.Add(diag);
+        }
+
+        var border = new Border
+        {
+            Width = 22,
+            Height = 22,
+            CornerRadius = new CornerRadius(3),
+            Child = inner,
+            BorderBrush = isActive
+                ? (Brush)Application.Current.Resources["AccentBrush"]
+                : (Brush)Application.Current.Resources["HairlineBrush"],
+            BorderThickness = new Thickness(isActive ? 2 : 1),
+        };
+        ToolTipService.SetToolTip(border, tooltip);
+        border.Tapped += (_, _) => onTap();
+        return border;
+    }
+
+    private static bool ColorHexEquals(string a, string b) =>
+        string.Equals(a, b, StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsTransparent(string hex)
+    {
+        var s = hex?.Trim().TrimStart('#') ?? string.Empty;
+        if (s.Length == 8 &&
+            byte.TryParse(s[..2], System.Globalization.NumberStyles.HexNumber, null, out var a))
+            return a == 0;
+        return false;
+    }
+
+    private static bool IsKnownSwatch(string hex) =>
+        Array.Exists(TextColorSwatches, s => ColorHexEquals(s.Hex, hex));
+
+    private async void OpenCustomColorPickerAsync(string initialHex,
+                                                  Action<string> onChange,
+                                                  bool allowAlpha)
+    {
+        var initial = ParseColorBrush(initialHex)?.Color ?? Microsoft.UI.Colors.White;
+
+        var picker = new ColorPicker
+        {
+            Color = initial,
+            IsAlphaEnabled = allowAlpha,
+            IsAlphaSliderVisible = allowAlpha,
+            IsHexInputVisible = true,
+            IsColorChannelTextInputVisible = true,
+            IsColorSliderVisible = true,
+            ColorSpectrumShape = ColorSpectrumShape.Box,
+            // Make sure the popup fits without forcing the user to scroll inside it.
+            Width = 320,
+        };
+
+        var dialog = new ContentDialog
+        {
+            Title = "Pick a color",
+            Content = picker,
+            PrimaryButtonText = "Apply",
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Primary,
+            XamlRoot = XamlRoot,
+        };
+
+        var result = await dialog.ShowAsync();
+        if (result != ContentDialogResult.Primary) return;
+
+        var c = picker.Color;
+        // Always store as #AARRGGBB so background's alpha round-trips through the
+        // serializer; ParseColorBrush already handles both 6- and 8-digit forms.
+        var hex = $"#{c.A:X2}{c.R:X2}{c.G:X2}{c.B:X2}";
+        onChange(hex);
     }
 
     private void BuildInspectorAudio(TimelineClip clip)
@@ -3089,17 +3978,46 @@ public sealed partial class EditorPage : Page
 
         InspectorContent.Children.Add(MakeInspSectionHeader("LEVELS"));
         InspectorContent.Children.Add(MakeAudioLevelMeter(clip));
-        AddInspSlider("Gain", clip.Volume * 100, 0,    200, v => clip.Volume = v / 100.0);
-        AddInspSlider("Pan",  clip.Pan    * 100, -100, 100, v => clip.Pan    = v / 100.0);
+        AddInspSlider("Gain", clip.Volume * 100, 0,    200, v => ApplyMulti(clip, c => c.Volume = v / 100.0));
+        AddInspSlider("Pan",  clip.Pan    * 100, -100, 100, v => ApplyMulti(clip, c => c.Pan    = v / 100.0));
 
         InspectorContent.Children.Add(MakeInspSectionHeader("ENVELOPE"));
-        AddInspSlider("Fade In",  clip.FadeInMs,  0, 5000, v => clip.FadeInMs  = v);
-        AddInspSlider("Fade Out", clip.FadeOutMs, 0, 5000, v => clip.FadeOutMs = v);
+        AddInspSlider("Fade In",  clip.FadeInMs,  0, 5000, v => ApplyMulti(clip, c => c.FadeInMs  = v));
+        AddInspSlider("Fade Out", clip.FadeOutMs, 0, 5000, v => ApplyMulti(clip, c => c.FadeOutMs = v));
 
         InspectorContent.Children.Add(MakeInspSectionHeader("PROCESSING"));
-        AddInspSlider("EQ Low",  clip.EqLow,  -12, 12, v => clip.EqLow  = v);
-        AddInspSlider("EQ Mid",  clip.EqMid,  -12, 12, v => clip.EqMid  = v);
-        AddInspSlider("EQ High", clip.EqHigh, -12, 12, v => clip.EqHigh = v);
+        AddInspSlider("EQ Low",  clip.EqLow,  -12, 12, v => { ApplyMulti(clip, c => c.EqLow  = v); VideoCompositor.NotifyAudioParamsChanged(); });
+        AddInspSlider("EQ Mid",  clip.EqMid,  -12, 12, v => { ApplyMulti(clip, c => c.EqMid  = v); VideoCompositor.NotifyAudioParamsChanged(); });
+        AddInspSlider("EQ High", clip.EqHigh, -12, 12, v => { ApplyMulti(clip, c => c.EqHigh = v); VideoCompositor.NotifyAudioParamsChanged(); });
+
+        // Captions: only meaningful for video clips (they own the source audio that
+        // Whisper transcribes). Audio-only clips have no caption surface — captions
+        // are baked as Title clips on the timeline, not as part of the audio.
+        if (clip.Kind == ClipKind.Video)
+            AddCaptionsInspectorSection(clip);
+    }
+
+    private void AddCaptionsInspectorSection(TimelineClip clip)
+    {
+        InspectorContent.Children.Add(MakeInspSectionHeader("CAPTIONS"));
+        var panel = new StackPanel { Spacing = 6, Margin = new Thickness(14, 6, 14, 12) };
+        panel.Children.Add(new TextBlock
+        {
+            Text = "Transcribe this clip and add timed caption text on a Captions track.",
+            FontSize = 11,
+            TextWrapping = TextWrapping.Wrap,
+            Foreground = (Brush)Application.Current.Resources["TextMutedBrush"],
+        });
+        var btn = new Button
+        {
+            Content = "Generate captions…",
+            FontSize = 11.5,
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            Style = (Style)Application.Current.Resources["PrimaryButtonStyle"],
+        };
+        btn.Click += OnGenerateCaptions;
+        panel.Children.Add(btn);
+        InspectorContent.Children.Add(panel);
     }
 
     private UIElement MakeAudioLevelMeter(TimelineClip clip)
@@ -3503,25 +4421,69 @@ public sealed partial class EditorPage : Page
     private void BuildInspectorEffects(TimelineClip clip)
     {
         InspectorContent.Children.Add(MakeInspSectionHeader("EFFECTS"));
-        foreach (var name in ClipEffectsChain.AvailableVideoEffects)
+        var effectList = IsAudioOnlyClip(clip)
+            ? ClipEffectsChain.AvailableAudioEffects
+            : ClipEffectsChain.AvailableVideoEffects;
+        foreach (var name in effectList)
             InspectorContent.Children.Add(MakeEffectToggleRow(clip, name));
     }
 
     private void BuildInspectorColor(TimelineClip clip)
     {
         InspectorContent.Children.Add(MakeInspSectionHeader("BASIC"));
-        AddInspSlider("Exposure",   clip.Exposure,   -2,   2,   v => clip.Exposure   = v);
-        AddInspSlider("Contrast",   clip.Contrast,   -100, 100, v => clip.Contrast   = v);
-        AddInspSlider("Saturation", clip.Saturation, -100, 100, v => clip.Saturation = v);
+        AddInspSlider("Exposure",   clip.Exposure,   -2,   2,   v => ApplyMulti(clip, c => c.Exposure   = v));
+        AddInspSlider("Contrast",   clip.Contrast,   -100, 100, v => ApplyMulti(clip, c => c.Contrast   = v));
+        AddInspSlider("Saturation", clip.Saturation, -100, 100, v => ApplyMulti(clip, c => c.Saturation = v));
 
         InspectorContent.Children.Add(MakeInspSectionHeader("WHITE BALANCE"));
-        AddInspSlider("Temperature", clip.Temperature, -100, 100, v => clip.Temperature = v);
-        AddInspSlider("Tint",        clip.Tint,        -100, 100, v => clip.Tint        = v);
+        AddInspSlider("Temperature", clip.Temperature, -100, 100, v => ApplyMulti(clip, c => c.Temperature = v));
+        AddInspSlider("Tint",        clip.Tint,        -100, 100, v => ApplyMulti(clip, c => c.Tint        = v));
 
         InspectorContent.Children.Add(MakeInspSectionHeader("WHEELS"));
-        AddInspSlider("Lift",  clip.Lift,      -50, 50, v => clip.Lift      = v);
-        AddInspSlider("Gamma", clip.Gamma,     -50, 50, v => clip.Gamma     = v);
-        AddInspSlider("Gain",  clip.ColorGain, -50, 50, v => clip.ColorGain = v);
+        AddInspSlider("Lift",  clip.Lift,      -50, 50, v => ApplyMulti(clip, c => c.Lift      = v));
+        AddInspSlider("Gamma", clip.Gamma,     -50, 50, v => ApplyMulti(clip, c => c.Gamma     = v));
+        AddInspSlider("Gain",  clip.ColorGain, -50, 50, v => ApplyMulti(clip, c => c.ColorGain = v));
+
+        InspectorContent.Children.Add(MakeInspSectionHeader("COLOR OVERLAY"));
+        InspectorContent.Children.Add(MakeColorPickerRow(
+            "Overlay", clip.ColorOverlay,
+            hex => { ApplyMulti(clip, c => c.ColorOverlay = hex); UpdateInspector(clip); },
+            allowTransparent: true));
+
+        InspectorContent.Children.Add(MakeColorResetButton(clip));
+    }
+
+    /// <summary>"Reset all" affordance at the bottom of the Color tab. Clears every
+    /// color-grade slider plus the overlay on the primary clip and any other
+    /// clips that are part of the multi-selection, matching the rest of the
+    /// inspector's batch behavior.</summary>
+    private UIElement MakeColorResetButton(TimelineClip clip)
+    {
+        var btn = new Button
+        {
+            Content = "Reset color",
+            FontSize = 11,
+            Margin = new Thickness(14, 10, 14, 12),
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            Style = (Style)Application.Current.Resources["GhostButtonStyle"],
+        };
+        btn.Click += (_, _) =>
+        {
+            ApplyMulti(clip, c =>
+            {
+                c.Exposure = 0;
+                c.Contrast = 0;
+                c.Saturation = 0;
+                c.Temperature = 0;
+                c.Tint = 0;
+                c.Lift = 0;
+                c.Gamma = 0;
+                c.ColorGain = 0;
+                c.ColorOverlay = "#00000000";
+            });
+            UpdateInspector(clip);
+        };
+        return btn;
     }
 
     /// <summary>Flat-list automations browser: every keyframe across every effect
@@ -4047,7 +5009,13 @@ public sealed partial class EditorPage : Page
             Padding = new Thickness(14, 4, 8, 2),
         };
 
-        var label = new TextBlock
+        var labelContent = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 6,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        labelContent.Children.Add(new TextBlock
         {
             Text = effectName,
             FontSize = 11,
@@ -4056,7 +5024,30 @@ public sealed partial class EditorPage : Page
                 ? (Brush)Application.Current.Resources["TextPrimaryBrush"]
                 : (Brush)Application.Current.Resources["TextDimBrush"],
             VerticalAlignment = VerticalAlignment.Center,
-        };
+        });
+        // Audio effects whose DSP isn't wired in the live preview yet get a small
+        // badge so the inspector doesn't pretend the slider does something audible.
+        if (ClipEffectsChain.IsAudioEffect(effectName) && !AudioEngine.IsPreviewActive(effectName))
+        {
+            var badge = new Border
+            {
+                Background = (Brush)Application.Current.Resources["BgElevatedBrush"],
+                CornerRadius = new CornerRadius(2),
+                Padding = new Thickness(5, 0, 5, 1),
+                VerticalAlignment = VerticalAlignment.Center,
+                Child = new TextBlock
+                {
+                    Text = "EXPORT ONLY",
+                    FontSize = 8.5,
+                    CharacterSpacing = 80,
+                    Foreground = (Brush)Application.Current.Resources["TextFaintBrush"],
+                },
+            };
+            ToolTipService.SetToolTip(badge,
+                "Live preview not yet implemented for this effect — it'll still save to the project file.");
+            labelContent.Children.Add(badge);
+        }
+        var label = labelContent;
 
         // Clear OnContent/OffContent so the switch reads as a compact pill without
         // the default "On"/"Off" text taking ~40px of horizontal space.
@@ -4072,6 +5063,10 @@ public sealed partial class EditorPage : Page
         toggle.Toggled += (_, _) =>
         {
             SetEffectEnabledOnClip(clip, effectName, toggle.IsOn);
+            // Audio effects: re-apply chain so adding/removing an effect takes
+            // effect immediately. Video effects re-render on the next frame.
+            if (ClipEffectsChain.IsAudioEffect(effectName))
+                VideoCompositor.NotifyAudioParamsChanged();
             UpdateInspector(clip);
         };
 
@@ -4212,6 +5207,11 @@ public sealed partial class EditorPage : Page
             fx.SetNumber(p.Key, v);
             valLbl.Text = FormatEffectNumber(v);
             if (_vm is not null) _vm.Project.IsModified = true;
+            // Audio effect params: live re-apply through the AudioGraph engine so
+            // the user hears the change as they drag. No-op for video effects /
+            // when AudioEngine couldn't init.
+            if (ClipEffectsChain.IsAudioEffect(fx.Name))
+                VideoCompositor.NotifyAudioParamsChanged();
         });
         // When the parameter is animated, the static value is a fallback that
         // doesn't affect the rendered frame — dim the slider to signal that.
@@ -4593,27 +5593,48 @@ public sealed partial class EditorPage : Page
 
     private void AddInspSlider(string label, double value, double min, double max, Action<double>? onChange = null)
     {
-        var panel = new StackPanel { Padding = new Thickness(14, 4, 14, 4), Spacing = 2 };
+        var panel = new StackPanel { Padding = new Thickness(14, 4, 14, 4), Spacing = 1 };
 
+        // Label row: parameter name on the left, live numeric value on the right.
+        // Mirrors the layout used by the Effects tab so sliders read consistently
+        // across the whole inspector.
+        var head = new Grid
+        {
+            ColumnDefinitions =
+            {
+                new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) },
+                new ColumnDefinition { Width = GridLength.Auto },
+            },
+        };
         var lbl = new TextBlock
         {
             Text = label,
             FontSize = 10,
             Foreground = (Brush)Application.Current.Resources["TextMutedBrush"],
+            VerticalAlignment = VerticalAlignment.Center,
         };
-        var slider = new Slider
+        var valLbl = new TextBlock
         {
-            Minimum = min,
-            Maximum = max,
-            Value = value,
-            Style = (Style)Application.Current.Resources["BtapSliderStyle"],
+            Text = FormatEffectNumber(value),
+            FontSize = 10,
+            FontFamily = new FontFamily("JetBrains Mono, Consolas"),
+            Foreground = (Brush)Application.Current.Resources["TextDimBrush"],
+            VerticalAlignment = VerticalAlignment.Center,
         };
+        head.Children.Add(lbl);
+        Grid.SetColumn(lbl, 0);
+        head.Children.Add(valLbl);
+        Grid.SetColumn(valLbl, 1);
+        panel.Children.Add(head);
 
-        if (onChange is not null)
-            slider.ValueChanged += (_, e) => onChange(e.NewValue);
+        // Use the standard bare slider helper so the thumb is the normal size
+        // (the old BtapSliderStyle squashed Height to 4px which hid the thumb).
+        panel.Children.Add(MakeBareSlider(min, max, value, v =>
+        {
+            valLbl.Text = FormatEffectNumber(v);
+            onChange?.Invoke(v);
+        }));
 
-        panel.Children.Add(lbl);
-        panel.Children.Add(slider);
         InspectorContent.Children.Add(panel);
     }
 
@@ -4815,20 +5836,20 @@ public sealed partial class EditorPage : Page
     private void OnViewFullscreen(object sender, RoutedEventArgs e)
     {
         _isFullscreen = !_isFullscreen;
-        var hidden = _isFullscreen ? Visibility.Collapsed : Visibility.Visible;
-        LibraryPanel.Visibility   = hidden;
-        InspectorPanel.Visibility = hidden;
-        MenuBar.Visibility        = hidden;
+        MenuBar.Visibility = _isFullscreen ? Visibility.Collapsed : Visibility.Visible;
 
         if (_isFullscreen)
         {
+            LibraryPanel.Visibility   = Visibility.Collapsed;
+            InspectorPanel.Visibility = Visibility.Collapsed;
             BodyGrid.ColumnDefinitions[0].Width = new GridLength(0);
             BodyGrid.ColumnDefinitions[2].Width = new GridLength(0);
         }
         else
         {
-            BodyGrid.ColumnDefinitions[0].Width = new GridLength(256);
-            BodyGrid.ColumnDefinitions[2].Width = new GridLength(296);
+            // Fall back to the user's layout preferences instead of the
+            // hardcoded 256 / 296 defaults.
+            ApplyLayoutFromSettings();
         }
     }
 
@@ -4936,9 +5957,485 @@ public sealed partial class EditorPage : Page
             XamlRoot = XamlRoot,
         }.ShowAsync().AsTask();
 
+    // ── Pre-export preview dialog ─────────────────────────────────────────
+
+    /// <summary>Result of the export-preview dialog. <see cref="Continue"/> is true
+    /// when the user confirmed; <see cref="Options"/> carries any encoder overrides
+    /// (e.g. when the file-size limit was enabled) or is null for the default
+    /// encode.</summary>
+    private sealed class ExportPreviewResult
+    {
+        public bool                          Continue { get; set; }
+        public ExportRenderer.ExportOptions? Options  { get; set; }
+    }
+
+    /// <summary>Show the user a summary of what's about to be rendered (resolution,
+    /// fps, format, aspect, duration, estimated file size, included vs excluded
+    /// tracks) plus a small 10x-speed looping playback of the timeline's source
+    /// video. Returns the user's choice and any encoder options they configured.</summary>
+    private async Task<ExportPreviewResult> ShowExportPreviewAsync()
+    {
+        if (_vm is null) return new ExportPreviewResult();
+        var project = _vm.Project;
+
+        // ── Compute summary values ──────────────────────────────────────────
+        double fps   = project.FrameRate;
+        int    w     = project.Width;
+        int    h     = project.Height;
+        double durSec = project.Duration.TotalSeconds;
+        string aspect = AspectRatioLabel(w, h);
+
+        // Match ExportRenderer's bitrate formula so the estimate aligns with the
+        // file the user actually gets. Plus ~192 kbps for AAC audio.
+        long videoBps = (long)Math.Max(2_000_000, w * h * Math.Max(1, fps) * 0.16);
+        const long audioBps = 192_000;
+        long estimatedBytes = (long)((videoBps + audioBps) / 8.0 * durSec);
+
+        // Split tracks into included / excluded based on the same rules the
+        // VideoCompositor uses at playback (and that the renderer mirrors).
+        var included = new List<string>();
+        var excluded = new List<string>();
+        foreach (var t in project.Tracks)
+        {
+            string label = string.IsNullOrEmpty(t.Label) ? $"({t.Kind})" : $"{t.Label} ({t.Kind})";
+            bool empty = t.Clips.Count == 0;
+            if (t.IsMuted || empty)
+                excluded.Add($"{label}{(empty ? " — empty" : " — muted")}");
+            else
+                included.Add(label);
+        }
+
+        // ── Details block (left side) ───────────────────────────────────────
+        var detailsPanel = new StackPanel { Spacing = 8, Width = 320 };
+        detailsPanel.Children.Add(MakeDetailRow("Resolution",   $"{w} × {h}"));
+        detailsPanel.Children.Add(MakeDetailRow("Aspect ratio", aspect));
+        // Track the frame-rate and estimated-size value labels so the
+        // file-size limiter below can rewrite them when toggled.
+        var fpsValueTb  = new TextBlock();
+        var sizeValueTb = new TextBlock();
+        detailsPanel.Children.Add(MakeDetailRow("Frame rate",   $"{fps:G4} fps", fpsValueTb));
+        detailsPanel.Children.Add(MakeDetailRow("Format",       "MP4 · H.264 + AAC"));
+        detailsPanel.Children.Add(MakeDetailRow("Duration",     FormatHms(project.Duration)));
+        detailsPanel.Children.Add(MakeDetailRow("Estimated size", FormatBytes(estimatedBytes), sizeValueTb));
+
+        // ── File-size limiter (optional) ────────────────────────────────────
+        // Trades bitrate (and, if necessary, frame rate) to hit a user-defined
+        // target file size while keeping the project's aspect ratio. The
+        // toggle and initial cap come from AppSettings so the user's saved
+        // defaults pre-populate every export.
+        double defaultLimitMb = _appSettings.DefaultExportLimitFileSize
+            ? _appSettings.DefaultExportMaxSizeMb
+            : Math.Max(1, Math.Ceiling(estimatedBytes / (1024.0 * 1024.0)));
+        var limitToggle = new CheckBox
+        {
+            Content = "Limit file size",
+            Margin = new Thickness(0, 8, 0, 0),
+            IsChecked = _appSettings.DefaultExportLimitFileSize,
+        };
+        var limitInput = new NumberBox
+        {
+            Header = "Max size (MB)",
+            Value = defaultLimitMb,
+            Minimum = 1,
+            Maximum = 100_000,
+            SmallChange = 1,
+            LargeChange = 10,
+            SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Inline,
+            IsEnabled = _appSettings.DefaultExportLimitFileSize,
+        };
+        var limitHint = new TextBlock
+        {
+            FontSize = 10.5,
+            TextWrapping = TextWrapping.Wrap,
+            Foreground = (Brush)Application.Current.Resources["TextFaintBrush"],
+            Visibility = Visibility.Collapsed,
+        };
+        detailsPanel.Children.Add(limitToggle);
+        detailsPanel.Children.Add(limitInput);
+        detailsPanel.Children.Add(limitHint);
+
+        ExportRenderer.ExportOptions? pendingOptions = null;
+
+        void RefreshLimit()
+        {
+            if (limitToggle.IsChecked != true)
+            {
+                pendingOptions = null;
+                fpsValueTb.Text  = $"{fps:G4} fps";
+                sizeValueTb.Text = FormatBytes(estimatedBytes);
+                limitHint.Visibility = Visibility.Collapsed;
+                return;
+            }
+            long maxBytes = (long)(Math.Max(1, limitInput.Value) * 1024.0 * 1024.0);
+            var opts = ExportRenderer.ExportOptions.ForMaxFileSize(
+                w, h, fps, project.Duration, maxBytes);
+            pendingOptions = opts;
+            double newFps      = opts.FrameRate    ?? fps;
+            int    newBitrate  = opts.VideoBitrate ?? (int)videoBps;
+            fpsValueTb.Text    = newFps < fps - 0.05
+                                 ? $"{newFps:F1} fps (reduced from {fps:G4})"
+                                 : $"{fps:G4} fps";
+            sizeValueTb.Text   = $"≤ {FormatBytes(maxBytes)}";
+            limitHint.Text     = $"Target bitrate: {newBitrate / 1_000_000.0:F1} Mbps. " +
+                                 (newFps < fps - 0.05
+                                  ? "Frame rate reduced to keep quality usable at this size."
+                                  : "Aspect ratio and resolution preserved.");
+            limitHint.Visibility = Visibility.Visible;
+        }
+
+        limitToggle.Checked   += (_, _) => { limitInput.IsEnabled = true;  RefreshLimit(); };
+        limitToggle.Unchecked += (_, _) => { limitInput.IsEnabled = false; RefreshLimit(); };
+        limitInput.ValueChanged += (_, _) => RefreshLimit();
+        RefreshLimit();
+
+        // Tracks block
+        detailsPanel.Children.Add(new TextBlock
+        {
+            Text = "INCLUDED",
+            FontSize = 9.5,
+            CharacterSpacing = 120,
+            Margin = new Thickness(0, 8, 0, 2),
+            Foreground = (Brush)Application.Current.Resources["TextMutedBrush"],
+        });
+        if (included.Count == 0)
+            detailsPanel.Children.Add(MakeFaintLine("(none — nothing will render)"));
+        else
+            foreach (var s in included) detailsPanel.Children.Add(MakeDetailLine(s));
+
+        detailsPanel.Children.Add(new TextBlock
+        {
+            Text = "EXCLUDED",
+            FontSize = 9.5,
+            CharacterSpacing = 120,
+            Margin = new Thickness(0, 8, 0, 2),
+            Foreground = (Brush)Application.Current.Resources["TextMutedBrush"],
+        });
+        if (excluded.Count == 0)
+            detailsPanel.Children.Add(MakeFaintLine("(none)"));
+        else
+            foreach (var s in excluded) detailsPanel.Children.Add(MakeFaintLine(s));
+
+        // ── 10x looping preview using the real compositor ────────────────────
+        // Size the preview to the EXPORT aspect (project.Width:Height) and let
+        // the compositor render its export-window view so the user sees exactly
+        // what comes out of the exporter — not the wider editor canvas view.
+        const double previewMaxW = 360;
+        const double previewMaxH = 360;
+        double previewAspect = project.Height <= 0
+            ? 16.0 / 9.0
+            : (double)project.Width / project.Height;
+        double previewW, previewH;
+        if (previewAspect >= 1) { previewW = previewMaxW; previewH = previewMaxW / previewAspect; }
+        else                    { previewH = previewMaxH; previewW = previewMaxH * previewAspect; }
+
+        bool hasContent = CollectExportVideoSources(project).Count > 0;
+
+        // ── Build the preview viewport: real VideoCompositorControl ──────────
+        // Hosting this in a separate Window (rather than ContentDialog) avoids
+        // Win2D's render-loop suspension that we hit inside popups.
+        var previewHeader = new TextBlock
+        {
+            Text = hasContent ? "PREVIEW · 10× SPEED · LOOPS" : "PREVIEW",
+            FontSize = 9.5,
+            CharacterSpacing = 120,
+            Foreground = (Brush)Application.Current.Resources["TextMutedBrush"],
+        };
+
+        var previewBox = new Border
+        {
+            Background = new SolidColorBrush(Microsoft.UI.Colors.Black),
+            CornerRadius = new CornerRadius(4),
+            HorizontalAlignment = HorizontalAlignment.Center,
+        };
+
+        BTAP.Controls.VideoCompositorControl? preview = null;
+        DispatcherTimer? clockTimer = null;
+        var wallClock = new System.Diagnostics.Stopwatch();
+
+        if (hasContent)
+        {
+            preview = new BTAP.Controls.VideoCompositorControl
+            {
+                SuppressAudio          = true,
+                ExternallyManaged      = true,
+                RenderExportWindowOnly = true,
+                HorizontalAlignment    = HorizontalAlignment.Stretch,
+                VerticalAlignment      = VerticalAlignment.Stretch,
+            };
+            previewBox.Width  = previewW;
+            previewBox.Height = previewH;
+            previewBox.Child  = preview;
+        }
+        else
+        {
+            previewBox.Width = 360;
+            previewBox.Height = 200;
+            previewBox.Background = (Brush)Application.Current.Resources["BgElevatedBrush"];
+            previewBox.Child = new TextBlock
+            {
+                Text = "No video clips to preview",
+                FontSize = 11,
+                Foreground = (Brush)Application.Current.Resources["TextFaintBrush"],
+                HorizontalAlignment = HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Center,
+            };
+        }
+
+        // ── Window body: details on top, preview below, buttons at the bottom ─
+        var body = new StackPanel { Spacing = 16, Padding = new Thickness(20), Width = 400 };
+        body.Children.Add(new TextBlock
+        {
+            Text = "Export preview",
+            FontSize = 18,
+            FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+        });
+        body.Children.Add(detailsPanel);
+        body.Children.Add(previewHeader);
+        body.Children.Add(previewBox);
+
+        var continueBtn = new Button
+        {
+            Content = "Continue…",
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            Style = (Style)Application.Current.Resources["PrimaryButtonStyle"],
+            IsEnabled = included.Count > 0,
+        };
+        var cancelBtn = new Button
+        {
+            Content = "Cancel",
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+        };
+        var buttonRow = new Grid
+        {
+            ColumnDefinitions =
+            {
+                new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) },
+                new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) },
+            },
+            ColumnSpacing = 8,
+        };
+        Grid.SetColumn(cancelBtn, 0);    buttonRow.Children.Add(cancelBtn);
+        Grid.SetColumn(continueBtn, 1);  buttonRow.Children.Add(continueBtn);
+        body.Children.Add(buttonRow);
+
+        var scroller = new ScrollViewer
+        {
+            Content = body,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            Background = (Brush)Application.Current.Resources["BgPageBrush"],
+        };
+
+        // ── Spin up a real Window for the preview ─────────────────────────────
+        // Stop editor playback so we're not fighting for source files, but
+        // leave the editor compositor attached — MediaPlayer supports multiple
+        // readers on the same file.
+        StopPlayback();
+
+        var window = new Window { Title = "Export preview" };
+        window.Content = scroller;
+
+        var tcs = new TaskCompletionSource<bool>();
+        Windows.Foundation.TypedEventHandler<object, Microsoft.UI.Xaml.WindowEventArgs> onClosed = null!;
+        onClosed = (_, _) =>
+        {
+            window.Closed -= onClosed;
+            if (!tcs.Task.IsCompleted) tcs.TrySetResult(false);
+        };
+        window.Closed += onClosed;
+        continueBtn.Click += (_, _) => { tcs.TrySetResult(true); window.Close(); };
+        cancelBtn.Click   += (_, _) => { tcs.TrySetResult(false); window.Close(); };
+
+        // Size the window to fit its content (rough estimate; ScrollViewer
+        // handles any overflow).
+        try
+        {
+            var hwnd = WinRT.Interop.WindowNative.GetWindowHandle(window);
+            var winId = Microsoft.UI.Win32Interop.GetWindowIdFromWindow(hwnd);
+            var appWin = Microsoft.UI.Windowing.AppWindow.GetFromWindowId(winId);
+            appWin?.Resize(new Windows.Graphics.SizeInt32 { Width = 480, Height = 760 });
+        }
+        catch { /* sizing is cosmetic */ }
+
+        window.Activate();
+
+        // Now that the window is up, attach + drive the preview compositor.
+        if (preview is not null)
+        {
+            try
+            {
+                // Loop bound = end of the last clip, not Project.Duration. The VM
+                // adds a 10-second trailing buffer to Duration so the editor's
+                // timeline keeps scrolling past the last clip; for the preview
+                // that buffer would just show black.
+                TimeSpan contentEnd = TimeSpan.Zero;
+                foreach (var t in _vm.Tracks)
+                    foreach (var c in t.Clips)
+                        if (c.Kind is ClipKind.Video or ClipKind.Audio
+                            && c.TimelineEnd > contentEnd) contentEnd = c.TimelineEnd;
+                if (contentEnd <= TimeSpan.Zero) contentEnd = _vm.Project.Duration;
+
+                preview.Attach(_vm);
+                preview.Sync(TimeSpan.Zero);
+                preview.Seek(TimeSpan.Zero);
+                preview.SetPlaybackRate(10.0);
+                preview.Play();
+                wallClock.Restart();
+                clockTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(33) };
+                clockTimer.Tick += (_, _) =>
+                {
+                    if (_vm is null) return;
+                    if (contentEnd <= TimeSpan.Zero) return;
+                    var ph = TimeSpan.FromTicks((long)(wallClock.Elapsed.Ticks * 10));
+                    if (ph >= contentEnd)
+                    {
+                        // Loop. MediaPlayers may have parked in Ended state when
+                        // their source rolled past srcEnd — calling Play() after
+                        // Seek kicks them back into Playing. SetPlaybackRate also
+                        // re-applies the rate since some implementations reset
+                        // it on transition out of Ended.
+                        wallClock.Restart();
+                        ph = TimeSpan.Zero;
+                        preview.Sync(ph);
+                        preview.Seek(ph);
+                        preview.SetPlaybackRate(10.0);
+                        preview.Play();
+                        return;
+                    }
+                    preview.Sync(ph);
+                };
+                clockTimer.Start();
+            }
+            catch { /* preview is decorative; never block the user */ }
+        }
+
+        bool continued;
+        try
+        {
+            continued = await tcs.Task;
+        }
+        finally
+        {
+            try { clockTimer?.Stop(); } catch { }
+            try { preview?.Pause(); } catch { }
+            try { preview?.Detach(); } catch { }
+            // Window may already be closed if user clicked a button; Close() is
+            // idempotent so this is safe either way.
+            try { window.Close(); } catch { }
+        }
+        return new ExportPreviewResult
+        {
+            Continue = continued,
+            Options  = continued ? pendingOptions : null,
+        };
+    }
+
+    /// <summary>Resolved file paths for every video clip that will contribute to the
+    /// export, in timeline order. Used by the preview player to scrub through the
+    /// content at 10x. Skips title tracks (text overlays only) and muted tracks.</summary>
+    private List<string> CollectExportVideoSources(BTAP.Models.Project project)
+    {
+        var paths = new List<(TimeSpan At, string Path)>();
+        foreach (var t in project.Tracks)
+        {
+            if (t.Kind != TrackKind.Video || t.IsMuted) continue;
+            foreach (var c in t.Clips)
+            {
+                if (c.Kind != ClipKind.Video) continue;
+                if (string.IsNullOrEmpty(c.SourceId)) continue;
+                var media = project.MediaBin.FirstOrDefault(m => m.Id == c.SourceId);
+                if (media is null || string.IsNullOrEmpty(media.FilePath)) continue;
+                if (!System.IO.File.Exists(media.FilePath)) continue;
+                paths.Add((c.TimelineStart, media.FilePath));
+            }
+        }
+        paths.Sort((a, b) => a.At.CompareTo(b.At));
+        var dedup = new List<string>();
+        string? last = null;
+        foreach (var p in paths)
+        {
+            if (p.Path == last) continue; // same file back-to-back — skip extra entries
+            dedup.Add(p.Path);
+            last = p.Path;
+        }
+        return dedup;
+    }
+
+    private static UIElement MakeDetailRow(string label, string value, TextBlock? valueTb = null)
+    {
+        var grid = new Grid
+        {
+            ColumnDefinitions =
+            {
+                new ColumnDefinition { Width = new GridLength(120) },
+                new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) },
+            },
+        };
+        var lbl = new TextBlock
+        {
+            Text = label,
+            FontSize = 11,
+            Foreground = (Brush)Application.Current.Resources["TextMutedBrush"],
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        var val = valueTb ?? new TextBlock();
+        val.Text              = value;
+        val.FontFamily        = new FontFamily("JetBrains Mono, Consolas");
+        val.FontSize          = 11.5;
+        val.Foreground        = (Brush)Application.Current.Resources["TextPrimaryBrush"];
+        val.VerticalAlignment = VerticalAlignment.Center;
+        Grid.SetColumn(lbl, 0);
+        Grid.SetColumn(val, 1);
+        grid.Children.Add(lbl);
+        grid.Children.Add(val);
+        return grid;
+    }
+
+    private static UIElement MakeDetailLine(string text) => new TextBlock
+    {
+        Text = "  · " + text,
+        FontSize = 11,
+        Foreground = (Brush)Application.Current.Resources["TextPrimaryBrush"],
+    };
+
+    private static UIElement MakeFaintLine(string text) => new TextBlock
+    {
+        Text = "  · " + text,
+        FontSize = 11,
+        Foreground = (Brush)Application.Current.Resources["TextFaintBrush"],
+    };
+
+    /// <summary>Reduces width:height to a printable ratio (e.g. "16:9"). Falls back
+    /// to the raw "WxH" when no clean integer ratio fits.</summary>
+    private static string AspectRatioLabel(int w, int h)
+    {
+        if (w <= 0 || h <= 0) return "—";
+        int g = Gcd(w, h);
+        int aw = w / g, ah = h / g;
+        // Anything where the simplified ratio is still 3+ digits per side reads as
+        // noise (e.g. 1920:1079) — fall back to a decimal ratio in those cases.
+        if (aw > 99 || ah > 99) return $"{(double)w / h:F2} : 1";
+        return $"{aw} : {ah}";
+    }
+
+    private static int Gcd(int a, int b) => b == 0 ? a : Gcd(b, a % b);
+
+    private static string FormatBytes(long bytes)
+    {
+        if (bytes < 1024)               return $"{bytes} B";
+        if (bytes < 1024L * 1024)       return $"{bytes / 1024.0:F1} KB";
+        if (bytes < 1024L * 1024 * 1024) return $"{bytes / (1024.0 * 1024):F1} MB";
+        return $"{bytes / (1024.0 * 1024 * 1024):F2} GB";
+    }
+
     private async void OnExport(object sender, RoutedEventArgs e)
     {
         if (_vm is null) return;
+
+        // Pre-export preview: summary of what's about to render + a 10x looping
+        // playback of the timeline content. Cancel here means we never even open
+        // the file picker.
+        var previewResult = await ShowExportPreviewAsync();
+        if (!previewResult.Continue) return;
 
         var picker = new FileSavePicker();
         var hwnd = WindowNative.GetWindowHandle(
@@ -4972,7 +6469,7 @@ public sealed partial class EditorPage : Page
 
         try
         {
-            await RunCustomExportAsync(file, logger);
+            await RunCustomExportAsync(file, logger, previewResult.Options);
         }
         finally
         {
@@ -4988,7 +6485,8 @@ public sealed partial class EditorPage : Page
         }
     }
 
-    private async Task RunCustomExportAsync(StorageFile destination, ExportLogger log)
+    private async Task RunCustomExportAsync(StorageFile destination, ExportLogger log,
+                                            ExportRenderer.ExportOptions? options = null)
     {
         if (_vm is null) return;
 
@@ -5048,7 +6546,7 @@ public sealed partial class EditorPage : Page
         ExportRenderer.Result result;
         try
         {
-            result = await ExportRenderer.RenderAsync(_vm.Project, destination, progress, log, cts.Token);
+            result = await ExportRenderer.RenderAsync(_vm.Project, destination, progress, log, cts.Token, options);
         }
         catch (Exception ex)
         {
@@ -5286,5 +6784,240 @@ public sealed partial class EditorPage : Page
             _activeToolBtn.Background = null;
         _activeToolBtn = btn;
         btn.Background = (Brush)Application.Current.Resources["BgElevatedBrush"];
+    }
+
+    // ── Auto-captions (Whisper) ──────────────────────────────────────────────
+
+    /// <summary>Stored across regenerations so reopening the dialog remembers the
+    /// last chosen words-per-caption count.</summary>
+    private int _captionWordsPerCaption = 4;
+    private WhisperTranscriptionService.ModelSize _captionModelSize =
+        WhisperTranscriptionService.ModelSize.Base;
+
+    private async void OnGenerateCaptions(object sender, RoutedEventArgs e)
+    {
+        if (_vm is null) return;
+
+        // The selected video clip drives the source audio. If nothing is selected
+        // (or it's a title/audio-only clip), fall back to the first video clip on
+        // the timeline so the menu item still does something sensible.
+        TimelineClip? sourceClip = _vm.SelectedClip;
+        if (sourceClip is null || sourceClip.Kind != ClipKind.Video)
+            sourceClip = _vm.Tracks
+                .Where(t => t.Kind == TrackKind.Video)
+                .SelectMany(t => t.Clips)
+                .FirstOrDefault();
+
+        if (sourceClip is null || string.IsNullOrEmpty(sourceClip.SourceId))
+        {
+            await ShowSimpleDialog("Generate captions",
+                "Add a video clip to the timeline first, then select it and try again.");
+            return;
+        }
+
+        var media = _vm.MediaBin.FirstOrDefault(m => m.Id == sourceClip.SourceId);
+        if (media is null || !System.IO.File.Exists(media.FilePath))
+        {
+            await ShowSimpleDialog("Generate captions",
+                "The source media file for this clip can't be found.");
+            return;
+        }
+
+        await ShowCaptionsDialog(sourceClip, media);
+    }
+
+    private async Task ShowSimpleDialog(string title, string body) =>
+        await new ContentDialog
+        {
+            Title = title,
+            Content = body,
+            CloseButtonText = "OK",
+            XamlRoot = XamlRoot,
+        }.ShowAsync();
+
+    private async Task ShowCaptionsDialog(TimelineClip sourceClip, MediaItem media)
+    {
+        var wordsSlider = new Slider
+        {
+            Minimum = 1,
+            Maximum = 10,
+            StepFrequency = 1,
+            SmallChange = 1,
+            LargeChange = 1,
+            TickFrequency = 1,
+            TickPlacement = Microsoft.UI.Xaml.Controls.Primitives.TickPlacement.Outside,
+            Value = _captionWordsPerCaption,
+            Width = 280,
+        };
+        var wordsLabel = new TextBlock
+        {
+            Text = $"{_captionWordsPerCaption} word{(_captionWordsPerCaption == 1 ? "" : "s")} per caption",
+            FontSize = 12,
+            Foreground = (Brush)Application.Current.Resources["TextMutedBrush"],
+        };
+        wordsSlider.ValueChanged += (_, ev) =>
+        {
+            int v = (int)Math.Round(ev.NewValue);
+            wordsLabel.Text = $"{v} word{(v == 1 ? "" : "s")} per caption";
+        };
+
+        var modelCombo = new ComboBox { Width = 280 };
+        modelCombo.Items.Add(new ComboBoxItem { Content = "Tiny  (~75 MB · fastest)",   Tag = WhisperTranscriptionService.ModelSize.Tiny });
+        modelCombo.Items.Add(new ComboBoxItem { Content = "Base  (~140 MB · balanced)", Tag = WhisperTranscriptionService.ModelSize.Base });
+        modelCombo.Items.Add(new ComboBoxItem { Content = "Small (~465 MB · accurate)", Tag = WhisperTranscriptionService.ModelSize.Small });
+        for (int i = 0; i < modelCombo.Items.Count; i++)
+            if (modelCombo.Items[i] is ComboBoxItem c &&
+                c.Tag is WhisperTranscriptionService.ModelSize s &&
+                s == _captionModelSize) { modelCombo.SelectedIndex = i; break; }
+        if (modelCombo.SelectedIndex < 0) modelCombo.SelectedIndex = 1;
+
+        var statusText = new TextBlock
+        {
+            Text = "Captions will replace any existing ones on the \"Captions\" track over this clip's range.",
+            FontSize = 11.5,
+            TextWrapping = TextWrapping.Wrap,
+            Foreground = (Brush)Application.Current.Resources["TextMutedBrush"],
+            MaxWidth = 320,
+        };
+        var progressBar = new ProgressBar
+        {
+            Minimum = 0,
+            Maximum = 100,
+            Value = 0,
+            Width = 320,
+            Height = 4,
+            Visibility = Visibility.Collapsed,
+        };
+
+        var content = new StackPanel { Spacing = 12, Width = 340 };
+        content.Children.Add(new TextBlock { Text = $"Source: {media.Name}", FontSize = 12, TextTrimming = TextTrimming.CharacterEllipsis });
+        content.Children.Add(new TextBlock { Text = "Words per caption", FontSize = 12.5, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold });
+        content.Children.Add(wordsSlider);
+        content.Children.Add(wordsLabel);
+        content.Children.Add(new TextBlock { Text = "Whisper model", FontSize = 12.5, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold, Margin = new Thickness(0, 6, 0, 0) });
+        content.Children.Add(modelCombo);
+        content.Children.Add(statusText);
+        content.Children.Add(progressBar);
+
+        var dialog = new ContentDialog
+        {
+            Title = "Generate captions",
+            PrimaryButtonText = "Generate",
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Primary,
+            XamlRoot = XamlRoot,
+            Content = content,
+        };
+
+        var cts = new CancellationTokenSource();
+        dialog.Closing += (_, args) => { cts.Cancel(); };
+
+        dialog.PrimaryButtonClick += async (_, args) =>
+        {
+            // Keep the dialog open while we work; we close it ourselves when done.
+            args.Cancel = true;
+            var deferral = args.GetDeferral();
+            try
+            {
+                int wordsPer = (int)Math.Round(wordsSlider.Value);
+                var modelSize = (modelCombo.SelectedItem as ComboBoxItem)?.Tag
+                                is WhisperTranscriptionService.ModelSize s ? s
+                                : WhisperTranscriptionService.ModelSize.Base;
+                _captionWordsPerCaption = wordsPer;
+                _captionModelSize = modelSize;
+
+                // Disable inputs during work
+                wordsSlider.IsEnabled = false;
+                modelCombo.IsEnabled  = false;
+                dialog.IsPrimaryButtonEnabled = false;
+                progressBar.Visibility = Visibility.Visible;
+                progressBar.IsIndeterminate = true;
+
+                statusText.Text = "Extracting audio…";
+                var audio = await Task.Run(
+                    () => AudioExtractionService.ExtractMono16kAsync(media.FilePath),
+                    cts.Token);
+                cts.Token.ThrowIfCancellationRequested();
+                if (audio is null || audio.Samples.Length == 0)
+                {
+                    statusText.Text = "Couldn't decode audio from this file.";
+                    dialog.IsPrimaryButtonEnabled = true;
+                    return;
+                }
+
+                if (!WhisperTranscriptionService.IsModelDownloaded(modelSize))
+                {
+                    statusText.Text = $"Downloading {modelSize} model (one-time, may take a few minutes)…";
+                    progressBar.IsIndeterminate = true;
+                    long lastReported = 0;
+                    var byteProgress = new Progress<long>(b =>
+                    {
+                        // We don't know total size — show MB transferred and pulse the bar.
+                        if (b - lastReported > 256 * 1024)
+                        {
+                            lastReported = b;
+                            statusText.Text = $"Downloading {modelSize} model… {(b / 1024.0 / 1024.0):F1} MB";
+                        }
+                    });
+                    await WhisperTranscriptionService.EnsureModelDownloadedAsync(modelSize, byteProgress, cts.Token);
+                    cts.Token.ThrowIfCancellationRequested();
+                }
+
+                statusText.Text = "Transcribing…";
+                progressBar.IsIndeterminate = false;
+                progressBar.Value = 0;
+                var pctProgress = new Progress<int>(pct =>
+                {
+                    progressBar.Value = pct;
+                    statusText.Text = $"Transcribing… {pct}%";
+                });
+
+                var words = await Task.Run(() => WhisperTranscriptionService.TranscribeAsync(
+                    audio.Samples, modelSize, "en", pctProgress, cts.Token), cts.Token);
+                cts.Token.ThrowIfCancellationRequested();
+
+                if (words.Count == 0)
+                {
+                    statusText.Text = "No speech detected in this clip.";
+                    dialog.IsPrimaryButtonEnabled = true;
+                    return;
+                }
+
+                // Build the title clips. Origin = source clip's timeline start, shifted
+                // by the clip's source-in offset so trimmed-in audio still aligns.
+                var origin = sourceClip.TimelineStart - sourceClip.SourceStart;
+                CaptionGeneratorService.ClearCaptionsForRange(
+                    _vm!.Project,
+                    sourceClip.TimelineStart,
+                    sourceClip.TimelineEnd);
+                CaptionGeneratorService.BuildCaptionClips(_vm.Project, words, origin, wordsPer);
+
+                _vm.Project.IsModified = true;
+                _vm.RecomputeDuration();
+                Timeline.ViewModel = _vm;
+                RefreshTitleOverlay();
+
+                dialog.Hide();
+            }
+            catch (OperationCanceledException)
+            {
+                // User hit Cancel — just close.
+                dialog.Hide();
+            }
+            catch (Exception ex)
+            {
+                statusText.Text = "Failed: " + ex.Message;
+                progressBar.Visibility = Visibility.Collapsed;
+                dialog.IsPrimaryButtonEnabled = true;
+                wordsSlider.IsEnabled = true;
+                modelCombo.IsEnabled  = true;
+            }
+            finally
+            {
+                deferral.Complete();
+            }
+        };
+
+        await dialog.ShowAsync();
     }
 }

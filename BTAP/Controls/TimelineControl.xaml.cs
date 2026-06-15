@@ -97,6 +97,19 @@ public sealed partial class TimelineControl : UserControl
     // would shift them when the clip is shortened/lengthened).
     private Dictionary<EffectKeyframe, double>? _trimKfSourceTimes;
 
+    // Multi-trim companions. When the user starts trimming a clip that's part
+    // of a multi-selection, every other selected clip is captured here so the
+    // pointer-move delta can be applied to all of them in lockstep. Null on a
+    // single-clip trim.
+    private sealed record MultiTrimItem(
+        TimelineClip                          Clip,
+        Border                                Border,
+        TimeSpan                              OrigStart,
+        TimeSpan                              OrigDuration,
+        TimeSpan                              OrigSourceStart,
+        Dictionary<EffectKeyframe, double>    KfSourceTimes);
+    private List<MultiTrimItem>? _multiTrimItems;
+
     // Keyframe-diamond drag state. Press captures the diamond; if pointer moves
     // past KfDragThresholdPx the drag mutates the kf's TimeRel; release without
     // crossing the threshold falls back to single-click selection semantics.
@@ -306,9 +319,39 @@ public sealed partial class TimelineControl : UserControl
             Height = height,
             BorderBrush = new SolidColorBrush(Color.FromArgb(80, 53, 76, 90)),
             BorderThickness = new Thickness(0, 0, 0, 1),
+            // Background must be set (even transparent) for Tapped events to fire on
+            // empty regions of the border — otherwise hits leak through to whatever's
+            // behind. The label/M/S/L buttons handle their own events, so a click on
+            // the surrounding area is what we capture for "select all clips on track".
+            Background = new SolidColorBrush(Color.FromArgb(0, 0, 0, 0)),
             Child = stack,
         };
+        border.Tapped += (_, ev) =>
+        {
+            // Ctrl+click on the track name region → select every clip on the track.
+            // Plain click is left alone so future "rename" / "expand" actions can
+            // bind to it without surprising the user.
+            if (!IsShiftOrCtrlDown()) return;
+            SelectAllClipsOnTrack(track);
+            ev.Handled = true;
+        };
         TrackHeaders.Children.Add(border);
+    }
+
+    /// <summary>Mark every clip on <paramref name="track"/> selected, make the first
+    /// the primary selection (so the inspector has a target), and notify listeners.
+    /// Used by Ctrl+click on the track header so subsequent delete / move / nudge
+    /// actions cover every clip in the track.</summary>
+    private void SelectAllClipsOnTrack(Track track)
+    {
+        if (ViewModel is null) return;
+        ClearAllClipSelection();
+        foreach (var c in track.Clips) c.IsSelected = true;
+        var primary = track.Clips.FirstOrDefault();
+        ViewModel.SelectedClip = primary;
+        if (primary is not null) ClipTapped?.Invoke(this, primary);
+        else                     SelectionCleared?.Invoke(this, EventArgs.Empty);
+        Rebuild();
     }
 
     private static Button MakeHeaderBtn(string text, bool active, Action onClick)
@@ -445,6 +488,15 @@ public sealed partial class TimelineControl : UserControl
         flyout.Items.Add(miDup);
         flyout.Items.Add(new MenuFlyoutSeparator());
         flyout.Items.Add(BuildAddKeyframeSubmenu(clip));
+        // Video clips only — pull audio out onto its own track so it can be
+        // edited / muted / panned independently of the video.
+        if (clip.Kind == ClipKind.Video)
+        {
+            var miSeparateAudio = new MenuFlyoutItem { Text = "Separate Audio" };
+            miSeparateAudio.Click += (_, _) => SeparateAudio(clip, track);
+            flyout.Items.Add(new MenuFlyoutSeparator());
+            flyout.Items.Add(miSeparateAudio);
+        }
         flyout.Items.Add(new MenuFlyoutSeparator());
         flyout.Items.Add(miDel);
         border.ContextFlyout = flyout;
@@ -740,7 +792,7 @@ public sealed partial class TimelineControl : UserControl
             _trimOriginalStart = clip.TimelineStart;
             _trimOriginalDuration = clip.Duration;
             _trimOriginalSourceStart = clip.SourceStart;
-            _multiDragItems = null;  // trim is always single-clip
+            _multiDragItems = null;
             BeginTrimVisual(b, fromLeft: true);
         }
         else if (localX >= w - EdgeHitZone)
@@ -767,6 +819,10 @@ public sealed partial class TimelineControl : UserControl
                 foreach (var kv in fx.Keyframes)
                     foreach (var kf in kv.Value)
                         _trimKfSourceTimes[kf] = clip.SourceStart.TotalSeconds + kf.TimeRel * clip.Duration.TotalSeconds;
+
+            // If the trimmed clip is part of a multi-selection, capture every other
+            // selected clip so the pointer-move delta can be applied to them too.
+            _multiTrimItems = clip.IsSelected ? CaptureMultiTrimItems(clip) : null;
         }
 
         b.CapturePointer(e.Pointer);
@@ -784,6 +840,61 @@ public sealed partial class TimelineControl : UserControl
             if (c == primary) continue;
             if (!c.IsSelected) continue;
             items.Add((c, b, c.TimelineStart));
+        }
+        return items.Count > 0 ? items : null;
+    }
+
+    /// <summary>Apply a left-trim delta to one clip (data + border position/width).</summary>
+    private void ApplyLeftTrim(TimelineClip clip, Border border,
+                               TimeSpan origStart, TimeSpan origDuration, TimeSpan origSourceStart,
+                               double delta)
+    {
+        double newStartSec = origStart.TotalSeconds       + delta;
+        double newDurSec   = origDuration.TotalSeconds    - delta;
+        double newSrcSec   = origSourceStart.TotalSeconds + delta;
+        clip.TimelineStart = TimeSpan.FromSeconds(newStartSec);
+        clip.Duration      = TimeSpan.FromSeconds(newDurSec);
+        clip.SourceStart   = TimeSpan.FromSeconds(newSrcSec);
+        Canvas.SetLeft(border, newStartSec * _pixelsPerSec);
+        border.Width = Math.Max(newDurSec * _pixelsPerSec, 4);
+    }
+
+    /// <summary>Apply a right-trim delta to one clip (data + border width).</summary>
+    private void ApplyRightTrim(TimelineClip clip, Border border, TimeSpan origDuration, double delta)
+    {
+        double newDurSec = origDuration.TotalSeconds + delta;
+        clip.Duration = TimeSpan.FromSeconds(newDurSec);
+        border.Width  = Math.Max(newDurSec * _pixelsPerSec, 4);
+    }
+
+    private static void ReanchorKeyframes(TimelineClip clip, Dictionary<EffectKeyframe, double> kfSourceTimes)
+    {
+        double newSrc = clip.SourceStart.TotalSeconds;
+        double newDur = Math.Max(0.001, clip.Duration.TotalSeconds);
+        foreach (var kv in kfSourceTimes)
+        {
+            double newRel = (kv.Value - newSrc) / newDur;
+            kv.Key.TimeRel = Math.Clamp(newRel, 0, 1);
+        }
+    }
+
+    /// <summary>Collect all other selected clips' borders and their original
+    /// (TimelineStart, Duration, SourceStart) + keyframe anchor times so they can
+    /// trim in lockstep with <paramref name="primary"/>.</summary>
+    private List<MultiTrimItem>? CaptureMultiTrimItems(TimelineClip primary)
+    {
+        var items = new List<MultiTrimItem>();
+        foreach (var child in ClipCanvas.Children)
+        {
+            if (child is not Border b || b.Tag is not (TimelineClip c, Track _)) continue;
+            if (c == primary) continue;
+            if (!c.IsSelected) continue;
+            var kf = new Dictionary<EffectKeyframe, double>(ReferenceEqualityComparer.Instance);
+            foreach (var fx in c.Effects)
+                foreach (var kv in fx.Keyframes)
+                    foreach (var k in kv.Value)
+                        kf[k] = c.SourceStart.TotalSeconds + k.TimeRel * c.Duration.TotalSeconds;
+            items.Add(new MultiTrimItem(c, b, c.TimelineStart, c.Duration, c.SourceStart, kf));
         }
         return items.Count > 0 ? items : null;
     }
@@ -834,6 +945,16 @@ public sealed partial class TimelineControl : UserControl
                     -_trimOriginalStart.TotalSeconds,        // TimelineStart ≥ 0
                     -_trimOriginalSourceStart.TotalSeconds); // SourceStart ≥ 0
                 double maxDelta = _trimOriginalDuration.TotalSeconds - 0.1; // Duration ≥ 0.1
+                // Multi-trim: tighten the bounds so every companion stays valid too.
+                if (_multiTrimItems is not null)
+                {
+                    foreach (var it in _multiTrimItems)
+                    {
+                        minDelta = Math.Max(minDelta,
+                            Math.Max(-it.OrigStart.TotalSeconds, -it.OrigSourceStart.TotalSeconds));
+                        maxDelta = Math.Min(maxDelta, it.OrigDuration.TotalSeconds - 0.1);
+                    }
+                }
                 double delta = Math.Clamp(deltaSec, minDelta, maxDelta);
 
                 if (snapActive)
@@ -845,19 +966,19 @@ public sealed partial class TimelineControl : UserControl
                         delta = snappedDelta;
                 }
 
-                double newStartSec = _trimOriginalStart.TotalSeconds       + delta;
-                double newDurSec   = _trimOriginalDuration.TotalSeconds    - delta;
-                double newSrcSec   = _trimOriginalSourceStart.TotalSeconds + delta;
-
-                _dragClip.TimelineStart = TimeSpan.FromSeconds(newStartSec);
-                _dragClip.Duration      = TimeSpan.FromSeconds(newDurSec);
-                _dragClip.SourceStart   = TimeSpan.FromSeconds(newSrcSec);
-                Canvas.SetLeft(_dragBorder, newStartSec * _pixelsPerSec);
-                _dragBorder.Width = Math.Max(newDurSec * _pixelsPerSec, 4);
+                ApplyLeftTrim(_dragClip, _dragBorder,
+                              _trimOriginalStart, _trimOriginalDuration, _trimOriginalSourceStart, delta);
+                if (_multiTrimItems is not null)
+                    foreach (var it in _multiTrimItems)
+                        ApplyLeftTrim(it.Clip, it.Border,
+                                      it.OrigStart, it.OrigDuration, it.OrigSourceStart, delta);
             }
             else
             {
                 double minDelta = 0.1 - _trimOriginalDuration.TotalSeconds; // Duration ≥ 0.1
+                if (_multiTrimItems is not null)
+                    foreach (var it in _multiTrimItems)
+                        minDelta = Math.Max(minDelta, 0.1 - it.OrigDuration.TotalSeconds);
                 double delta = Math.Max(deltaSec, minDelta);
 
                 if (snapActive)
@@ -870,9 +991,10 @@ public sealed partial class TimelineControl : UserControl
                         delta = snappedDelta;
                 }
 
-                double newDurSec = _trimOriginalDuration.TotalSeconds + delta;
-                _dragClip.Duration = TimeSpan.FromSeconds(newDurSec);
-                _dragBorder.Width = Math.Max(newDurSec * _pixelsPerSec, 4);
+                ApplyRightTrim(_dragClip, _dragBorder, _trimOriginalDuration, delta);
+                if (_multiTrimItems is not null)
+                    foreach (var it in _multiTrimItems)
+                        ApplyRightTrim(it.Clip, it.Border, it.OrigDuration, delta);
             }
             // Re-anchor every keyframe to the source-time we captured at trim-begin
             // so keyframes stay glued to the underlying content rather than reflowing
@@ -880,15 +1002,10 @@ public sealed partial class TimelineControl : UserControl
             // un-clamp if the user reverses the trim within the same gesture, because
             // _trimKfSourceTimes preserves the original anchor for the whole drag).
             if (_trimKfSourceTimes is not null)
-            {
-                double newSrc = _dragClip.SourceStart.TotalSeconds;
-                double newDur = Math.Max(0.001, _dragClip.Duration.TotalSeconds);
-                foreach (var kv in _trimKfSourceTimes)
-                {
-                    double newRel = (kv.Value - newSrc) / newDur;
-                    kv.Key.TimeRel = Math.Clamp(newRel, 0, 1);
-                }
-            }
+                ReanchorKeyframes(_dragClip, _trimKfSourceTimes);
+            if (_multiTrimItems is not null)
+                foreach (var it in _multiTrimItems)
+                    ReanchorKeyframes(it.Clip, it.KfSourceTimes);
             UpdateTrimHandlePosition(_dragBorder, _trimFromLeft);
 
             // Seek the preview to the trim edge so the user sees the actual frame they're
@@ -1090,6 +1207,7 @@ public sealed partial class TimelineControl : UserControl
         var trimOriginalSourceStart = _trimOriginalSourceStart;
         var dragFromStart        = _dragFromStart;
         var multiDragItems       = _multiDragItems;
+        var multiTrimItems       = _multiTrimItems;
         var originalTrack        = _dragOriginalTrack;
         var originalIndex        = _dragOriginalIndex;
         var hoverTrack           = _dragHoverTrack;
@@ -1117,6 +1235,21 @@ public sealed partial class TimelineControl : UserControl
                 clip,
                 trimOriginalStart, trimOriginalDuration, trimOriginalSourceStart,
                 clip.TimelineStart, clip.Duration, clip.SourceStart));
+            // Record one ClipTrimAction per multi-trim companion so each is
+            // independently undoable as part of this gesture.
+            if (multiTrimItems is not null)
+            {
+                foreach (var it in multiTrimItems)
+                {
+                    if (it.Clip.TimelineStart == it.OrigStart
+                        && it.Clip.Duration == it.OrigDuration
+                        && it.Clip.SourceStart == it.OrigSourceStart) continue;
+                    ViewModel?.History.RecordWithoutDo(new ClipTrimAction(
+                        it.Clip,
+                        it.OrigStart, it.OrigDuration, it.OrigSourceStart,
+                        it.Clip.TimelineStart, it.Clip.Duration, it.Clip.SourceStart));
+                }
+            }
             // Regenerate the clip's Border + waveform Image at the new dimensions.
             // Without this, the Image keeps its press-time Width and intrinsic pixel
             // content, so a subsequent trim that extends the clip back uncovers an
@@ -1206,6 +1339,7 @@ public sealed partial class TimelineControl : UserControl
         _dragHoverTrack    = null;
         _dragInsertNewTrackDir = 0;
         _trimKfSourceTimes = null;
+        _multiTrimItems = null;
     }
 
     private void ResetRazorState()
@@ -1260,6 +1394,30 @@ public sealed partial class TimelineControl : UserControl
     private void DuplicateClip(TimelineClip clip, Track track)
     {
         ViewModel?.History.Record(new ClipDuplicateAction(track, clip));
+        Rebuild();
+    }
+
+    /// <summary>Splits a video clip's audio onto its own audio track. Reuses an
+    /// existing audio track immediately below the video track if one is present,
+    /// otherwise creates a fresh "A{N}" track positioned right below. The video
+    /// clip's Volume is set to 0 (silenced) so the audio plays exclusively from
+    /// the new track; both halves of the operation undo together.</summary>
+    private void SeparateAudio(TimelineClip clip, Track track)
+    {
+        if (ViewModel is null) return;
+        var project = ViewModel.Project;
+        int videoIdx = project.Tracks.IndexOf(track);
+        if (videoIdx < 0) return;
+
+        // Reuse the very next track if it's already an audio track; otherwise
+        // insert a new one immediately below the video track.
+        Track? reuse = videoIdx + 1 < project.Tracks.Count
+                    && project.Tracks[videoIdx + 1].Kind == TrackKind.Audio
+                       ? project.Tracks[videoIdx + 1]
+                       : null;
+
+        ViewModel.History.Record(new SeparateAudioAction(
+            project, track, clip, reuse, videoIdx + 1));
         Rebuild();
     }
 
@@ -1542,6 +1700,10 @@ public sealed partial class TimelineControl : UserControl
         if (ViewModel is null) return;
         var pt = e.GetCurrentPoint(RulerCanvas);
 
+        // Right (and middle) clicks must not move the playhead — they belong to
+        // context menus / panning. Only left-button drags scrub the timeline.
+        if (!pt.Properties.IsLeftButtonPressed) return;
+
         // Text tool: clicking the ruler adds a title clip at that time
         if (ViewModel.ActiveTool == ActiveTool.Text)
         {
@@ -1619,6 +1781,11 @@ public sealed partial class TimelineControl : UserControl
         // Click must be on the empty canvas — clip Borders already handle their own clicks
         var ptScroller = e.GetCurrentPoint(this).Position;
         var ptCanvas   = e.GetCurrentPoint(ClipCanvas).Position;
+
+        // Right/middle buttons must not start a scrub, marquee, pan, or add-title.
+        // They're reserved for context menus and future actions; leaving them alone
+        // here also lets them fall through to the ClipCanvas's own ContextFlyout.
+        if (!e.GetCurrentPoint(ClipCanvas).Properties.IsLeftButtonPressed) return;
 
         if (ViewModel.ActiveTool == ActiveTool.Hand)
         {
@@ -2791,6 +2958,10 @@ public sealed partial class TimelineControl : UserControl
                     var canvasLocal = canvas;
                     diamond.PointerPressed += (_, e) =>
                     {
+                        // Right-click is reserved for context menus / future actions —
+                        // never start a drag or playhead-jump on it.
+                        if (!e.GetCurrentPoint(canvasLocal).Properties.IsLeftButtonPressed) return;
+
                         // Don't immediately mutate selection — wait for release so a
                         // drag past the threshold lands as "reposition" without also
                         // changing selection (and so a no-move press still selects).

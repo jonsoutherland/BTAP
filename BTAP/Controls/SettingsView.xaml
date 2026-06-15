@@ -1,0 +1,331 @@
+<UserControl
+    x:Class="BTAP.Controls.SettingsView"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:controls="using:BTAP.Controls">
+
+    <Grid RowDefinitions="Auto,*">
+
+        <!-- ── Section header ─────────────────────────────────────────── -->
+        <StackPanel Grid.Row="0" Spacing="8" Margin="0,0,0,18">
+            <TextBlock Text="Today · Application settings"
+                       FontSize="11" CharacterSpacing="140"
+                       Foreground="{StaticResource TextFaintBrush}" />
+            <TextBlock FontSize="40" FontFamily="{StaticResource SerifFont}"
+                       FontStyle="Italic" LineHeight="44"
+                       Foreground="{StaticResource TextPrimaryBrush}">
+                <Run Text="Make it yours. " /><Run Text="Tune display, shortcuts, export, layout."
+                                                  Foreground="{StaticResource TextMutedBrush}" />
+            </TextBlock>
+        </StackPanel>
+
+        <!-- ── Tabs ────────────────────────────────────────────────────── -->
+        <Grid Grid.Row="1" RowDefinitions="Auto,*">
+            <Border Grid.Row="0" BorderBrush="{StaticResource HairlineBrush}"
+                    BorderThickness="0,0,0,1" Padding="0,0,0,6">
+                <StackPanel Orientation="Horizontal" Spacing="2">
+                    <Button x:Name="TabDisplay"  Content="Display"        Tag="display"
+                            Style="{StaticResource GhostButtonStyle}" Padding="14,8" FontSize="12"
+                            FontWeight="Medium" Click="OnTabClick"
+                            Background="{StaticResource BgElevatedBrush}"
+                            Foreground="{StaticResource TextPrimaryBrush}" />
+                    <Button x:Name="TabKeybinds" Content="Keybinds"       Tag="keys"
+                            Style="{StaticResource GhostButtonStyle}" Padding="14,8" FontSize="12"
+                            FontWeight="Medium" Click="OnTabClick" />
+                    <Button x:Name="TabExport"   Content="Export"         Tag="export"
+                            Style="{StaticResource GhostButtonStyle}" Padding="14,8" FontSize="12"
+                            FontWeight="Medium" Click="OnTabClick" />
+                    <Button x:Name="TabLayout"   Content="Layout"         Tag="layout"
+                            Style="{StaticResource GhostButtonStyle}" Padding="14,8" FontSize="12"
+                            FontWeight="Medium" Click="OnTabClick" />
+                </StackPanel>
+            </Border>
+
+            <Grid Grid.Row="1" Padding="0,20,0,8">
+
+                <!-- ══ Display ══════════════════════════════════════════════ -->
+                <ScrollViewer x:Name="PanelDisplay" VerticalScrollBarVisibility="Auto">
+                    <StackPanel Spacing="22" MaxWidth="720" HorizontalAlignment="Left">
+
+                        <StackPanel Spacing="6">
+                            <TextBlock Text="THEME" Style="{StaticResource SectionLabelStyle}" />
+                            <TextBlock Text="Choose how BTAP appears. System follows your Windows preference."
+                                       FontSize="11.5" Foreground="{StaticResource TextFaintBrush}" />
+                            <ComboBox x:Name="CbTheme" Width="260" Margin="0,4,0,0"
+                                      SelectionChanged="OnThemeChanged">
+                                <ComboBoxItem Content="System default" Tag="System" />
+                                <ComboBoxItem Content="Dark"           Tag="Dark" />
+                                <ComboBoxItem Content="Light"          Tag="Light" />
+                            </ComboBox>
+                        </StackPanel>
+
+                        <StackPanel Spacing="6">
+                            <TextBlock Text="ACCENT" Style="{StaticResource SectionLabelStyle}" />
+                            <TextBlock Text="Highlight color used by primary buttons and selection."
+                                       FontSize="11.5" Foreground="{StaticResource TextFaintBrush}" />
+                            <StackPanel Orientation="Horizontal" Spacing="10" Margin="0,4,0,0">
+                                <Button x:Name="AccentSage"   Tag="Sage"   Click="OnAccentClick"
+                                        Style="{StaticResource GhostButtonStyle}" Padding="0">
+                                    <Border Width="32" Height="32" CornerRadius="16"
+                                            Background="#FF7FB069" BorderBrush="{StaticResource HairlineBrush}"
+                                            BorderThickness="1" />
+                                </Button>
+                                <Button x:Name="AccentBlue"   Tag="Blue"   Click="OnAccentClick"
+                                        Style="{StaticResource GhostButtonStyle}" Padding="0">
+                                    <Border Width="32" Height="32" CornerRadius="16"
+                                            Background="#FF5B9FE3" BorderBrush="{StaticResource HairlineBrush}"
+                                            BorderThickness="1" />
+                                </Button>
+                                <Button x:Name="AccentPurple" Tag="Purple" Click="OnAccentClick"
+                                        Style="{StaticResource GhostButtonStyle}" Padding="0">
+                                    <Border Width="32" Height="32" CornerRadius="16"
+                                            Background="#FFA67FE0" BorderBrush="{StaticResource HairlineBrush}"
+                                            BorderThickness="1" />
+                                </Button>
+                                <Button x:Name="AccentAmber"  Tag="Amber"  Click="OnAccentClick"
+                                        Style="{StaticResource GhostButtonStyle}" Padding="0">
+                                    <Border Width="32" Height="32" CornerRadius="16"
+                                            Background="#FFE0A352" BorderBrush="{StaticResource HairlineBrush}"
+                                            BorderThickness="1" />
+                                </Button>
+                                <TextBlock x:Name="TbAccentLabel" VerticalAlignment="Center"
+                                           Margin="6,0,0,0" FontSize="11.5"
+                                           Foreground="{StaticResource TextMutedBrush}" />
+                            </StackPanel>
+                        </StackPanel>
+
+                        <StackPanel Spacing="6">
+                            <TextBlock Text="DENSITY" Style="{StaticResource SectionLabelStyle}" />
+                            <TextBlock Text="Compact tightens padding for smaller screens."
+                                       FontSize="11.5" Foreground="{StaticResource TextFaintBrush}" />
+                            <ComboBox x:Name="CbDensity" Width="260" Margin="0,4,0,0"
+                                      SelectionChanged="OnDensityChanged">
+                                <ComboBoxItem Content="Comfortable" Tag="Comfortable" />
+                                <ComboBoxItem Content="Compact"     Tag="Compact" />
+                            </ComboBox>
+                        </StackPanel>
+
+                        <StackPanel Spacing="4">
+                            <TextBlock Text="OPTIONS" Style="{StaticResource SectionLabelStyle}" />
+                            <CheckBox x:Name="CbShowThumbnails" Content="Show project thumbnails on home"
+                                      Margin="0,4,0,0" Checked="OnShowThumbnailsChanged"
+                                      Unchecked="OnShowThumbnailsChanged" />
+                            <CheckBox x:Name="CbReducedMotion" Content="Reduce motion (disable transitions)"
+                                      Checked="OnReducedMotionChanged" Unchecked="OnReducedMotionChanged" />
+                        </StackPanel>
+                    </StackPanel>
+                </ScrollViewer>
+
+                <!-- ══ Keybinds ═════════════════════════════════════════════ -->
+                <Grid x:Name="PanelKeybinds" Visibility="Collapsed">
+                    <Grid RowDefinitions="Auto,*">
+                        <TextBlock Grid.Row="0"
+                                   Text="Same keyboard customizer used in the editor — changes save instantly and apply everywhere. Scroll horizontally if the keyboard exceeds the window width."
+                                   FontSize="11.5" Foreground="{StaticResource TextFaintBrush}"
+                                   Margin="0,0,0,12" TextWrapping="Wrap" />
+                        <ScrollViewer Grid.Row="1"
+                                      HorizontalScrollBarVisibility="Auto"
+                                      HorizontalScrollMode="Auto"
+                                      VerticalScrollBarVisibility="Auto"
+                                      VerticalScrollMode="Auto">
+                            <Border Background="{StaticResource BgSurfaceBrush}"
+                                    BorderBrush="{StaticResource HairlineBrush}"
+                                    BorderThickness="1"
+                                    CornerRadius="{StaticResource RadiusLg}"
+                                    Padding="2"
+                                    HorizontalAlignment="Left">
+                                <controls:KeyboardCustomizerControl x:Name="KeyboardCustomizer" />
+                            </Border>
+                        </ScrollViewer>
+                    </Grid>
+                </Grid>
+
+                <!-- ══ Export ═══════════════════════════════════════════════ -->
+                <ScrollViewer x:Name="PanelExport" Visibility="Collapsed"
+                              VerticalScrollBarVisibility="Auto">
+                    <StackPanel Spacing="22" MaxWidth="720" HorizontalAlignment="Left">
+
+                        <StackPanel Spacing="6">
+                            <TextBlock Text="FORMAT" Style="{StaticResource SectionLabelStyle}" />
+                            <TextBlock Text="Default container and codecs for Export dialog."
+                                       FontSize="11.5" Foreground="{StaticResource TextFaintBrush}" />
+                            <ComboBox x:Name="CbContainer" Width="260" Margin="0,4,0,0"
+                                      SelectionChanged="OnContainerChanged">
+                                <ComboBoxItem Content="MP4 · H.264 + AAC" Tag="Mp4H264Aac" />
+                                <ComboBoxItem Content="MP4 · H.265 + AAC" Tag="Mp4H265Aac" />
+                            </ComboBox>
+                        </StackPanel>
+
+                        <StackPanel Spacing="6">
+                            <TextBlock Text="VIDEO BITRATE" Style="{StaticResource SectionLabelStyle}" />
+                            <TextBlock Text="Average target bitrate (Kbps). Higher = better quality, larger files."
+                                       FontSize="11.5" Foreground="{StaticResource TextFaintBrush}" />
+                            <NumberBox x:Name="NbBitrate" Width="260" Margin="0,4,0,0"
+                                       Minimum="300" Maximum="200000" SmallChange="500" LargeChange="2000"
+                                       SpinButtonPlacementMode="Inline"
+                                       ValueChanged="OnBitrateChanged" />
+                        </StackPanel>
+
+                        <StackPanel Spacing="6">
+                            <TextBlock Text="FRAME RATE" Style="{StaticResource SectionLabelStyle}" />
+                            <TextBlock Text="Default output frame rate when project doesn't override."
+                                       FontSize="11.5" Foreground="{StaticResource TextFaintBrush}" />
+                            <NumberBox x:Name="NbFps" Width="260" Margin="0,4,0,0"
+                                       Minimum="15" Maximum="120" SmallChange="1" LargeChange="6"
+                                       SpinButtonPlacementMode="Inline"
+                                       ValueChanged="OnFpsChanged" />
+                        </StackPanel>
+
+                        <StackPanel Spacing="6">
+                            <TextBlock Text="FILE SIZE LIMIT" Style="{StaticResource SectionLabelStyle}" />
+                            <CheckBox x:Name="CbLimitSize" Content="Enable by default"
+                                      Margin="0,4,0,0" Checked="OnLimitSizeChanged" Unchecked="OnLimitSizeChanged" />
+                            <NumberBox x:Name="NbMaxSize" Width="260"
+                                       Header="Max size (MB)"
+                                       Minimum="1" Maximum="100000" SmallChange="10" LargeChange="100"
+                                       SpinButtonPlacementMode="Inline"
+                                       ValueChanged="OnMaxSizeChanged" />
+                        </StackPanel>
+
+                        <Button Content="Reset export defaults"
+                                Style="{StaticResource BtapButtonStyle}"
+                                Click="OnResetExportClick"
+                                HorizontalAlignment="Left" />
+                    </StackPanel>
+                </ScrollViewer>
+
+                <!-- ══ Layout ═══════════════════════════════════════════════ -->
+                <ScrollViewer x:Name="PanelLayout" Visibility="Collapsed"
+                              VerticalScrollBarVisibility="Auto"
+                              HorizontalScrollBarVisibility="Auto"
+                              HorizontalScrollMode="Auto">
+                    <StackPanel Spacing="22" MaxWidth="900" HorizontalAlignment="Left">
+
+                        <TextBlock Text="Customize the editor workspace. Drag the sliders to resize panels; the preview below mirrors the layout."
+                                   FontSize="11.5" Foreground="{StaticResource TextFaintBrush}"
+                                   TextWrapping="Wrap" />
+
+                        <!-- Layout preview -->
+                        <Border Background="{StaticResource BgSurfaceBrush}"
+                                BorderBrush="{StaticResource HairlineBrush}"
+                                BorderThickness="1"
+                                CornerRadius="{StaticResource RadiusLg}"
+                                Padding="16">
+                            <StackPanel Spacing="10">
+                                <TextBlock Text="PREVIEW" Style="{StaticResource SectionLabelStyle}" />
+                                <Border x:Name="LayoutPreviewFrame"
+                                        Background="{StaticResource BgPageBrush}"
+                                        BorderBrush="{StaticResource HairlineBrush}"
+                                        BorderThickness="1"
+                                        CornerRadius="{StaticResource RadiusMd}"
+                                        Height="240">
+                                    <Grid x:Name="LayoutPreviewGrid"
+                                          ColumnDefinitions="*,*,*"
+                                          RowDefinitions="*,Auto">
+                                        <Border x:Name="PvLibrary" Grid.Column="0" Grid.RowSpan="2"
+                                                Background="{StaticResource BgElevatedBrush}"
+                                                BorderBrush="{StaticResource HairlineBrush}"
+                                                BorderThickness="0,0,1,0">
+                                            <TextBlock Text="LIBRARY"
+                                                       FontSize="9.5" CharacterSpacing="140"
+                                                       HorizontalAlignment="Center" VerticalAlignment="Center"
+                                                       Foreground="{StaticResource TextMutedBrush}" />
+                                        </Border>
+                                        <Border x:Name="PvPreview" Grid.Column="1"
+                                                Background="{StaticResource CanvasBgBrush}">
+                                            <TextBlock Text="PREVIEW"
+                                                       FontSize="9.5" CharacterSpacing="140"
+                                                       HorizontalAlignment="Center" VerticalAlignment="Center"
+                                                       Foreground="{StaticResource AccentBrush}" />
+                                        </Border>
+                                        <Border x:Name="PvTimeline" Grid.Column="1" Grid.Row="1"
+                                                Background="{StaticResource BgInputBrush}"
+                                                BorderBrush="{StaticResource HairlineBrush}"
+                                                BorderThickness="0,1,0,0">
+                                            <TextBlock Text="TIMELINE"
+                                                       FontSize="9.5" CharacterSpacing="140"
+                                                       HorizontalAlignment="Center" VerticalAlignment="Center"
+                                                       Foreground="{StaticResource TextMutedBrush}" />
+                                        </Border>
+                                        <Border x:Name="PvInspector" Grid.Column="2" Grid.RowSpan="2"
+                                                Background="{StaticResource BgElevatedBrush}"
+                                                BorderBrush="{StaticResource HairlineBrush}"
+                                                BorderThickness="1,0,0,0">
+                                            <TextBlock Text="INSPECTOR"
+                                                       FontSize="9.5" CharacterSpacing="140"
+                                                       HorizontalAlignment="Center" VerticalAlignment="Center"
+                                                       Foreground="{StaticResource TextMutedBrush}" />
+                                        </Border>
+                                    </Grid>
+                                </Border>
+                            </StackPanel>
+                        </Border>
+
+                        <!-- Panel toggles -->
+                        <StackPanel Spacing="4">
+                            <TextBlock Text="PANELS" Style="{StaticResource SectionLabelStyle}" />
+                            <CheckBox x:Name="CbShowLibrary"   Content="Show library panel"
+                                      Checked="OnLayoutToggleChanged" Unchecked="OnLayoutToggleChanged" />
+                            <CheckBox x:Name="CbShowInspector" Content="Show inspector panel"
+                                      Checked="OnLayoutToggleChanged" Unchecked="OnLayoutToggleChanged" />
+                        </StackPanel>
+
+                        <StackPanel Spacing="6">
+                            <TextBlock Text="LIBRARY POSITION" Style="{StaticResource SectionLabelStyle}" />
+                            <ComboBox x:Name="CbLibrarySide" Width="260" Margin="0,4,0,0"
+                                      SelectionChanged="OnLibrarySideChanged">
+                                <ComboBoxItem Content="Left" Tag="Left" />
+                                <ComboBoxItem Content="Right (mirror)" Tag="Right" />
+                            </ComboBox>
+                        </StackPanel>
+
+                        <!-- Sliders -->
+                        <StackPanel Spacing="14">
+                            <StackPanel Spacing="4">
+                                <Grid ColumnDefinitions="*,Auto">
+                                    <TextBlock Grid.Column="0" Text="LIBRARY WIDTH"
+                                               Style="{StaticResource SectionLabelStyle}" />
+                                    <TextBlock Grid.Column="1" x:Name="TbLibWidth"
+                                               Style="{StaticResource MonoTextStyle}" />
+                                </Grid>
+                                <Slider x:Name="SldLibWidth" Minimum="180" Maximum="480"
+                                        StepFrequency="2"
+                                        ValueChanged="OnLayoutSliderChanged" />
+                            </StackPanel>
+
+                            <StackPanel Spacing="4">
+                                <Grid ColumnDefinitions="*,Auto">
+                                    <TextBlock Grid.Column="0" Text="INSPECTOR WIDTH"
+                                               Style="{StaticResource SectionLabelStyle}" />
+                                    <TextBlock Grid.Column="1" x:Name="TbInsWidth"
+                                               Style="{StaticResource MonoTextStyle}" />
+                                </Grid>
+                                <Slider x:Name="SldInsWidth" Minimum="200" Maximum="520"
+                                        StepFrequency="2"
+                                        ValueChanged="OnLayoutSliderChanged" />
+                            </StackPanel>
+
+                            <StackPanel Spacing="4">
+                                <Grid ColumnDefinitions="*,Auto">
+                                    <TextBlock Grid.Column="0" Text="TIMELINE HEIGHT"
+                                               Style="{StaticResource SectionLabelStyle}" />
+                                    <TextBlock Grid.Column="1" x:Name="TbTimelineH"
+                                               Style="{StaticResource MonoTextStyle}" />
+                                </Grid>
+                                <Slider x:Name="SldTimelineH" Minimum="160" Maximum="520"
+                                        StepFrequency="2"
+                                        ValueChanged="OnLayoutSliderChanged" />
+                            </StackPanel>
+                        </StackPanel>
+
+                        <Button Content="Reset layout to defaults"
+                                Style="{StaticResource BtapButtonStyle}"
+                                Click="OnResetLayoutClick"
+                                HorizontalAlignment="Left" />
+                    </StackPanel>
+                </ScrollViewer>
+
+            </Grid>
+        </Grid>
+    </Grid>
+</UserControl>

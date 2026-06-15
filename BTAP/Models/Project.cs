@@ -74,7 +74,25 @@ public partial class Project : ObservableObject
     public static Project CreateDefault() => new() { Name = "New project" };
 }
 
-public record RecentProject(string Name, string LastEdited, string Duration, string Spec, string Path = "");
+public partial class RecentProject : ObservableObject
+{
+    public string Name       { get; }
+    public string LastEdited { get; }
+    public string Duration   { get; }
+    public string Spec       { get; }
+    public string Path       { get; }
+
+    [ObservableProperty] private Microsoft.UI.Xaml.Media.Imaging.BitmapImage? _thumbnail;
+
+    public RecentProject(string name, string lastEdited, string duration, string spec, string path = "")
+    {
+        Name       = name;
+        LastEdited = lastEdited;
+        Duration   = duration;
+        Spec       = spec;
+        Path       = path;
+    }
+}
 
 public partial class Marker : ObservableObject
 {

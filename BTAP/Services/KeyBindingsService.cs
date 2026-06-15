@@ -145,6 +145,8 @@ public sealed class KeyBindingsService
         Add(EditorCommand.RippleDelete,      VirtualKey.Back,   VirtualKeyModifiers.Shift);
         Add(EditorCommand.DuplicateClip,     (VirtualKey)'D',   VirtualKeyModifiers.Control);
         Add(EditorCommand.SplitAtPlayhead,   (VirtualKey)'B',   VirtualKeyModifiers.Control);
+        Add(EditorCommand.CopyClip,          (VirtualKey)'C',   VirtualKeyModifiers.Control);
+        Add(EditorCommand.PasteFromClipboard,(VirtualKey)'V',   VirtualKeyModifiers.Control);
 
         Add(EditorCommand.AddMarker,         (VirtualKey)'M');
         Add(EditorCommand.ToggleSnap,        (VirtualKey)'S');

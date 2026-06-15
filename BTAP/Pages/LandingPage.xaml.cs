@@ -28,6 +28,17 @@ public sealed partial class LandingPage : Page
         RecentsList.Visibility      = _vm.HasRecents ? Visibility.Visible   : Visibility.Collapsed;
 
         PopulateLocations();
+        _ = LoadRecentThumbnailsAsync();
+    }
+
+    private async Task LoadRecentThumbnailsAsync()
+    {
+        foreach (var rp in _vm.Recents.ToList())
+        {
+            if (rp.Thumbnail is not null) continue;
+            var image = await ThumbnailService.GetForProjectAsync(rp.Path);
+            if (image is not null) rp.Thumbnail = image;
+        }
     }
 
     private static string GetGreeting()
@@ -95,7 +106,36 @@ public sealed partial class LandingPage : Page
     private void GoToEditor(Project project) =>
         Frame.Navigate(typeof(EditorPage), project);
 
-    private void OnNavTabClick(object sender, RoutedEventArgs e) { }
+    private void OnNavTabClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is not Button { Tag: string key }) return;
+        SetActiveNav(key);
+    }
+
+    private void SetActiveNav(string key)
+    {
+        bool settings = key == "settings";
+        RecentScroll.Visibility  = settings ? Visibility.Collapsed : Visibility.Visible;
+        SettingsScroll.Visibility = settings ? Visibility.Visible   : Visibility.Collapsed;
+
+        HighlightNav(BtnRecent,    key == "recent");
+        HighlightNav(BtnTemplates, key == "templates");
+        HighlightNav(BtnSettings,  key == "settings");
+    }
+
+    private static void HighlightNav(Button btn, bool selected)
+    {
+        if (selected)
+        {
+            btn.Background = (Brush)Application.Current.Resources["BgElevatedBrush"];
+            btn.Foreground = (Brush)Application.Current.Resources["TextPrimaryBrush"];
+        }
+        else
+        {
+            btn.ClearValue(Control.BackgroundProperty);
+            btn.ClearValue(Control.ForegroundProperty);
+        }
+    }
 
     private void OnSearchChanged(object sender, TextChangedEventArgs e) =>
         _vm.SearchText = SearchBox.Text;

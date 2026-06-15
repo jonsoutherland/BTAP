@@ -32,6 +32,54 @@ public static class ExportRenderer
         public int              AudioClips   { get; set; }
     }
 
+    /// <summary>Per-export overrides for the encoder. Either field can be null to
+    /// fall back to the project's value / default formula.</summary>
+    public sealed class ExportOptions
+    {
+        /// <summary>Explicit H.264 average bitrate in bits per second.</summary>
+        public int?    VideoBitrate { get; set; }
+
+        /// <summary>Explicit output frame rate (frames per second).</summary>
+        public double? FrameRate    { get; set; }
+
+        /// <summary>Derives a (bitrate, fps) pair that targets <paramref name="maxBytes"/>
+        /// while preserving the project's aspect ratio. Reduces frame rate (down to
+        /// 15 fps) before letting the bit budget fall below ~0.05 bits per pixel per
+        /// frame, so the result stays visually usable instead of becoming a mosaic
+        /// of macroblock noise at the source frame rate.</summary>
+        public static ExportOptions ForMaxFileSize(int width, int height, double sourceFps,
+                                                   TimeSpan duration, long maxBytes)
+        {
+            // 5 % headroom for MP4 container overhead + AAC bitrate variance.
+            double targetBytes = Math.Max(1, maxBytes * 0.95);
+            double durSec      = Math.Max(0.1, duration.TotalSeconds);
+            const double audioBps = 192_000;
+            double audioBytes  = audioBps / 8.0 * durSec;
+            double videoBudget = Math.Max(0, targetBytes - audioBytes);
+            double videoBps    = videoBudget * 8.0 / durSec;
+
+            // Don't waste bits beyond the natural quality target: if the limit is
+            // larger than what the default formula would produce, just use that.
+            double naturalBps = Math.Max(2_000_000,
+                                         width * height * Math.Max(1, sourceFps) * 0.16);
+            videoBps = Math.Min(naturalBps, videoBps);
+
+            // Trade frame rate for bits per frame once we drop below the
+            // playable-quality floor at the source frame rate.
+            const double minBpp = 0.05;
+            double pixels       = Math.Max(1, width) * Math.Max(1, height);
+            double fpsForQuality = videoBps / (pixels * minBpp);
+            double fps           = Math.Clamp(Math.Min(sourceFps, fpsForQuality),
+                                              15.0, Math.Max(15.0, sourceFps));
+
+            return new ExportOptions
+            {
+                VideoBitrate = (int)Math.Max(300_000, videoBps),
+                FrameRate    = fps,
+            };
+        }
+    }
+
     /// <summary>Computes the project's total duration as the max TimelineEnd across all clips.</summary>
     public static TimeSpan ComputeDuration(Project project)
     {
@@ -47,8 +95,11 @@ public static class ExportRenderer
         StorageFile destination,
         IProgress<double>? progress,
         ExportLogger? log,
-        CancellationToken ct)
+        CancellationToken ct,
+        ExportOptions? options = null)
     {
+        double effectiveFps = options?.FrameRate ?? project.FrameRate;
+
         // Auto-retry wrapper: at ≥60 fps the Win2D/D2D/MF race occasionally
         // collapses the output bitrate to a fraction of what was requested
         // (compositor goes black around frame 600 in some runs). We can't
@@ -63,10 +114,11 @@ public static class ExportRenderer
         // ≥ 25-40 % (5-8 Mbps). The 10 % cut separates them cleanly without
         // retrying borderline-acceptable runs.
         const double MinBitrateRatio = 0.10;
-        bool retryEligible          = project.FrameRate >= 60;
-        int  targetBitrate          = (int)Math.Max(2_000_000,
-                                            project.Width * project.Height *
-                                            Math.Max(1, project.FrameRate) * 0.16);
+        bool retryEligible          = effectiveFps >= 60;
+        int  targetBitrate          = options?.VideoBitrate
+                                      ?? (int)Math.Max(2_000_000,
+                                              project.Width * project.Height *
+                                              Math.Max(1, effectiveFps) * 0.16);
         int  minAcceptableBitrate   = (int)(targetBitrate * MinBitrateRatio);
 
         Result lastResult = null!;
@@ -87,7 +139,7 @@ public static class ExportRenderer
                 await Task.Delay(1500, ct).ConfigureAwait(false);
             }
 
-            lastResult = await RenderOnceAsync(project, destination, progress, log, ct).ConfigureAwait(false);
+            lastResult = await RenderOnceAsync(project, destination, progress, log, ct, options).ConfigureAwait(false);
 
             if (!lastResult.Success || !retryEligible)
                 return lastResult;
@@ -119,13 +171,19 @@ public static class ExportRenderer
         StorageFile destination,
         IProgress<double>? progress,
         ExportLogger? log,
-        CancellationToken ct)
+        CancellationToken ct,
+        ExportOptions? options)
     {
         var result = new Result();
+
+        double effectiveFps = options?.FrameRate ?? project.FrameRate;
 
         log?.Log("");
         log?.Log("=== CUSTOM EXPORT PIPELINE ===");
         log?.Log($"Project: {project.Name} — {project.Width}x{project.Height} @ {project.FrameRate}fps");
+        if (options is not null)
+            log?.Log($"Encoder overrides: fps={effectiveFps:F2}" +
+                     (options.VideoBitrate is int b ? $", bitrate={b}" : ""));
 
         // Initialise the diagnostic dump folder next to the log file. Each
         // pipeline stage dumps the first few frames so we can see where the
@@ -228,7 +286,7 @@ public static class ExportRenderer
             log?.Log($"Stage 1: rendering video-only intermediate to {tempVideo.Path}");
 
             await RenderCustomVideoAsync(project, duration, pool, compositor, deviceManager, d3dDevice,
-                tempVideo, p => progress?.Report(p * 0.85), log, ct).ConfigureAwait(false);
+                tempVideo, p => progress?.Report(p * 0.85), log, ct, options).ConfigureAwait(false);
 
             log?.Log("Stage 1 complete.");
 
@@ -278,8 +336,11 @@ public static class ExportRenderer
         ExportSourceReaderPool pool, ExportFrameCompositor compositor,
         Vortice.MediaFoundation.IMFDXGIDeviceManager deviceManager,
         Vortice.Direct3D11.ID3D11Device d3dDevice,
-        StorageFile output, Action<double>? progress, ExportLogger? log, CancellationToken ct)
+        StorageFile output, Action<double>? progress, ExportLogger? log, CancellationToken ct,
+        ExportOptions? options)
     {
+        double effectiveFps = options?.FrameRate ?? project.FrameRate;
+
         // Drive the SinkWriter directly: for each output frame, gather the source
         // bitmaps for every active clip (parallel per source so independent player
         // awaits don't serialize), composite, and hand the rendered frame to the
@@ -287,7 +348,7 @@ public static class ExportRenderer
         // we used to use, this drops the SampleRequested callback indirection and
         // the MediaTranscoder topology orchestration — both turned out to be a
         // measurable per-frame tax on top of the unavoidable readback.
-        var frameDuration = TimeSpan.FromSeconds(1.0 / Math.Max(1, project.FrameRate));
+        var frameDuration = TimeSpan.FromSeconds(1.0 / Math.Max(1, effectiveFps));
         long totalFrames  = Math.Max(1, (long)Math.Ceiling(duration.Ticks / (double)frameDuration.Ticks));
 
         // At >30 fps output, compose at 30 fps internally and submit each
@@ -299,15 +360,16 @@ public static class ExportRenderer
         // bitrate budget). Effectively trades 60 fps motion for reliability —
         // visually identical to 30 fps content tagged as 60 fps, which is
         // what most 30 fps source clips would have looked like anyway.
-        int composeStride = project.FrameRate > 30
-            ? Math.Max(1, (int)Math.Round(project.FrameRate / 30.0))
+        int composeStride = effectiveFps > 30
+            ? Math.Max(1, (int)Math.Round(effectiveFps / 30.0))
             : 1;
         if (composeStride > 1)
             log?.Log($"   [stage 1] compose stride: {composeStride} (compose at " +
-                     $"{project.FrameRate / composeStride:F0}fps, output at {project.FrameRate}fps)");
+                     $"{effectiveFps / composeStride:F0}fps, output at {effectiveFps}fps)");
         log?.Log($"   [stage 1] total frames to encode: {totalFrames}");
 
-        using var sink = new ExportSinkRenderer(project, output.Path, deviceManager, d3dDevice, log);
+        using var sink = new ExportSinkRenderer(project, output.Path, deviceManager, d3dDevice, log,
+            options?.VideoBitrate, options?.FrameRate);
         try
         {
             sink.Begin();

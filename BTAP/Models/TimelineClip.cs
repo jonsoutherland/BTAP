@@ -47,9 +47,13 @@ public partial class TimelineClip : ObservableObject
     [ObservableProperty] private double _saturation;
     [ObservableProperty] private double _temperature;
     [ObservableProperty] private double _tint;
-    [ObservableProperty] private double _lift;
-    [ObservableProperty] private double _gamma;
-    [ObservableProperty] private double _colorGain;
+    [ObservableProperty] private double _lift;           // -50..+50, shifts shadows
+    [ObservableProperty] private double _gamma;          // -50..+50, midtone gamma
+    [ObservableProperty] private double _colorGain;      // -50..+50, scales highlights
+    // Color overlay / tint. Stored as #AARRGGBB; the alpha channel drives the
+    // blend amount so #00000000 = no overlay. Cross-faded over the source after
+    // the lift/gamma/gain pass so the user sees the tint on top of their grade.
+    [ObservableProperty] private string _colorOverlay = "#00000000";
 
     // Title text formatting (only meaningful when Kind == Title)
     [ObservableProperty] private string _fontFamily = "Segoe UI";
@@ -59,6 +63,9 @@ public partial class TimelineClip : ObservableObject
     [ObservableProperty] private bool   _isUnderline;
     [ObservableProperty] private string _textColor = "#FFFFFFFF";
     [ObservableProperty] private string _textAlign = "Center"; // Left, Center, Right
+    // Background fill behind the rendered text. Default fully transparent so existing
+    // titles look unchanged; any non-zero alpha paints a colored box behind the text.
+    [ObservableProperty] private string _textBackground = "#00000000";
 
     // Effects applied to this clip
     public ObservableCollection<ClipEffect> Effects { get; } = [];

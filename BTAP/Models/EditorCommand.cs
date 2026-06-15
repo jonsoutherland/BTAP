@@ -32,6 +32,9 @@ public enum EditorCommand
     MoveClipUp,
     MoveClipDown,
     AddTitleAtPlayhead,
+
+    CopyClip,
+    PasteFromClipboard,
 }
 
 /// <summary>
@@ -60,6 +63,8 @@ public static class EditorCommandRegistry
         new(EditorCommand.MoveClipUp,        "Move clip up a track",   "Track↑",  "Edit"),
         new(EditorCommand.MoveClipDown,      "Move clip down a track", "Track↓",  "Edit"),
         new(EditorCommand.AddTitleAtPlayhead,"Add title at playhead",  "Title",   "Edit"),
+        new(EditorCommand.CopyClip,          "Copy clip",              "Copy",    "Edit"),
+        new(EditorCommand.PasteFromClipboard,"Paste from clipboard",   "Paste",   "Edit"),
 
         new(EditorCommand.Save,              "Save",                   "Save",    "File"),
         new(EditorCommand.NewProject,        "New project",            "New",     "File"),

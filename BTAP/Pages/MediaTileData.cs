@@ -6,6 +6,7 @@ public sealed class MediaTileData
 {
     public string Id { get; init; } = "";
     public string Name { get; init; } = "";
+    public string FilePath { get; init; } = "";
     public MediaType Type { get; init; }
     public string Duration { get; init; } = "";
     public string Resolution { get; init; } = "";
@@ -24,6 +25,7 @@ public sealed class MediaTileData
     {
         Id = item.Id,
         Name = item.Name,
+        FilePath = item.FilePath,
         Type = item.Type,
         Duration = item.Duration == TimeSpan.Zero ? "" :
             $"{(int)item.Duration.TotalMinutes:D2}:{item.Duration.Seconds:D2}",

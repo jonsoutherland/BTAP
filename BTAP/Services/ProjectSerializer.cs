@@ -215,6 +215,7 @@ public class ClipDto
     public double Lift        { get; set; }
     public double Gamma       { get; set; }
     public double ColorGain   { get; set; }
+    public string ColorOverlay { get; set; } = "#00000000";
 
     // Title text formatting
     public string FontFamily  { get; set; } = "Segoe UI";
@@ -222,8 +223,9 @@ public class ClipDto
     public bool   IsBold      { get; set; }
     public bool   IsItalic    { get; set; }
     public bool   IsUnderline { get; set; }
-    public string TextColor   { get; set; } = "#FFFFFFFF";
-    public string TextAlign   { get; set; } = "Center";
+    public string TextColor      { get; set; } = "#FFFFFFFF";
+    public string TextAlign      { get; set; } = "Center";
+    public string TextBackground { get; set; } = "#00000000";
 
     public List<ClipEffectDto> Effects { get; set; } = [];
 
@@ -242,9 +244,11 @@ public class ClipDto
         Exposure = c.Exposure, Contrast = c.Contrast, Saturation = c.Saturation,
         Temperature = c.Temperature, Tint = c.Tint,
         Lift = c.Lift, Gamma = c.Gamma, ColorGain = c.ColorGain,
+        ColorOverlay = c.ColorOverlay,
         FontFamily = c.FontFamily, FontSize = c.FontSize,
         IsBold = c.IsBold, IsItalic = c.IsItalic, IsUnderline = c.IsUnderline,
         TextColor = c.TextColor, TextAlign = c.TextAlign,
+        TextBackground = c.TextBackground,
         Effects = [.. c.Effects.Select(ClipEffectDto.From)],
     };
 
@@ -266,9 +270,11 @@ public class ClipDto
             Exposure = Exposure, Contrast = Contrast, Saturation = Saturation,
             Temperature = Temperature, Tint = Tint,
             Lift = Lift, Gamma = Gamma, ColorGain = ColorGain,
+            ColorOverlay = ColorOverlay,
             FontFamily = FontFamily, FontSize = FontSize,
             IsBold = IsBold, IsItalic = IsItalic, IsUnderline = IsUnderline,
             TextColor = TextColor, TextAlign = TextAlign,
+            TextBackground = TextBackground,
         };
         foreach (var fx in Effects) c.Effects.Add(fx.ToModel());
         return c;
