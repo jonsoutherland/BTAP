@@ -11,7 +11,7 @@
          See EditorPage.RebuildKeyboardAccelerators(). The Help → Keyboard shortcuts
          menu opens a visual customizer that lets the user rebind anything. -->
 
-    <Grid RowDefinitions="36,36,*,22">
+    <Grid x:Name="RootGrid" RowDefinitions="36,36,*,22">
 
         <!-- ══ Title bar ══════════════════════════════════════════════ -->
         <Border Grid.Row="0"
@@ -205,8 +205,17 @@
             </Grid>
         </Border>
 
-        <!-- ══ Body ════════════════════════════════════════════════════ -->
-        <Grid x:Name="BodyGrid" Grid.Row="2" ColumnDefinitions="256,*,296">
+        <!-- ══ Body ════════════════════════════════════════════════════
+             The three editor panels (Library / Center / Inspector) are now
+             docked through DockHost so users can drag them between positions
+             and persist the layout. The panels themselves are defined inline
+             below; on load, EditorPage detaches them from PanelStash and hands
+             them to EditorDock. PanelStash stays Collapsed so the panels never
+             render twice. -->
+        <Grid Grid.Row="2">
+            <controls:DockHost x:Name="EditorDock" />
+            <Border x:Name="PanelStash" Visibility="Collapsed">
+              <Grid>
 
             <!-- ── Library panel ──────────────────────────────────── -->
             <Grid x:Name="LibraryPanel" Grid.Column="0" RowDefinitions="Auto,Auto,Auto,*"
@@ -981,6 +990,8 @@
                     </Grid>
                 </Grid>
             </Grid>
+              </Grid>
+            </Border>
         </Grid>
 
         <!-- ══ Status bar ══════════════════════════════════════════════ -->

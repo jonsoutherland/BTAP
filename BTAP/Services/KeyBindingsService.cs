@@ -118,6 +118,19 @@ public sealed class KeyBindingsService
         Save();
     }
 
+    /// <summary>Replace the whole binding set in one shot. Used by preset
+    /// switching to drop the old keymap and pick up a curated one. Fires
+    /// <see cref="Changed"/> once at the end instead of per-binding so consumers
+    /// (keyboard accelerators, customizer UI) only rebuild themselves once.</summary>
+    public void LoadBindings(IEnumerable<KeyBinding> bindings)
+    {
+        _bindings.Clear();
+        foreach (var b in bindings)
+            _bindings.Add(new KeyBinding { Command = b.Command, Key = b.Key, Modifiers = b.Modifiers });
+        Save();
+        Changed?.Invoke(this, EventArgs.Empty);
+    }
+
     public IEnumerable<KeyBinding> BindingsForKey(VirtualKey key) =>
         _bindings.Where(b => b.Key == key);
 

@@ -3,8 +3,85 @@
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
     xmlns:local="using:BTAP"
+    xmlns:animation="using:Microsoft.UI.Xaml.Media.Animation"
     Title="BTAP — Better Than Adobe Premiere">
     <Grid>
-        <Frame x:Name="RootFrame" />
+        <Frame x:Name="RootFrame">
+            <!-- NavigationThemeTransition is required for SlideNavigationTransitionInfo
+                 passed to Frame.Navigate to actually animate. Without an explicit
+                 NavigationThemeTransition in ContentTransitions, the transition info
+                 argument is silently ignored. The default Slide effect (FromRight) is
+                 fine for most navigations; callers that want a different effect (e.g.
+                 the "Roll tape" curtain exit, which uses FromBottom) pass it via the
+                 NavigationTransitionInfo argument to Frame.Navigate, and it overrides
+                 the default for that one call. -->
+            <Frame.ContentTransitions>
+                <TransitionCollection>
+                    <animation:NavigationThemeTransition>
+                        <animation:NavigationThemeTransition.DefaultNavigationTransitionInfo>
+                            <animation:SlideNavigationTransitionInfo Effect="FromRight" />
+                        </animation:NavigationThemeTransition.DefaultNavigationTransitionInfo>
+                    </animation:NavigationThemeTransition>
+                </TransitionCollection>
+            </Frame.ContentTransitions>
+        </Frame>
+
+        <!-- Floating "Report bug" link, persistent across every page (sits
+             above the Frame so it overlays whatever's currently navigated).
+             Opens the GitHub issue tracker in the default browser.
+             Below the CurtainOverlay in Z-order so the onboarding outro
+             curtain still covers it cleanly during the "Roll tape" exit. -->
+        <!-- Border around the button so we can paint the outline in the
+             accent colour without fighting the GhostButtonStyle's own
+             border resolution. Background is the page bg so the button
+             reads cleanly against any underlying content. Foreground is
+             left as the standard TextPrimaryColor for legibility in both
+             themes — accent on text directly tends to be unreadable on
+             washed-out pages. -->
+        <Border HorizontalAlignment="Right"
+                VerticalAlignment="Bottom"
+                Margin="0,0,16,16"
+                CornerRadius="6"
+                Background="{ThemeResource BgPageColor}"
+                BorderBrush="{StaticResource AccentBrush}"
+                BorderThickness="1.5">
+            <Button x:Name="BtnReportBug"
+                    Click="OnReportBugClick"
+                    Background="Transparent"
+                    BorderThickness="0"
+                    Padding="10,5"
+                    FontSize="11"
+                    Foreground="{ThemeResource TextPrimaryColor}"
+                    ToolTipService.ToolTip="Open a GitHub issue">
+                <StackPanel Orientation="Horizontal" Spacing="6">
+                    <FontIcon FontFamily="Segoe MDL2 Assets" Glyph="&#xE939;" FontSize="11"
+                              Foreground="{StaticResource AccentBrush}" />
+                    <TextBlock Text="Report bug" />
+                </StackPanel>
+            </Button>
+        </Border>
+
+        <!-- Window-level curtain for the OutroStep "Roll tape" exit.
+             Lives outside the Frame so it survives the OnboardingPage →
+             LandingPage navigation: Phase 1 rises from the bottom and
+             covers everything; once it's at full coverage MainWindow
+             navigates to LandingPage with a Suppressed transition (so the
+             swap is hidden behind the curtain); Phase 2 flips the
+             RenderTransformOrigin to (0.5, 0) and scales ScaleY back to 0,
+             lifting the curtain off the top to reveal the now-loaded
+             LandingPage underneath.
+             AccentBrush colour (not BgPage) so the curtain is visually
+             distinct from the page bg in both themes — the earlier
+             BgPage-coloured version was invisible against a matching bg
+             in dark mode. ScaleTransform is XAML-declared because that's
+             the only animation primitive confirmed to render here. -->
+        <Border x:Name="CurtainOverlay"
+                Background="{StaticResource AccentBrush}"
+                IsHitTestVisible="False"
+                RenderTransformOrigin="0.5,1">
+            <Border.RenderTransform>
+                <ScaleTransform x:Name="CurtainOverlayScale" ScaleY="0" />
+            </Border.RenderTransform>
+        </Border>
     </Grid>
 </Window>

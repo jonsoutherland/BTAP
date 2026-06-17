@@ -17,5 +17,11 @@ public partial class Track : ObservableObject
     [ObservableProperty] private double _volume = 1.0;
     [ObservableProperty] private int _height = 44;
 
+    /// <summary>Per-track colour override as a hex string ("#RRGGBB" or
+    /// "#AARRGGBB"). Null means "use the default for this track's kind from
+    /// AppSettings". Drives every clip's fill colour on the track so a user
+    /// can recolour a whole strip via right-click without touching clips.</summary>
+    [ObservableProperty] private string? _colorHex;
+
     public ObservableCollection<TimelineClip> Clips { get; } = [];
 }

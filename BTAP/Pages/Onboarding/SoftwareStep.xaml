@@ -1,0 +1,34 @@
+<UserControl
+    x:Class="BTAP.Pages.Onboarding.SoftwareStep"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    HorizontalAlignment="Stretch" VerticalAlignment="Stretch"
+    Background="{ThemeResource BgPageColor}">
+
+    <Grid HorizontalAlignment="Center" VerticalAlignment="Center" MaxWidth="640">
+        <StackPanel Spacing="22">
+            <StackPanel Spacing="6" HorizontalAlignment="Center">
+                <TextBlock Text="QUESTION 1"
+                           FontFamily="{StaticResource MonoFont}"
+                           FontSize="10.5" CharacterSpacing="200"
+                           Foreground="{ThemeResource TextFaintColor}"
+                           HorizontalAlignment="Center" />
+                <TextBlock x:Name="Headline"
+                           Text="What are you coming from?"
+                           FontSize="40" FontFamily="{StaticResource SerifFont}"
+                           FontStyle="Italic" LineHeight="46"
+                           Foreground="{ThemeResource TextPrimaryColor}"
+                           HorizontalAlignment="Center"
+                           TextAlignment="Center"
+                           TextWrapping="Wrap"
+                           MaxWidth="640" />
+                <TextBlock Text="We'll lay things out the way you're used to."
+                           FontSize="12.5"
+                           Foreground="{ThemeResource TextMutedColor}"
+                           HorizontalAlignment="Center" />
+            </StackPanel>
+
+            <StackPanel x:Name="OptionsHost" Spacing="10" HorizontalAlignment="Center" />
+        </StackPanel>
+    </Grid>
+</UserControl>

@@ -148,12 +148,30 @@ public sealed partial class TimelineControl : UserControl
         {
             _isLoaded = true;
             BTAP.Services.WaveformService.PeaksReady += OnWaveformPeaksReady;
+            // Repaint when the user changes default clip colours or flips theme —
+            // both affect what GetClipColors returns.
+            BTAP.Services.AppSettingsService.Instance.Changed += OnAppSettingsChangedForColors;
+            ActualThemeChanged                                  += OnActualThemeChangedForColors;
             Rebuild();
         };
         Unloaded += (_, _) =>
         {
             BTAP.Services.WaveformService.PeaksReady -= OnWaveformPeaksReady;
+            BTAP.Services.AppSettingsService.Instance.Changed -= OnAppSettingsChangedForColors;
+            ActualThemeChanged                                  -= OnActualThemeChangedForColors;
         };
+    }
+
+    private void OnAppSettingsChangedForColors(object? sender, EventArgs e)
+    {
+        if (!_isLoaded || _dragClip is not null || _isRazoring) return;
+        DispatcherQueue?.TryEnqueue(Rebuild);
+    }
+
+    private void OnActualThemeChangedForColors(FrameworkElement sender, object args)
+    {
+        if (!_isLoaded || _dragClip is not null || _isRazoring) return;
+        DispatcherQueue?.TryEnqueue(Rebuild);
     }
 
     private void OnWaveformPeaksReady(object? sender, string filePath)
@@ -335,7 +353,80 @@ public sealed partial class TimelineControl : UserControl
             SelectAllClipsOnTrack(track);
             ev.Handled = true;
         };
+
+        // Right-click on the track header surfaces a colour picker. Lets users
+        // recolour a whole track (and therefore every clip on it) without having
+        // to touch individual clips. "Reset" drops the override so the AppSettings
+        // default for that kind takes over again.
+        var headerFlyout = new MenuFlyout();
+        var miColor = new MenuFlyoutItem { Text = "Track colour…" };
+        miColor.Click += (_, _) => OpenTrackColorPicker(border, track);
+        headerFlyout.Items.Add(miColor);
+        if (!string.IsNullOrWhiteSpace(track.ColorHex))
+        {
+            var miReset = new MenuFlyoutItem { Text = "Reset to default" };
+            miReset.Click += (_, _) => { track.ColorHex = null; Rebuild(); };
+            headerFlyout.Items.Add(miReset);
+        }
+        border.ContextFlyout = headerFlyout;
+
+        // Tint the kind-dot with the current resolved colour so the user gets a
+        // visible cue for "this is the track's colour", not just a generic
+        // kind-coded swatch.
+        var resolved = ResolveTrackBaseColor(track);
+        kindDot.Fill = new SolidColorBrush(resolved);
         TrackHeaders.Children.Add(border);
+    }
+
+    /// <summary>What colour will the timeline paint clips on this track with?
+    /// Mirrors the resolution order in <see cref="GetClipColors"/> but returns
+    /// the full-opacity base so the track header's kind-dot reads cleanly.</summary>
+    private static Color ResolveTrackBaseColor(Track track)
+    {
+        var settings = BTAP.Services.AppSettingsService.Instance;
+        if (!string.IsNullOrWhiteSpace(track.ColorHex)
+            && TryParseHex(track.ColorHex) is { } c)
+            return Color.FromArgb(255, c.R, c.G, c.B);
+        string hex = track.Kind switch
+        {
+            TrackKind.Audio => settings.DefaultAudioClipColor,
+            TrackKind.Title => settings.DefaultTitleClipColor,
+            _               => settings.DefaultVideoClipColor,
+        };
+        return TryParseHex(hex) ?? Color.FromArgb(255, 45, 110, 180);
+    }
+
+    /// <summary>Open a ColorPicker flyout anchored on <paramref name="anchor"/>.
+    /// Applies the chosen colour to <paramref name="track"/> on Apply; the
+    /// timeline rebuilds afterwards so every clip on the track recolours.</summary>
+    private void OpenTrackColorPicker(FrameworkElement anchor, Track track)
+    {
+        var picker = new ColorPicker
+        {
+            ColorSpectrumShape = ColorSpectrumShape.Box,
+            IsAlphaEnabled        = false,
+            IsAlphaSliderVisible  = false,
+            IsHexInputVisible     = true,
+        };
+        var initial = ResolveTrackBaseColor(track);
+        picker.Color = initial;
+
+        var apply = new Button
+        {
+            Content = "Apply",
+            Margin = new Thickness(0, 8, 0, 0),
+            HorizontalAlignment = HorizontalAlignment.Right,
+        };
+        var content = new StackPanel { Spacing = 6, Children = { picker, apply } };
+        var flyout = new Flyout { Content = content, Placement = Microsoft.UI.Xaml.Controls.Primitives.FlyoutPlacementMode.Right };
+        apply.Click += (_, _) =>
+        {
+            var c = picker.Color;
+            track.ColorHex = $"#FF{c.R:X2}{c.G:X2}{c.B:X2}";
+            flyout.Hide();
+            Rebuild();
+        };
+        flyout.ShowAt(anchor);
     }
 
     /// <summary>Mark every clip on <paramref name="track"/> selected, make the first
@@ -393,7 +484,7 @@ public sealed partial class TimelineControl : UserControl
         double x = clip.TimelineStart.TotalSeconds * _pixelsPerSec;
         double w = Math.Max(clip.Duration.TotalSeconds * _pixelsPerSec, 4);
 
-        var (bgColor, borderColor) = GetClipColors(clip);
+        var (bgColor, borderColor) = GetClipColors(clip, track, ActualTheme);
         bool isSelected = clip.IsSelected;
         bool isAudible  = IsTrackAudible(track);
 
@@ -1454,16 +1545,57 @@ public sealed partial class TimelineControl : UserControl
         }
     }
 
-    private static (Color Bg, Color Border) GetClipColors(TimelineClip clip)
+    /// <summary>Resolves a clip's draw colours in three layers:
+    /// (1) the clip's parent track override if set (right-click → Track colour),
+    /// (2) the user-customisable default for the clip's kind from AppSettings,
+    /// (3) a hardcoded fallback per kind.
+    /// Background alpha is theme-aware — translucent on dark, mostly opaque on
+    /// light — so the clip reads at a glance in either palette.</summary>
+    private static (Color Bg, Color Border) GetClipColors(TimelineClip clip, Track? track, ElementTheme theme)
     {
-        return clip.Kind switch
-        {
-            ClipKind.Video  => (Color.FromArgb(90, 28, 90, 140),  Color.FromArgb(160, 40, 120, 190)),
-            ClipKind.Audio  => (Color.FromArgb(90, 25, 90, 50),   Color.FromArgb(160, 35, 140, 75)),
-            ClipKind.Music  => (Color.FromArgb(90, 70, 35, 120),  Color.FromArgb(160, 100, 55, 175)),
-            ClipKind.Title  => (Color.FromArgb(90, 90, 65, 15),   Color.FromArgb(160, 140, 100, 25)),
-            _ => (Color.FromArgb(90, 50, 50, 50), Color.FromArgb(160, 80, 80, 80)),
-        };
+        var settings = BTAP.Services.AppSettingsService.Instance;
+        string hex = (track is not null && !string.IsNullOrWhiteSpace(track.ColorHex))
+            ? track.ColorHex!
+            : clip.Kind switch
+            {
+                ClipKind.Audio  => settings.DefaultAudioClipColor,
+                ClipKind.Music  => settings.DefaultMusicClipColor,
+                ClipKind.Title  => settings.DefaultTitleClipColor,
+                _               => settings.DefaultVideoClipColor,
+            };
+
+        var baseColor = TryParseHex(hex) ?? FallbackForKind(clip.Kind);
+
+        bool light = theme == ElementTheme.Light;
+        // Light bg needs much more opacity for the clip to read; dark bg looks
+        // best with a translucent wash that lets the timeline striping show.
+        byte bgA     = light ? (byte)210 : (byte)110;
+        byte borderA = light ? (byte)255 : (byte)180;
+        return (
+            Color.FromArgb(bgA,     baseColor.R, baseColor.G, baseColor.B),
+            Color.FromArgb(borderA, baseColor.R, baseColor.G, baseColor.B));
+    }
+
+    private static Color FallbackForKind(ClipKind kind) => kind switch
+    {
+        ClipKind.Audio => Color.FromArgb(255, 25, 90, 50),
+        ClipKind.Music => Color.FromArgb(255, 70, 35, 120),
+        ClipKind.Title => Color.FromArgb(255, 90, 65, 15),
+        _              => Color.FromArgb(255, 28, 90, 140),
+    };
+
+    private static Color? TryParseHex(string? hex)
+    {
+        if (string.IsNullOrWhiteSpace(hex)) return null;
+        var s = hex.Trim();
+        if (s.StartsWith("#")) s = s.Substring(1);
+        if (s.Length != 6 && s.Length != 8) return null;
+        if (!ulong.TryParse(s, System.Globalization.NumberStyles.HexNumber,
+                            System.Globalization.CultureInfo.InvariantCulture, out var v)) return null;
+        byte a, r, g, b;
+        if (s.Length == 8) { a = (byte)((v >> 24) & 0xFF); r = (byte)((v >> 16) & 0xFF); g = (byte)((v >> 8) & 0xFF); b = (byte)(v & 0xFF); }
+        else               { a = 0xFF;                       r = (byte)((v >> 16) & 0xFF); g = (byte)((v >> 8) & 0xFF); b = (byte)(v & 0xFF); }
+        return Color.FromArgb(a, r, g, b);
     }
 
     private void DrawPlayhead(double x)

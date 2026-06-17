@@ -128,7 +128,9 @@ public sealed partial class EditorPage : Page
         // Apply layout preferences from app settings + react to live edits.
         _appSettings.Changed -= OnAppSettingsChanged;
         _appSettings.Changed += OnAppSettingsChanged;
+        WireDockHost();
         ApplyLayoutFromSettings();
+        ApplyDensityFromSettings();
 
         // Re-size the TransformOverlay box once the compositor knows each
         // clip's real source dims (fires on first frame decode). Without
@@ -259,6 +261,7 @@ public sealed partial class EditorPage : Page
         // Settings page can fire many times in a row while the user drags a
         // slider — keep this cheap and idempotent.
         ApplyLayoutFromSettings();
+        ApplyDensityFromSettings();
     }
 
     private void OnLayerFrameSizeChanged(object? sender, string clipId)
@@ -270,49 +273,169 @@ public sealed partial class EditorPage : Page
         if (_inCropMode) UpdateCropOverlay();
     }
 
-    /// <summary>Push panel widths / visibility / library side from
-    /// <see cref="AppSettingsService"/> into the editor body grid. Honors
-    /// fullscreen and Cut-mode overrides — they collapse panels by setting
-    /// column width to 0; this method only applies when those overrides
-    /// aren't active.</summary>
+    /// <summary>Detach the three editor panels from their XAML stash and hand
+    /// them to <see cref="EditorDock"/> so the dock host owns their layout from
+    /// here on. Persists tree mutations back to <see cref="AppSettingsService.DockTreeJson"/>.</summary>
+    private void WireDockHost()
+    {
+        if (EditorDock is null || PanelStash is null) return;
+        // Idempotent: if the stash already gave up its children we've wired this
+        // page once before (e.g. Frame.Navigate restore).
+        if (PanelStash.Child is not Grid stash || stash.Children.Count == 0) return;
+
+        // Pull each named panel out of the stash grid. They retain their content
+        // and event handlers — only the parent changes.
+        stash.Children.Remove(LibraryPanel);
+        stash.Children.Remove(CenterPanel);
+        stash.Children.Remove(InspectorPanel);
+
+        // Reset borders that were used for the legacy 3-column body so they don't
+        // double-draw against DockHost's panel headers.
+        LibraryPanel.BorderThickness   = new Thickness(0);
+        InspectorPanel.BorderThickness = new Thickness(0);
+        CenterPanel.BorderThickness    = new Thickness(0);
+
+        // Live editor is layout-locked: no DnD, no resize. The user customises
+        // the workspace from Settings → Layout, where a live preview lets them
+        // drag and drop without the risk of nudging things while editing video.
+        EditorDock.IsLayoutEditable = false;
+
+        EditorDock.Configure(
+            new Dictionary<string, FrameworkElement>
+            {
+                ["library"]   = LibraryPanel,
+                ["center"]    = CenterPanel,
+                ["inspector"] = InspectorPanel,
+            },
+            new Dictionary<string, string>
+            {
+                ["library"]   = "LIBRARY",
+                ["center"]    = "PROGRAM",
+                ["inspector"] = "INSPECTOR",
+            },
+            ResolveDockTree());
+
+        // TreeChanged can't fire when IsLayoutEditable is false (no DnD), but
+        // wire the handler anyway for symmetry — costs nothing.
+        EditorDock.TreeChanged -= OnDockTreeChanged;
+        EditorDock.TreeChanged += OnDockTreeChanged;
+    }
+
+    /// <summary>Picks the dock tree to render: the user's persisted layout if it
+    /// deserialises cleanly, otherwise the current preset's default tree.</summary>
+    private DockNode ResolveDockTree()
+    {
+        var saved = DockTree.TryDeserialize(_appSettings.DockTreeJson);
+        if (saved is not null) return saved;
+        return _appSettings.LayoutPreset switch
+        {
+            LayoutPreset.Simple  => DockTree.SimpleTree(),
+            LayoutPreset.Complex => DockTree.ComplexTree(),
+            _                    => DockTree.DefaultTree(),
+        };
+    }
+
+    private void OnDockTreeChanged(object? sender, string json)
+    {
+        // Round-trip through AppSettings so other surfaces (e.g. the Layout
+        // preview) reflect the change too. The setter no-ops on equal strings.
+        _appSettings.DockTreeJson = json;
+    }
+
+    /// <summary>Reflect the selected density across the editor chrome — title
+    /// bar / menu bar / status bar heights, and the three tab strips (mode,
+    /// library, inspector). Compact shaves a few px off each so the editor
+    /// makes more room for actual content; Comfortable restores the
+    /// roomier defaults.</summary>
+    private void ApplyDensityFromSettings()
+    {
+        if (RootGrid is null || RootGrid.RowDefinitions.Count < 4) return;
+        bool compact = _appSettings.Density == UiDensity.Compact;
+        RootGrid.RowDefinitions[0].Height = new GridLength(compact ? 28 : 36);
+        RootGrid.RowDefinitions[1].Height = new GridLength(compact ? 28 : 36);
+        RootGrid.RowDefinitions[3].Height = new GridLength(compact ? 18 : 22);
+
+        // Mode tabs (CUT / EDIT / COLOR / AUDIO / EXPORT) — small, dense.
+        ApplyTabDensity(compact,
+            modePadding: compact ? new Thickness(10, 2, 10, 2) : new Thickness(12, 3, 12, 3),
+            modeFont:    compact ? 10 : 11,
+            BtnModeCut, BtnModeEdit, BtnModeColor, BtnModeAudio, BtnModeExp);
+
+        // Library tabs (Media / Titles / Effects / Audio).
+        ApplyTabDensity(compact,
+            modePadding: compact ? new Thickness(8, 4, 8, 4) : new Thickness(10, 6, 10, 6),
+            modeFont:    compact ? 10.5 : 11.5,
+            BtnLibMedia, BtnLibTitles, BtnLibFX, BtnLibAudio);
+
+        // Inspector tabs (Video / Audio / Effects / Color / Automations / Text).
+        ApplyTabDensity(compact,
+            modePadding: compact ? new Thickness(5, 2, 5, 2) : new Thickness(7, 3, 7, 3),
+            modeFont:    compact ? 9.5 : 10.5,
+            BtnInspText, BtnInspVideo, BtnInspAudio, BtnInspFX, BtnInspColor, BtnInspAuto);
+    }
+
+    /// <summary>Push a uniform padding + font-size onto a set of tab buttons.
+    /// Null entries are skipped so partial markup (e.g. a future build that
+    /// drops one of these tabs) doesn't throw.</summary>
+    private static void ApplyTabDensity(bool compact, Thickness modePadding, double modeFont,
+                                        params Control?[] buttons)
+    {
+        foreach (var b in buttons)
+        {
+            if (b is null) continue;
+            b.Padding  = modePadding;
+            b.FontSize = modeFont;
+        }
+    }
+
+    /// <summary>Push panel visibility / library side from <see cref="AppSettingsService"/>
+    /// into the dock host. The dock tree handles widths now; visibility is
+    /// honoured by swapping in a reduced tree when a panel is toggled off.
+    /// Fullscreen and Cut-mode overrides take precedence and apply a center-only
+    /// tree; on exit we restore the user's full tree from settings.</summary>
     private void ApplyLayoutFromSettings()
     {
-        if (BodyGrid is null) return;
+        if (EditorDock is null) return;
 
-        // Don't fight the fullscreen / cut-mode overrides — they manage
-        // visibility explicitly and would flicker if we rewrote widths here.
-        if (_isFullscreen) return;
-        if (_vm?.Mode == EditorMode.Cut) return;
-
-        double libW = _appSettings.LibraryPanelVisible   ? _appSettings.LibraryPanelWidth   : 0;
-        double insW = _appSettings.InspectorPanelVisible ? _appSettings.InspectorPanelWidth : 0;
-
-        // Re-order columns when the library is mirrored to the right.
-        if (_appSettings.LibrarySide == PanelSide.Left)
+        // Fullscreen / cut-mode: just the center.
+        if (_isFullscreen || _vm?.Mode == EditorMode.Cut)
         {
-            Grid.SetColumn(LibraryPanel,   0);
-            Grid.SetColumn(InspectorPanel, 2);
-            LibraryPanel.BorderThickness   = new Thickness(0, 0, 1, 0);
-            InspectorPanel.BorderThickness = new Thickness(1, 0, 0, 0);
-            BodyGrid.ColumnDefinitions[0].Width = new GridLength(libW);
-            BodyGrid.ColumnDefinitions[2].Width = new GridLength(insW);
-        }
-        else
-        {
-            Grid.SetColumn(LibraryPanel,   2);
-            Grid.SetColumn(InspectorPanel, 0);
-            LibraryPanel.BorderThickness   = new Thickness(1, 0, 0, 0);
-            InspectorPanel.BorderThickness = new Thickness(0, 0, 1, 0);
-            BodyGrid.ColumnDefinitions[0].Width = new GridLength(insW);
-            BodyGrid.ColumnDefinitions[2].Width = new GridLength(libW);
+            EditorDock.ApplyTree(new DockLeaf { PanelId = "center" });
+            return;
         }
 
-        LibraryPanel.Visibility   = _appSettings.LibraryPanelVisible   ? Visibility.Visible : Visibility.Collapsed;
-        InspectorPanel.Visibility = _appSettings.InspectorPanelVisible ? Visibility.Visible : Visibility.Collapsed;
+        // Step 1: make sure every visible panel is present in the tree.
+        // (A previous DnD while it was hidden may have persisted a tree that
+        // dropped it — EnsurePanel re-attaches it at a default location so the
+        // visibility toggle is reliably reversible.)
+        var root = ResolveDockTree();
+        root = DockTree.EnsurePanel(root, "center"); // center is always required
+        if (_appSettings.LibraryPanelVisible)   root = DockTree.EnsurePanel(root, "library");
+        if (_appSettings.InspectorPanelVisible) root = DockTree.EnsurePanel(root, "inspector");
 
-        // Row 3 of the center grid is the timeline track area.
-        if (CenterPanel is not null && CenterPanel.RowDefinitions.Count >= 4)
-            CenterPanel.RowDefinitions[3].Height = new GridLength(_appSettings.TimelinePanelHeight);
+        // Step 2: prune the ones the user wants hidden.
+        if (!_appSettings.LibraryPanelVisible)   root = PruneLeaf(root, "library");
+        if (!_appSettings.InspectorPanelVisible) root = PruneLeaf(root, "inspector");
+        EditorDock.ApplyTree(root);
+    }
+
+    /// <summary>Removes the leaf with <paramref name="panelId"/> from <paramref name="root"/>,
+    /// collapsing the parent split into the remaining sibling. Returns the
+    /// (possibly new) root, or a center-only leaf if pruning would empty the
+    /// tree.</summary>
+    private static DockNode PruneLeaf(DockNode root, string panelId)
+    {
+        var leaf = DockTree.FindLeaf(root, panelId);
+        if (leaf is null || leaf.Parent is null) return root;
+
+        var parent = leaf.Parent;
+        var sibling = ReferenceEquals(parent.First, leaf) ? parent.Second : parent.First;
+        sibling.Parent = parent.Parent;
+
+        if (parent.Parent is null) return sibling;
+        if (ReferenceEquals(parent.Parent.First, parent)) parent.Parent.First = sibling;
+        else                                              parent.Parent.Second = sibling;
+        return root;
     }
 
     private void RebuildKeyboardAccelerators()
@@ -3384,9 +3507,10 @@ public sealed partial class EditorPage : Page
                 break;
 
             case "cut":
-                // Cut mode: hide inspector to maximize timeline real estate
-                InspectorPanel.Visibility = Visibility.Collapsed;
-                BodyGrid.ColumnDefinitions[2].Width = new GridLength(0);
+                // Cut mode: drop everything except the center panel so the
+                // timeline gets the full width. ApplyLayoutFromSettings restores
+                // the user's layout when the mode changes back.
+                EditorDock.ApplyTree(new DockLeaf { PanelId = "center" });
                 return;
 
             case "export":
@@ -3416,9 +3540,30 @@ public sealed partial class EditorPage : Page
     {
         if (_vm is null) return;
         _vm.SnapEnabled = !_vm.SnapEnabled;
-        BtnSnap.Foreground = _vm.SnapEnabled
-            ? (Brush)Application.Current.Resources["AccentInkBrush"]
-            : (Brush)Application.Current.Resources["TextMutedBrush"];
+        ApplyToggleVisualState(BtnSnap, _vm.SnapEnabled);
+    }
+
+    /// <summary>Sticky-toggle visual: when active, paint the button with an
+    /// accent-tinted fill, a 1 px accent border, and accent-ink foreground so
+    /// the state is unmistakable. When inactive, clear the local values to fall
+    /// back on the button's default theme styling.</summary>
+    private static void ApplyToggleVisualState(Control btn, bool active)
+    {
+        var res = Application.Current.Resources;
+        if (active)
+        {
+            btn.Background      = (Brush)res["AccentSoftBrush"];
+            btn.BorderBrush     = (Brush)res["AccentBrush"];
+            btn.BorderThickness = new Thickness(1);
+            btn.Foreground      = (Brush)res["AccentInkBrush"];
+        }
+        else
+        {
+            btn.ClearValue(Control.BackgroundProperty);
+            btn.ClearValue(Control.BorderBrushProperty);
+            btn.ClearValue(Control.BorderThicknessProperty);
+            btn.ClearValue(Control.ForegroundProperty);
+        }
     }
 
     /// <summary>Select every clip whose start sits at or after the playhead, across
@@ -5840,10 +5985,7 @@ public sealed partial class EditorPage : Page
 
         if (_isFullscreen)
         {
-            LibraryPanel.Visibility   = Visibility.Collapsed;
-            InspectorPanel.Visibility = Visibility.Collapsed;
-            BodyGrid.ColumnDefinitions[0].Width = new GridLength(0);
-            BodyGrid.ColumnDefinitions[2].Width = new GridLength(0);
+            EditorDock.ApplyTree(new DockLeaf { PanelId = "center" });
         }
         else
         {
@@ -6223,6 +6365,18 @@ public sealed partial class EditorPage : Page
             Content = body,
             VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
             Background = (Brush)Application.Current.Resources["BgPageBrush"],
+            // WinUI 3 satellite Windows don't inherit RequestedTheme from
+            // the main Window — they default to ElementTheme.Default, which
+            // resolves to the OS theme (typically Dark). Setting
+            // RequestedTheme on the content root forces this preview to
+            // match the user's chosen app theme so they don't see a
+            // dark-mode flash when they're running BTAP in light mode.
+            RequestedTheme = _appSettings.Theme switch
+            {
+                AppTheme.Light => ElementTheme.Light,
+                AppTheme.Dark  => ElementTheme.Dark,
+                _              => ElementTheme.Default,
+            },
         };
 
         // ── Spin up a real Window for the preview ─────────────────────────────

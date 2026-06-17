@@ -1,0 +1,78 @@
+<UserControl
+    x:Class="BTAP.Pages.Onboarding.ColorStep"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    HorizontalAlignment="Stretch" VerticalAlignment="Stretch"
+    Background="{ThemeResource BgPageColor}">
+
+    <Grid x:Name="StepRoot" HorizontalAlignment="Stretch" VerticalAlignment="Stretch">
+        <Grid HorizontalAlignment="Center" VerticalAlignment="Center" MaxWidth="640">
+            <StackPanel Spacing="28">
+                <StackPanel Spacing="6" HorizontalAlignment="Center">
+                    <TextBlock Text="QUESTION 2"
+                               FontFamily="{StaticResource MonoFont}"
+                               FontSize="10.5" CharacterSpacing="200"
+                               Foreground="{ThemeResource TextFaintColor}"
+                               HorizontalAlignment="Center" />
+                    <!-- "favorite" picks up the live AccentBrush so the
+                         word retints whenever the user changes accent (in
+                         this step or later in Settings). AccentBrush is a
+                         SolidColorBrush whose Color is mutated in-place by
+                         AccentManager.Apply, so the Run repaints on
+                         change without us re-binding. -->
+                    <TextBlock FontSize="40" FontFamily="{StaticResource SerifFont}"
+                               FontStyle="Italic" LineHeight="46"
+                               Foreground="{ThemeResource TextPrimaryColor}"
+                               HorizontalAlignment="Center"
+                               TextAlignment="Center"
+                               TextWrapping="Wrap"
+                               MaxWidth="640">
+                        <Run Text="What's your " />
+                        <Run x:Name="FavoriteRun" Text="favorite"
+                             Foreground="{StaticResource AccentBrush}" />
+                        <Run Text=" color?" />
+                    </TextBlock>
+                    <TextBlock Text="This becomes your accent. Taste matters."
+                               FontSize="12.5"
+                               Foreground="{ThemeResource TextMutedColor}"
+                               HorizontalAlignment="Center" />
+                </StackPanel>
+
+                <StackPanel x:Name="SwatchRow" Orientation="Horizontal" Spacing="14"
+                            HorizontalAlignment="Center" />
+
+                <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Center">
+                    <Button x:Name="BtnWeirder" Content="Pick something weirder…"
+                            Style="{StaticResource GhostButtonStyle}"
+                            Padding="14,6" FontSize="11"
+                            Click="OnPickWeirderClick" />
+                    <Button x:Name="BtnNext"
+                            Content="That'll do"
+                            Style="{StaticResource PrimaryButtonStyle}"
+                            Padding="18,8" FontSize="12"
+                            Click="OnNextClick" />
+                </StackPanel>
+            </StackPanel>
+        </Grid>
+
+        <!-- Splash overlay: a single shared Ellipse positioned at the tapped
+             swatch's centre (via Canvas.Left/Top), then scaled up via a
+             XAML-declared ScaleTransform. Canvas is full-step (stretches to
+             StepRoot bounds) so absolute positioning of the splash can land
+             on any swatch regardless of where SwatchRow ends up in layout.
+             IsHitTestVisible=False so the splash never blocks subsequent
+             clicks on swatches. -->
+        <Canvas x:Name="SplashOverlay" IsHitTestVisible="False">
+            <Ellipse x:Name="Splash"
+                     Width="40" Height="40"
+                     Fill="Transparent"
+                     IsHitTestVisible="False"
+                     Opacity="0"
+                     RenderTransformOrigin="0.5,0.5">
+                <Ellipse.RenderTransform>
+                    <ScaleTransform x:Name="SplashScale" ScaleX="0" ScaleY="0" />
+                </Ellipse.RenderTransform>
+            </Ellipse>
+        </Canvas>
+    </Grid>
+</UserControl>

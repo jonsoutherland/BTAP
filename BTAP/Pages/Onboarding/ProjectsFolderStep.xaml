@@ -1,0 +1,55 @@
+<UserControl
+    x:Class="BTAP.Pages.Onboarding.ProjectsFolderStep"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    HorizontalAlignment="Stretch" VerticalAlignment="Stretch"
+    Background="{ThemeResource BgPageColor}">
+
+    <Grid HorizontalAlignment="Center" VerticalAlignment="Center" MaxWidth="720">
+        <StackPanel Spacing="22">
+            <StackPanel Spacing="6" HorizontalAlignment="Center">
+                <TextBlock Text="QUESTION 4"
+                           FontFamily="{StaticResource MonoFont}"
+                           FontSize="10.5" CharacterSpacing="200"
+                           Foreground="{ThemeResource TextFaintColor}"
+                           HorizontalAlignment="Center" />
+                <TextBlock Text="Where should we DEFINITELY NOT look for your files?"
+                           FontSize="36" FontFamily="{StaticResource SerifFont}"
+                           FontStyle="Italic" LineHeight="42"
+                           Foreground="{ThemeResource TextPrimaryColor}"
+                           HorizontalAlignment="Center"
+                           TextAlignment="Center"
+                           TextWrapping="Wrap" />
+                <TextBlock Text="That's where projects will live. (We promise to look.)"
+                           FontSize="12.5"
+                           Foreground="{ThemeResource TextMutedColor}"
+                           HorizontalAlignment="Center" />
+            </StackPanel>
+
+            <!-- Fake path display — typewriter animation fills this in. -->
+            <Border BorderBrush="{ThemeResource HairlineColor}"
+                    BorderThickness="0,1,0,1"
+                    Padding="0,12,0,12"
+                    HorizontalAlignment="Stretch">
+                <TextBlock x:Name="PathDisplay"
+                           Text=""
+                           FontFamily="{StaticResource MonoFont}"
+                           FontSize="13"
+                           Foreground="{ThemeResource TextDimColor}"
+                           HorizontalAlignment="Center"
+                           TextTrimming="CharacterEllipsis" />
+            </Border>
+
+            <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Center">
+                <Button x:Name="BtnPick" Content="Pick the spot"
+                        Style="{StaticResource PrimaryButtonStyle}"
+                        Padding="18,8" FontSize="12"
+                        Click="OnPickClick" />
+                <Button x:Name="BtnSkip" Content="Ask me each time"
+                        Style="{StaticResource GhostButtonStyle}"
+                        Padding="14,6" FontSize="11"
+                        Click="OnSkipClick" />
+            </StackPanel>
+        </StackPanel>
+    </Grid>
+</UserControl>

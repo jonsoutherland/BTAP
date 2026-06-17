@@ -1,0 +1,54 @@
+<UserControl
+    x:Class="BTAP.Pages.Onboarding.ExportsFolderStep"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    HorizontalAlignment="Stretch" VerticalAlignment="Stretch"
+    Background="{ThemeResource BgPageColor}">
+
+    <Grid HorizontalAlignment="Center" VerticalAlignment="Center" MaxWidth="720">
+        <StackPanel Spacing="22">
+            <StackPanel Spacing="6" HorizontalAlignment="Center">
+                <TextBlock Text="QUESTION 5"
+                           FontFamily="{StaticResource MonoFont}"
+                           FontSize="10.5" CharacterSpacing="200"
+                           Foreground="{ThemeResource TextFaintColor}"
+                           HorizontalAlignment="Center" />
+                <TextBlock Text="Where are we writing out your masterpieces?"
+                           FontSize="36" FontFamily="{StaticResource SerifFont}"
+                           FontStyle="Italic" LineHeight="42"
+                           Foreground="{ThemeResource TextPrimaryColor}"
+                           HorizontalAlignment="Center"
+                           TextAlignment="Center"
+                           TextWrapping="Wrap" />
+                <TextBlock Text="Default destination for rendered exports."
+                           FontSize="12.5"
+                           Foreground="{ThemeResource TextMutedColor}"
+                           HorizontalAlignment="Center" />
+            </StackPanel>
+
+            <Border BorderBrush="{ThemeResource HairlineColor}"
+                    BorderThickness="0,1,0,1"
+                    Padding="0,12,0,12">
+                <TextBlock x:Name="PathDisplay"
+                           Text=""
+                           FontFamily="{StaticResource MonoFont}"
+                           FontSize="13"
+                           Foreground="{ThemeResource TextDimColor}"
+                           HorizontalAlignment="Center"
+                           VerticalAlignment="Center"
+                           TextTrimming="CharacterEllipsis" />
+            </Border>
+
+            <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Center">
+                <Button x:Name="BtnPick" Content="Pick the destination"
+                        Style="{StaticResource PrimaryButtonStyle}"
+                        Padding="18,8" FontSize="12"
+                        Click="OnPickClick" />
+                <Button x:Name="BtnSkip" Content="Ask me each time"
+                        Style="{StaticResource GhostButtonStyle}"
+                        Padding="14,6" FontSize="11"
+                        Click="OnSkipClick" />
+            </StackPanel>
+        </StackPanel>
+    </Grid>
+</UserControl>

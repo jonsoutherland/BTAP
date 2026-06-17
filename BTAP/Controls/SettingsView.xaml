@@ -88,10 +88,101 @@
                                             Background="#FFE0A352" BorderBrush="{StaticResource HairlineBrush}"
                                             BorderThickness="1" />
                                 </Button>
+                                <Button x:Name="AccentRose"   Tag="Rose"   Click="OnAccentClick"
+                                        Style="{StaticResource GhostButtonStyle}" Padding="0">
+                                    <Border Width="32" Height="32" CornerRadius="16"
+                                            Background="#FFD27FA8" BorderBrush="{StaticResource HairlineBrush}"
+                                            BorderThickness="1" />
+                                </Button>
+                                <Button x:Name="AccentTeal"   Tag="Teal"   Click="OnAccentClick"
+                                        Style="{StaticResource GhostButtonStyle}" Padding="0">
+                                    <Border Width="32" Height="32" CornerRadius="16"
+                                            Background="#FF5BB8B0" BorderBrush="{StaticResource HairlineBrush}"
+                                            BorderThickness="1" />
+                                </Button>
+                                <Button x:Name="AccentCoral"  Tag="Coral"  Click="OnAccentClick"
+                                        Style="{StaticResource GhostButtonStyle}" Padding="0">
+                                    <Border Width="32" Height="32" CornerRadius="16"
+                                            Background="#FFE08070" BorderBrush="{StaticResource HairlineBrush}"
+                                            BorderThickness="1" />
+                                </Button>
+                                <Button x:Name="AccentSlate"  Tag="Slate"  Click="OnAccentClick"
+                                        Style="{StaticResource GhostButtonStyle}" Padding="0">
+                                    <Border Width="32" Height="32" CornerRadius="16"
+                                            Background="#FF8090A8" BorderBrush="{StaticResource HairlineBrush}"
+                                            BorderThickness="1" />
+                                </Button>
                                 <TextBlock x:Name="TbAccentLabel" VerticalAlignment="Center"
                                            Margin="6,0,0,0" FontSize="11.5"
                                            Foreground="{StaticResource TextMutedBrush}" />
                             </StackPanel>
+
+                            <StackPanel Orientation="Horizontal" Spacing="10" Margin="0,6,0,0"
+                                        VerticalAlignment="Center">
+                                <CheckBox x:Name="CbUseCustomAccent"
+                                          Content="Custom color"
+                                          Checked="OnUseCustomAccentChanged"
+                                          Unchecked="OnUseCustomAccentChanged" />
+                                <Border x:Name="CustomAccentSwatch" Width="32" Height="32"
+                                        CornerRadius="16"
+                                        BorderBrush="{StaticResource HairlineBrush}"
+                                        BorderThickness="1" />
+                                <TextBox x:Name="TbCustomAccentHex"
+                                         Width="120"
+                                         FontFamily="{StaticResource MonoFont}" FontSize="11"
+                                         PlaceholderText="#7FB069"
+                                         LostFocus="OnCustomAccentHexChanged"
+                                         KeyDown="OnCustomAccentHexKeyDown" />
+                                <Button Content="Pick…" Style="{StaticResource GhostButtonStyle}"
+                                        Padding="10,4" FontSize="11.5"
+                                        Click="OnPickCustomAccent" />
+                            </StackPanel>
+                        </StackPanel>
+
+                        <StackPanel Spacing="6">
+                            <TextBlock Text="DEFAULT TRACK COLORS" Style="{StaticResource SectionLabelStyle}" />
+                            <TextBlock Text="Default fill used for clips on each kind of track. Right-click any track in the editor to override per track."
+                                       FontSize="11.5" Foreground="{StaticResource TextFaintBrush}" TextWrapping="Wrap" />
+                            <Grid ColumnDefinitions="Auto,Auto,Auto,Auto"
+                                  ColumnSpacing="14" RowSpacing="8" Margin="0,6,0,0">
+                                <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="8">
+                                    <Border x:Name="SwatchVideoClip" Width="22" Height="22"
+                                            CornerRadius="11"
+                                            BorderBrush="{StaticResource HairlineBrush}" BorderThickness="1" />
+                                    <Button Content="Video" Style="{StaticResource GhostButtonStyle}"
+                                            Padding="8,4" FontSize="11" Tag="Video"
+                                            Click="OnPickDefaultClipColor" />
+                                </StackPanel>
+                                <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8">
+                                    <Border x:Name="SwatchAudioClip" Width="22" Height="22"
+                                            CornerRadius="11"
+                                            BorderBrush="{StaticResource HairlineBrush}" BorderThickness="1" />
+                                    <Button Content="Audio" Style="{StaticResource GhostButtonStyle}"
+                                            Padding="8,4" FontSize="11" Tag="Audio"
+                                            Click="OnPickDefaultClipColor" />
+                                </StackPanel>
+                                <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="8">
+                                    <Border x:Name="SwatchMusicClip" Width="22" Height="22"
+                                            CornerRadius="11"
+                                            BorderBrush="{StaticResource HairlineBrush}" BorderThickness="1" />
+                                    <Button Content="Music" Style="{StaticResource GhostButtonStyle}"
+                                            Padding="8,4" FontSize="11" Tag="Music"
+                                            Click="OnPickDefaultClipColor" />
+                                </StackPanel>
+                                <StackPanel Grid.Column="3" Orientation="Horizontal" Spacing="8">
+                                    <Border x:Name="SwatchTitleClip" Width="22" Height="22"
+                                            CornerRadius="11"
+                                            BorderBrush="{StaticResource HairlineBrush}" BorderThickness="1" />
+                                    <Button Content="Title" Style="{StaticResource GhostButtonStyle}"
+                                            Padding="8,4" FontSize="11" Tag="Title"
+                                            Click="OnPickDefaultClipColor" />
+                                </StackPanel>
+                            </Grid>
+                            <Button Content="Reset clip colors"
+                                    Style="{StaticResource GhostButtonStyle}"
+                                    Padding="10,4" FontSize="11"
+                                    HorizontalAlignment="Left" Margin="0,4,0,0"
+                                    Click="OnResetDefaultClipColors" />
                         </StackPanel>
 
                         <StackPanel Spacing="6">
@@ -113,17 +204,44 @@
                             <CheckBox x:Name="CbReducedMotion" Content="Reduce motion (disable transitions)"
                                       Checked="OnReducedMotionChanged" Unchecked="OnReducedMotionChanged" />
                         </StackPanel>
+
+                        <StackPanel Spacing="6">
+                            <TextBlock Text="ONBOARDING" Style="{StaticResource SectionLabelStyle}" />
+                            <TextBlock Text="Replay the first-run intro to repick your layout, color, theme, and default folders."
+                                       FontSize="11.5" Foreground="{StaticResource TextFaintBrush}" TextWrapping="Wrap" />
+                            <Button Content="Replay onboarding"
+                                    Style="{StaticResource GhostButtonStyle}"
+                                    Padding="14,6" FontSize="11"
+                                    HorizontalAlignment="Left" Margin="0,4,0,0"
+                                    Click="OnReplayOnboardingClick" />
+                        </StackPanel>
                     </StackPanel>
                 </ScrollViewer>
 
                 <!-- ══ Keybinds ═════════════════════════════════════════════ -->
                 <Grid x:Name="PanelKeybinds" Visibility="Collapsed">
-                    <Grid RowDefinitions="Auto,*">
+                    <Grid RowDefinitions="Auto,Auto,*">
                         <TextBlock Grid.Row="0"
                                    Text="Same keyboard customizer used in the editor — changes save instantly and apply everywhere. Scroll horizontally if the keyboard exceeds the window width."
                                    FontSize="11.5" Foreground="{StaticResource TextFaintBrush}"
                                    Margin="0,0,0,12" TextWrapping="Wrap" />
-                        <ScrollViewer Grid.Row="1"
+
+                        <StackPanel Grid.Row="1" Orientation="Horizontal" Spacing="10"
+                                    Margin="0,0,0,12" VerticalAlignment="Center">
+                            <TextBlock Text="PRESET" Style="{StaticResource SectionLabelStyle}"
+                                       VerticalAlignment="Center" />
+                            <ComboBox x:Name="CbKeybindPreset" Width="200"
+                                      SelectionChanged="OnKeybindPresetChanged">
+                                <ComboBoxItem Content="Minimal"        Tag="Minimal" />
+                                <ComboBoxItem Content="Default (BTAP)" Tag="Default" />
+                                <ComboBoxItem Content="Premiere-like"  Tag="PremiereLike" />
+                            </ComboBox>
+                            <TextBlock Text="Switching presets replaces every binding below. Your manual edits survive until the next preset switch."
+                                       FontSize="11" TextWrapping="Wrap" MaxWidth="380"
+                                       Foreground="{StaticResource TextFaintBrush}"
+                                       VerticalAlignment="Center" />
+                        </StackPanel>
+                        <ScrollViewer Grid.Row="2"
                                       HorizontalScrollBarVisibility="Auto"
                                       HorizontalScrollMode="Auto"
                                       VerticalScrollBarVisibility="Auto"
@@ -195,137 +313,125 @@
                 </ScrollViewer>
 
                 <!-- ══ Layout ═══════════════════════════════════════════════ -->
-                <ScrollViewer x:Name="PanelLayout" Visibility="Collapsed"
-                              VerticalScrollBarVisibility="Auto"
-                              HorizontalScrollBarVisibility="Auto"
-                              HorizontalScrollMode="Auto">
-                    <StackPanel Spacing="22" MaxWidth="900" HorizontalAlignment="Left">
+                <Grid x:Name="PanelLayout" Visibility="Collapsed" RowDefinitions="Auto,Auto,*,Auto"
+                      RowSpacing="14">
 
-                        <TextBlock Text="Customize the editor workspace. Drag the sliders to resize panels; the preview below mirrors the layout."
-                                   FontSize="11.5" Foreground="{StaticResource TextFaintBrush}"
-                                   TextWrapping="Wrap" />
+                    <TextBlock Grid.Row="0"
+                               Text="The preview below behaves exactly like the live editor. Drag panel headers to rearrange, drag splitters to resize. Use Edit at full size for a roomier canvas."
+                               FontSize="11.5" Foreground="{StaticResource TextFaintBrush}"
+                               TextWrapping="Wrap" />
 
-                        <!-- Layout preview -->
-                        <Border Background="{StaticResource BgSurfaceBrush}"
-                                BorderBrush="{StaticResource HairlineBrush}"
-                                BorderThickness="1"
-                                CornerRadius="{StaticResource RadiusLg}"
-                                Padding="16">
-                            <StackPanel Spacing="10">
-                                <TextBlock Text="PREVIEW" Style="{StaticResource SectionLabelStyle}" />
-                                <Border x:Name="LayoutPreviewFrame"
-                                        Background="{StaticResource BgPageBrush}"
-                                        BorderBrush="{StaticResource HairlineBrush}"
-                                        BorderThickness="1"
-                                        CornerRadius="{StaticResource RadiusMd}"
-                                        Height="240">
-                                    <Grid x:Name="LayoutPreviewGrid"
-                                          ColumnDefinitions="*,*,*"
-                                          RowDefinitions="*,Auto">
-                                        <Border x:Name="PvLibrary" Grid.Column="0" Grid.RowSpan="2"
-                                                Background="{StaticResource BgElevatedBrush}"
-                                                BorderBrush="{StaticResource HairlineBrush}"
-                                                BorderThickness="0,0,1,0">
-                                            <TextBlock Text="LIBRARY"
-                                                       FontSize="9.5" CharacterSpacing="140"
-                                                       HorizontalAlignment="Center" VerticalAlignment="Center"
-                                                       Foreground="{StaticResource TextMutedBrush}" />
-                                        </Border>
-                                        <Border x:Name="PvPreview" Grid.Column="1"
-                                                Background="{StaticResource CanvasBgBrush}">
-                                            <TextBlock Text="PREVIEW"
-                                                       FontSize="9.5" CharacterSpacing="140"
-                                                       HorizontalAlignment="Center" VerticalAlignment="Center"
-                                                       Foreground="{StaticResource AccentBrush}" />
-                                        </Border>
-                                        <Border x:Name="PvTimeline" Grid.Column="1" Grid.Row="1"
-                                                Background="{StaticResource BgInputBrush}"
-                                                BorderBrush="{StaticResource HairlineBrush}"
-                                                BorderThickness="0,1,0,0">
-                                            <TextBlock Text="TIMELINE"
-                                                       FontSize="9.5" CharacterSpacing="140"
-                                                       HorizontalAlignment="Center" VerticalAlignment="Center"
-                                                       Foreground="{StaticResource TextMutedBrush}" />
-                                        </Border>
-                                        <Border x:Name="PvInspector" Grid.Column="2" Grid.RowSpan="2"
-                                                Background="{StaticResource BgElevatedBrush}"
-                                                BorderBrush="{StaticResource HairlineBrush}"
-                                                BorderThickness="1,0,0,0">
-                                            <TextBlock Text="INSPECTOR"
-                                                       FontSize="9.5" CharacterSpacing="140"
-                                                       HorizontalAlignment="Center" VerticalAlignment="Center"
-                                                       Foreground="{StaticResource TextMutedBrush}" />
-                                        </Border>
-                                    </Grid>
-                                </Border>
+                    <!-- Preset chips + visibility toggles + full-size editor -->
+                    <Grid Grid.Row="1" ColumnDefinitions="*,Auto" ColumnSpacing="14">
+                        <StackPanel Grid.Column="0" Spacing="8">
+                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                <Button x:Name="BtnPresetSimple"    Tag="Simple"   Click="OnPresetClick"
+                                        Style="{StaticResource GhostButtonStyle}" Padding="14,8" FontSize="11.5">
+                                    <StackPanel Spacing="2">
+                                        <TextBlock Text="Simple" FontWeight="Medium" FontSize="12" />
+                                        <TextBlock Text="Clipchamp-like" FontSize="10"
+                                                   Foreground="{StaticResource TextFaintBrush}" />
+                                    </StackPanel>
+                                </Button>
+                                <Button x:Name="BtnPresetModerate"  Tag="Moderate" Click="OnPresetClick"
+                                        Style="{StaticResource GhostButtonStyle}" Padding="14,8" FontSize="11.5">
+                                    <StackPanel Spacing="2">
+                                        <TextBlock Text="Moderate" FontWeight="Medium" FontSize="12" />
+                                        <TextBlock Text="Three-pane editor" FontSize="10"
+                                                   Foreground="{StaticResource TextFaintBrush}" />
+                                    </StackPanel>
+                                </Button>
+                                <Button x:Name="BtnPresetComplex"   Tag="Complex"  Click="OnPresetClick"
+                                        Style="{StaticResource GhostButtonStyle}" Padding="14,8" FontSize="11.5">
+                                    <StackPanel Spacing="2">
+                                        <TextBlock Text="Complex" FontWeight="Medium" FontSize="12" />
+                                        <TextBlock Text="Premiere-like" FontSize="10"
+                                                   Foreground="{StaticResource TextFaintBrush}" />
+                                    </StackPanel>
+                                </Button>
+                                <TextBlock x:Name="TbPresetLabel" VerticalAlignment="Center"
+                                           Margin="6,0,0,0" FontSize="11.5"
+                                           Foreground="{StaticResource TextMutedBrush}" />
                             </StackPanel>
-                        </Border>
-
-                        <!-- Panel toggles -->
-                        <StackPanel Spacing="4">
-                            <TextBlock Text="PANELS" Style="{StaticResource SectionLabelStyle}" />
-                            <CheckBox x:Name="CbShowLibrary"   Content="Show library panel"
-                                      Checked="OnLayoutToggleChanged" Unchecked="OnLayoutToggleChanged" />
-                            <CheckBox x:Name="CbShowInspector" Content="Show inspector panel"
-                                      Checked="OnLayoutToggleChanged" Unchecked="OnLayoutToggleChanged" />
-                        </StackPanel>
-
-                        <StackPanel Spacing="6">
-                            <TextBlock Text="LIBRARY POSITION" Style="{StaticResource SectionLabelStyle}" />
-                            <ComboBox x:Name="CbLibrarySide" Width="260" Margin="0,4,0,0"
-                                      SelectionChanged="OnLibrarySideChanged">
-                                <ComboBoxItem Content="Left" Tag="Left" />
-                                <ComboBoxItem Content="Right (mirror)" Tag="Right" />
-                            </ComboBox>
-                        </StackPanel>
-
-                        <!-- Sliders -->
-                        <StackPanel Spacing="14">
-                            <StackPanel Spacing="4">
-                                <Grid ColumnDefinitions="*,Auto">
-                                    <TextBlock Grid.Column="0" Text="LIBRARY WIDTH"
-                                               Style="{StaticResource SectionLabelStyle}" />
-                                    <TextBlock Grid.Column="1" x:Name="TbLibWidth"
-                                               Style="{StaticResource MonoTextStyle}" />
-                                </Grid>
-                                <Slider x:Name="SldLibWidth" Minimum="180" Maximum="480"
-                                        StepFrequency="2"
-                                        ValueChanged="OnLayoutSliderChanged" />
-                            </StackPanel>
-
-                            <StackPanel Spacing="4">
-                                <Grid ColumnDefinitions="*,Auto">
-                                    <TextBlock Grid.Column="0" Text="INSPECTOR WIDTH"
-                                               Style="{StaticResource SectionLabelStyle}" />
-                                    <TextBlock Grid.Column="1" x:Name="TbInsWidth"
-                                               Style="{StaticResource MonoTextStyle}" />
-                                </Grid>
-                                <Slider x:Name="SldInsWidth" Minimum="200" Maximum="520"
-                                        StepFrequency="2"
-                                        ValueChanged="OnLayoutSliderChanged" />
-                            </StackPanel>
-
-                            <StackPanel Spacing="4">
-                                <Grid ColumnDefinitions="*,Auto">
-                                    <TextBlock Grid.Column="0" Text="TIMELINE HEIGHT"
-                                               Style="{StaticResource SectionLabelStyle}" />
-                                    <TextBlock Grid.Column="1" x:Name="TbTimelineH"
-                                               Style="{StaticResource MonoTextStyle}" />
-                                </Grid>
-                                <Slider x:Name="SldTimelineH" Minimum="160" Maximum="520"
-                                        StepFrequency="2"
-                                        ValueChanged="OnLayoutSliderChanged" />
+                            <StackPanel Orientation="Horizontal" Spacing="14">
+                                <CheckBox x:Name="CbShowLibrary"   Content="Show library"
+                                          Checked="OnLayoutToggleChanged" Unchecked="OnLayoutToggleChanged" />
+                                <CheckBox x:Name="CbShowInspector" Content="Show inspector"
+                                          Checked="OnLayoutToggleChanged" Unchecked="OnLayoutToggleChanged" />
+                                <Button x:Name="BtnResetToPreset" Content="Reset to preset"
+                                        Style="{StaticResource GhostButtonStyle}"
+                                        Padding="10,4" FontSize="11"
+                                        Click="OnResetToPresetClick" />
                             </StackPanel>
                         </StackPanel>
-
-                        <Button Content="Reset layout to defaults"
+                        <Button Grid.Column="1" x:Name="BtnFullsizeEdit"
                                 Style="{StaticResource BtapButtonStyle}"
-                                Click="OnResetLayoutClick"
-                                HorizontalAlignment="Left" />
-                    </StackPanel>
-                </ScrollViewer>
+                                Padding="14,8" FontSize="11.5"
+                                VerticalAlignment="Top"
+                                Click="OnFullsizeEditClick">
+                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                <FontIcon FontFamily="Segoe MDL2 Assets" Glyph="&#xE740;" FontSize="11" />
+                                <TextBlock Text="Edit at full size" />
+                            </StackPanel>
+                        </Button>
+                    </Grid>
+
+                    <!-- Live preview — same DockHost the editor uses, but with
+                         sample-content placeholders so the user can rearrange
+                         without a project loaded. -->
+                    <Border Grid.Row="2"
+                            Background="{StaticResource BgSurfaceBrush}"
+                            BorderBrush="{StaticResource HairlineBrush}"
+                            BorderThickness="1"
+                            CornerRadius="{StaticResource RadiusLg}"
+                            Padding="2"
+                            MinHeight="420">
+                        <controls:LayoutPreviewView x:Name="LayoutPreview" />
+                    </Border>
+
+                    <TextBlock Grid.Row="3"
+                               Text="Drag any panel header onto another panel — drop on its top, bottom, left, or right edge to dock there. Drag splitters to resize. Esc cancels an in-progress drag."
+                               FontSize="11" Foreground="{StaticResource TextFaintBrush}"
+                               TextWrapping="Wrap" />
+                </Grid>
 
             </Grid>
         </Grid>
+
+    <!-- ══ Fullsize layout editor overlay ════════════════════════════════
+         Lives inside the root Grid because a UserControl can only have one
+         root element, but a Popup renders over the XamlRoot regardless of
+         where it sits in the tree, so this doesn't affect layout. Opened by
+         the "Edit at full size" button; Esc / Close dismiss. -->
+    <Popup x:Name="FullsizePopup" IsLightDismissEnabled="False">
+        <Grid x:Name="FullsizePopupRoot"
+              Background="{StaticResource BgPageBrush}">
+            <Grid RowDefinitions="Auto,*">
+                <Border Grid.Row="0"
+                        Background="{StaticResource BgPageBrush}"
+                        BorderBrush="{StaticResource HairlineBrush}"
+                        BorderThickness="0,0,0,1"
+                        Padding="14,8">
+                    <Grid ColumnDefinitions="Auto,*,Auto">
+                        <TextBlock Grid.Column="0" Text="Layout editor · full size"
+                                   FontSize="12" FontWeight="Medium"
+                                   Foreground="{StaticResource TextPrimaryBrush}"
+                                   VerticalAlignment="Center" />
+                        <TextBlock Grid.Column="1"
+                                   Text="Drag panels to dock; Esc to close."
+                                   FontSize="11"
+                                   Foreground="{StaticResource TextFaintBrush}"
+                                   VerticalAlignment="Center"
+                                   Margin="14,0,0,0" />
+                        <Button Grid.Column="2" Content="Close"
+                                Style="{StaticResource BtapButtonStyle}"
+                                Padding="14,4" FontSize="11"
+                                Click="OnFullsizeEditClose" />
+                    </Grid>
+                </Border>
+                <controls:LayoutPreviewView Grid.Row="1" x:Name="LayoutPreviewFull" />
+            </Grid>
+        </Grid>
+    </Popup>
     </Grid>
 </UserControl>

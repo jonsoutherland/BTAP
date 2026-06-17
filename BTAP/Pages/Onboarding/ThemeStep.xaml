@@ -1,0 +1,148 @@
+<UserControl
+    x:Class="BTAP.Pages.Onboarding.ThemeStep"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    HorizontalAlignment="Stretch" VerticalAlignment="Stretch"
+    Background="{ThemeResource BgPageColor}">
+
+    <Grid x:Name="StepRoot" HorizontalAlignment="Stretch" VerticalAlignment="Stretch">
+    <Grid HorizontalAlignment="Center" VerticalAlignment="Center" MaxWidth="640">
+        <StackPanel Spacing="36">
+            <StackPanel Spacing="6" HorizontalAlignment="Center">
+                <TextBlock Text="QUESTION 3"
+                           FontFamily="{StaticResource MonoFont}"
+                           FontSize="10.5" CharacterSpacing="200"
+                           Foreground="{ThemeResource TextFaintColor}"
+                           HorizontalAlignment="Center" />
+                <TextBlock Text="Do you stare at the sun, or are you normal?"
+                           FontSize="36" FontFamily="{StaticResource SerifFont}"
+                           FontStyle="Italic" LineHeight="42"
+                           Foreground="{ThemeResource TextPrimaryColor}"
+                           HorizontalAlignment="Center"
+                           TextAlignment="Center"
+                           TextWrapping="Wrap"
+                           MaxWidth="640" />
+                <TextBlock Text="Hover to preview. Click to commit."
+                           FontSize="12.5"
+                           Foreground="{ThemeResource TextMutedColor}"
+                           HorizontalAlignment="Center" />
+            </StackPanel>
+
+            <Grid HorizontalAlignment="Center">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="220" />
+                    <ColumnDefinition Width="220" />
+                </Grid.ColumnDefinitions>
+
+                <!-- Sun side -->
+                <Border Grid.Column="0" x:Name="SunZone"
+                        Width="200" Height="200"
+                        Background="Transparent"
+                        PointerEntered="OnSunEnter"
+                        PointerExited="OnSunExit"
+                        Tapped="OnSunTapped">
+                    <Grid>
+                        <!-- Light wash: an accent-coloured disc centred on the
+                             sun. On commit it scales up to cover the whole
+                             page, holds at peak opacity while we flip the
+                             theme to Light, then fades out as the new bg
+                             takes over. Rendered FIRST so the disc and rays
+                             stay readable on top of the wash while it grows. -->
+                        <Ellipse x:Name="LightWash"
+                                 Width="40" Height="40"
+                                 Fill="{StaticResource AccentBrush}"
+                                 HorizontalAlignment="Center" VerticalAlignment="Center"
+                                 IsHitTestVisible="False"
+                                 Opacity="0"
+                                 RenderTransformOrigin="0.5,0.5">
+                            <Ellipse.RenderTransform>
+                                <ScaleTransform x:Name="LightWashScale"
+                                                ScaleX="1" ScaleY="1" />
+                            </Ellipse.RenderTransform>
+                        </Ellipse>
+
+                        <!-- Sun rays — 8 rectangles rotated around the disc -->
+                        <Grid x:Name="SunRays" Opacity="0">
+                            <Grid.RenderTransform>
+                                <ScaleTransform x:Name="SunRaysScale" ScaleX="0.6" ScaleY="0.6"
+                                                CenterX="100" CenterY="100" />
+                            </Grid.RenderTransform>
+                        </Grid>
+                        <Ellipse x:Name="SunDisc" Width="100" Height="100"
+                                 Fill="{StaticResource AccentBrush}"
+                                 HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        <TextBlock Text="Light"
+                                   FontFamily="{StaticResource SerifFont}" FontStyle="Italic"
+                                   FontSize="14"
+                                   Foreground="{ThemeResource TextMutedColor}"
+                                   HorizontalAlignment="Center" VerticalAlignment="Bottom"
+                                   Margin="0,0,0,-4" />
+                    </Grid>
+                </Border>
+
+                <!-- Moon side -->
+                <Border Grid.Column="1" x:Name="MoonZone"
+                        Width="200" Height="200"
+                        Background="Transparent"
+                        PointerEntered="OnMoonEnter"
+                        PointerExited="OnMoonExit"
+                        Tapped="OnMoonTapped">
+                    <Grid>
+                        <Ellipse Width="100" Height="100"
+                                 Fill="{ThemeResource TextDimColor}"
+                                 HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        <!-- Crescent: an overlapping ellipse the same colour as
+                             the background that "bites" out of the moon. -->
+                        <Ellipse x:Name="MoonBite" Width="100" Height="100"
+                                 HorizontalAlignment="Center" VerticalAlignment="Center"
+                                 Fill="{ThemeResource BgPageColor}">
+                            <Ellipse.RenderTransform>
+                                <TranslateTransform x:Name="MoonBiteTx" X="0" />
+                            </Ellipse.RenderTransform>
+                        </Ellipse>
+                        <TextBlock Text="Dark"
+                                   FontFamily="{StaticResource SerifFont}" FontStyle="Italic"
+                                   FontSize="14"
+                                   Foreground="{ThemeResource TextMutedColor}"
+                                   HorizontalAlignment="Center" VerticalAlignment="Bottom"
+                                   Margin="0,0,0,-4" />
+                    </Grid>
+                </Border>
+            </Grid>
+        </StackPanel>
+    </Grid>
+
+        <!-- Light emanation overlay: a warm-white Ellipse positioned over
+             the sun disc centre (via Canvas.Left/Top), then scaled up in two
+             phases on commit. Phase 1 (slow, ease-in): scale 0 → 3, fades in
+             to opacity ~0.85 — a glow emanating to the sun disc's edge.
+             Phase 2 (fast, ease-out): scale 3 → 60, opacity climbs to 1.0 —
+             the burst fills the screen. Theme then flips to Light while the
+             screen is fully covered; Phase 3 fades the burst to expose the
+             new light-mode page beneath. Lives at StepRoot (sibling of the
+             centred content) so it's not constrained by SunZone's 200x200
+             bounds and can grow past them. -->
+        <Canvas x:Name="BurstOverlay" IsHitTestVisible="False">
+            <Ellipse x:Name="LightBurst"
+                     Width="40" Height="40"
+                     Fill="#FFFBED"
+                     IsHitTestVisible="False"
+                     Opacity="0"
+                     RenderTransformOrigin="0.5,0.5">
+                <Ellipse.RenderTransform>
+                    <ScaleTransform x:Name="LightBurstScale" ScaleX="0" ScaleY="0" />
+                </Ellipse.RenderTransform>
+            </Ellipse>
+            <Ellipse x:Name="DarkBurst"
+                     Width="40" Height="40"
+                     Fill="#0F0F12"
+                     IsHitTestVisible="False"
+                     Opacity="0"
+                     RenderTransformOrigin="0.5,0.5">
+                <Ellipse.RenderTransform>
+                    <ScaleTransform x:Name="DarkBurstScale" ScaleX="0" ScaleY="0" />
+                </Ellipse.RenderTransform>
+            </Ellipse>
+        </Canvas>
+    </Grid>
+</UserControl>

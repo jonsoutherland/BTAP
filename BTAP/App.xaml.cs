@@ -54,6 +54,10 @@ public partial class App : Application
             return;
         }
 
+        // Hook the live accent before any window paints — first frame already
+        // reflects the user's saved colour instead of flashing the default sage.
+        AccentManager.Init();
+
         _window = new MainWindow();
         _window.Activate();
     }

@@ -1,6 +1,7 @@
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media;
+using Microsoft.UI.Xaml.Shapes;
 
 namespace BTAP.Controls;
 
@@ -26,10 +27,30 @@ public sealed partial class PlaybackBarControl : UserControl
     public void SetIsPlaying(bool playing) =>
         PlayIcon.Glyph = playing ? PauseGlyph : PlayGlyph;
 
-    public void SetIsLooping(bool looping) =>
-        BtnLoop.Foreground = looping
-            ? (Brush)Application.Current.Resources["AccentInkBrush"]
-            : (Brush)Application.Current.Resources["TextMutedBrush"];
+    public void SetIsLooping(bool looping) => ToggleActiveState(BtnLoop, looping);
+
+    /// <summary>Visualises a sticky-toggle button's on/off state. "On" gets the
+    /// accent foreground, a translucent accent fill, and a 1px accent border so
+    /// the active state is unmistakable even at a glance — a foreground colour
+    /// shift alone gets lost against the surrounding ghost buttons.</summary>
+    private static void ToggleActiveState(Button btn, bool active)
+    {
+        var res = Application.Current.Resources;
+        if (active)
+        {
+            btn.Background      = (Brush)res["AccentSoftBrush"];
+            btn.BorderBrush     = (Brush)res["AccentBrush"];
+            btn.BorderThickness = new Thickness(1);
+            btn.Foreground      = (Brush)res["AccentInkBrush"];
+        }
+        else
+        {
+            btn.ClearValue(Control.BackgroundProperty);
+            btn.ClearValue(Control.BorderBrushProperty);
+            btn.ClearValue(Control.BorderThicknessProperty);
+            btn.ClearValue(Control.ForegroundProperty);
+        }
+    }
 
     private void OnPlayClick(object sender, RoutedEventArgs e) =>
         PlayClicked?.Invoke(this, e);

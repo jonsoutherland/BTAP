@@ -1,0 +1,87 @@
+<UserControl
+    x:Class="BTAP.Pages.Onboarding.OutroStep"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    HorizontalAlignment="Stretch" VerticalAlignment="Stretch"
+    Background="{ThemeResource BgPageColor}">
+
+    <Grid HorizontalAlignment="Center" VerticalAlignment="Center">
+        <StackPanel Spacing="22" HorizontalAlignment="Center">
+            <TextBlock x:Name="Wordmark"
+                       Text="BTAP"
+                       FontSize="80"
+                       FontFamily="{StaticResource SerifFont}"
+                       FontStyle="Italic"
+                       FontWeight="Medium"
+                       CharacterSpacing="120"
+                       Foreground="{ThemeResource TextPrimaryColor}"
+                       HorizontalAlignment="Center"
+                       Opacity="0">
+                <TextBlock.RenderTransform>
+                    <ScaleTransform x:Name="WordmarkScale" ScaleX="0.9" ScaleY="0.9" />
+                </TextBlock.RenderTransform>
+                <TextBlock.RenderTransformOrigin>0.5,0.5</TextBlock.RenderTransformOrigin>
+            </TextBlock>
+
+            <TextBlock x:Name="Caption"
+                       Text="Make sure you're reading this — we could be asking for your firstborn."
+                       FontFamily="{StaticResource SerifFont}"
+                       FontStyle="Italic"
+                       FontSize="10.5"
+                       Foreground="{ThemeResource TextFaintColor}"
+                       HorizontalAlignment="Center"
+                       TextAlignment="Center"
+                       TextWrapping="Wrap"
+                       MaxWidth="420"
+                       Opacity="0" />
+
+            <!-- AI disclaimer + acknowledgement gate. BtnEnter starts
+                 IsEnabled=False; toggling the checkbox flips it. -->
+            <Border x:Name="DisclaimerPanel"
+                    MaxWidth="520"
+                    Margin="0,12,0,0"
+                    Padding="22,18"
+                    BorderBrush="{ThemeResource HairlineColor}"
+                    BorderThickness="1"
+                    CornerRadius="8"
+                    Opacity="0">
+                <StackPanel Spacing="12">
+                    <TextBlock Text="FINE PRINT"
+                               FontFamily="{StaticResource MonoFont}"
+                               FontSize="10" CharacterSpacing="200"
+                               Foreground="{ThemeResource TextFaintColor}" />
+                    <TextBlock TextWrapping="Wrap"
+                               FontSize="13.5" LineHeight="21"
+                               Foreground="{ThemeResource TextMutedColor}">
+                        <Run Text="A large portion of the functionality of BTAP was produced through vibe-coding tools. By clicking acknowledge, you recognize this." />
+                        <LineBreak /><LineBreak />
+                        <Run Text="There is no AI functionality within the application, nor is there any kind of creepy information collection. In exchange, we ask that you please report any bugs using the &quot;Report bug&quot; feature in the bottom right of the application." />
+                        <LineBreak /><LineBreak />
+                        <Run Text="Oh, and by the way, this video editor is totally free. If you paid someone for it, you got scammed. Sorry, bud." />
+                    </TextBlock>
+                    <CheckBox x:Name="AiAckCheckbox"
+                              Content="Acknowledge."
+                              Checked="OnAckChanged"
+                              Unchecked="OnAckChanged" />
+                </StackPanel>
+            </Border>
+
+            <!-- BtnEnter is always enabled — the unchecked case is handled
+                 in code-behind by showing a humorous Flyout instead of
+                 advancing. A disabled button can't fire Click in WinUI 3,
+                 so we'd lose the chance to lecture the user. -->
+            <Button x:Name="BtnEnter"
+                    Content="Enter editor"
+                    Style="{StaticResource PrimaryButtonStyle}"
+                    Padding="22,10" FontSize="13"
+                    Margin="0,14,0,0"
+                    HorizontalAlignment="Center"
+                    Click="OnEnterClick"
+                    Opacity="0">
+                <Button.RenderTransform>
+                    <TranslateTransform x:Name="BtnTx" Y="14" />
+                </Button.RenderTransform>
+            </Button>
+        </StackPanel>
+    </Grid>
+</UserControl>
